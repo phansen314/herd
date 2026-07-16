@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+# validate.py scratch DBs
+f.db*
+g.db*

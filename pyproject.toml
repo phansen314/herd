@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "herd"
+version = "0.1.0"
+description = "Track Claude Code sessions and jump to them in kitty"
+requires-python = ">=3.9"
+dependencies = []
+# Local-only by design: no network, no runtime deps. The hooks are bash + jq +
+# sqlite3 on purpose — a python cold start on SessionStart would be felt.
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+herd = ["schema/*.sql", "hooks/*.sh"]
