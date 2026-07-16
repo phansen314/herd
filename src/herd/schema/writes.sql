@@ -205,6 +205,28 @@ INSERT INTO events(session_pk, event_type, source, timestamp, raw_json)
 SELECT id, :etype, 'hook', :now, :raw FROM sessions WHERE session_id = :session_id;
 -- post_tool_use.sh passes :raw = NULL — it fires per tool call.
 
+-- W4b: SESSION END. The only hook-driven death, and distinct from W3d_reap:
+-- this one KNOWS (status_source='hook'), where reconcile only INFERS from the
+-- process table ('pid'). Fires trg_herd_job_death -> frees the job name and the
+-- window slot.
+--
+-- session_end.sh MUST be registered BLOCKING, never async. An async hook can be
+-- killed when the session exits, leaving stopped_at NULL and the row live until
+-- reconcile notices. Worse, on `/clear` Claude emits SessionEnd then
+-- SessionStart for the NEW session in the SAME window: if the end hasn't landed
+-- first, both rows are live in one window and the new placement collides on
+-- idx_herd_window. klawde learned this the hard way and documented it; its own
+-- live settings.json still has the async bug its commit message warns against.
+-- :name W4_end
+UPDATE sessions
+SET status          = 'stopped',
+    status_source   = 'hook',
+    stopped_at      = :now,
+    last_event_at   = :now,
+    last_event_type = 'end',
+    updated_at      = :now
+WHERE session_id = :session_id AND stopped_at IS NULL;
+
 
 -- ── W5. STATUSLINE (core) — UPDATE ONLY ───────────────────────────────────
 -- Fires ~1/sec per session. Guarded upstream by the fingerprint diff-cache

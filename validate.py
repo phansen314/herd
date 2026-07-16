@@ -46,6 +46,14 @@ def fresh(tier2=True):
     for s in ("f.db-wal","f.db-shm"):
         if os.path.exists(s): os.remove(s)
     c = sqlite3.connect("f.db")
+    # autocommit. Section N runs the real bash hooks against this file from
+    # ANOTHER connection, and python's default isolation_level would leave the
+    # setup rows in an uncommitted transaction that close() silently rolls back
+    # — the hook then sees an empty database. That produced a *false pass*:
+    # check 48 lost its reconciled row, W2b inserted a fresh one that landed on
+    # the same rowid it was asserting against, and the adopt path was never
+    # exercised at all.
+    c.isolation_level = None
     apply_schema(c, tier2=tier2)
     c.execute("PRAGMA foreign_keys=ON")
     c.row_factory = sqlite3.Row
@@ -412,6 +420,195 @@ check("44b idx_herd_window is partial on live=1",
 w5 = W["W5_statusline"].split("--")[0]
 check("44c W5_statusline never touches last_event_*", "last_event" not in w5.lower(),
       "the one invariant no runtime test survives someone 'optimizing' the statusline")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# N. HOOKS — end to end, running the real scripts
+#
+# The hooks are bash and the SQL is a file, so nothing but this exercises them.
+# ═══════════════════════════════════════════════════════════════════════════
+print("\n\033[1m═══ N. HOOKS (47-54) ═══\033[0m")
+import subprocess, json, tempfile, shutil
+
+HOOKS = pathlib.Path(__file__).resolve().parent / "src" / "herd" / "hooks"
+RUNTIME = tempfile.mkdtemp(prefix="herd-validate-")
+DBPATH = str(pathlib.Path("f.db").resolve())
+
+def hook(script, payload, env=None):
+    e = dict(os.environ)
+    e.update({"HERD_DB": DBPATH, "HERD_RUNTIME": RUNTIME,
+              "HERD_ERRLOG": f"{RUNTIME}/err.log"})
+    if env: e.update(env)
+    return subprocess.run(["bash", str(HOOKS / script)], input=json.dumps(payload),
+                          capture_output=True, text=True, env=e)
+
+def bash_stmt(name):
+    r = subprocess.run(["bash", "-c", f'. "{HOOKS}/common.sh"; stmt {name}'],
+                       capture_output=True, text=True, env=dict(os.environ, HERD_DB=DBPATH))
+    return r.stdout
+
+def norm(s): return " ".join(s.split())
+
+# ── 47. bash and python must extract the SAME statement ───────────────────
+# This is what makes "writes.sql is canonical" true for BOTH runtimes. Without
+# it, herd.db.load_statements() and the hooks' stmt() are two parsers of one
+# file that agree only by luck — and every check above tests only the python one.
+with guard("47 bash stmt() and python load_statements() agree"):
+    mismatch = [n for n in W if norm(bash_stmt(n)) != norm(W[n])]
+    check("47 bash stmt() and python load_statements() agree", not mismatch,
+          f"drifted: {mismatch}" if mismatch else f"all {len(W)} statements identical in both runtimes")
+
+# ── 48/49. session_start: adopt vs insert ─────────────────────────────────
+SOCK = "unix:/tmp/kitty-20035"
+with guard("48 session_start adopts the reconciled row via (socket,window_id)"):
+    c = fresh()
+    pk = c.execute("INSERT INTO sessions(cwd,status,status_source,started_at,updated_at)"
+                   " VALUES('/code/herd','unknown','reconcile',?,?)",(T0,T0)).lastrowid
+    c.execute("INSERT INTO herd_sessions(session_pk,job_name,created_at,kitty_socket,"
+              "window_id,source,verified_at) VALUES(?,'api',?,?,5,'spawn',?)",(pk,T0,SOCK,T0))
+    c.close()
+    hook("session_start.sh", {"session_id":"uuid-A","cwd":"/code/herd","model":"claude-opus-4-8",
+                              "transcript_path":"/t.jsonl","source":"startup",
+                              "hook_event_name":"SessionStart"},
+         {"KITTY_WINDOW_ID":"5","KITTY_LISTEN_ON":SOCK})
+    c = sqlite3.connect(DBPATH); c.row_factory = sqlite3.Row
+    rows = c.execute("SELECT id,session_id,status,model FROM sessions").fetchall()
+    # job_name is the discriminator: W2b would create a BRAND NEW session row
+    # with no herd_sessions attached. Only a true adopt leaves the spawn-time
+    # job still bound to the row Claude's UUID landed on. Asserting on rowid
+    # alone silently passes when the fallback fires and happens to reuse id 1.
+    job = c.execute("SELECT h.job_name FROM herd_sessions h JOIN sessions s ON s.id=h.session_pk"
+                    " WHERE s.session_id='uuid-A'").fetchone()
+    check("48 session_start adopts the reconciled row via (socket,window_id)",
+          len(rows)==1 and rows[0]["id"]==pk and rows[0]["session_id"]=="uuid-A"
+          and rows[0]["status"]=="working" and job is not None and job["job_name"]=="api",
+          f"adopted pk={pk}, job still attached={job and job['job_name']}, {len(rows)} row(s) total")
+    c.close()
+
+with guard("49 session_start falls back to W2b outside kitty"):
+    c = fresh(); c.close()
+    hook("session_start.sh", {"session_id":"uuid-B","cwd":"/x","model":"claude-opus-4-8",
+                              "transcript_path":"/t.jsonl","source":"startup",
+                              "hook_event_name":"SessionStart"},
+         {"KITTY_WINDOW_ID":"", "KITTY_LISTEN_ON":""})
+    c = sqlite3.connect(DBPATH)
+    n = c.execute("SELECT COUNT(*) FROM sessions WHERE session_id='uuid-B' AND status='working'").fetchone()[0]
+    check("49 session_start falls back to W2b outside kitty", n==1,
+          "hooks wired but herd never saw the window")
+    c.close()
+
+# ── 50. THE HOT PATH: last_event_at must advance, and throttle must not lie ──
+with guard("50 post_tool_use advances last_event_at"):
+    c = fresh()
+    c.execute("INSERT INTO sessions(session_id,cwd,status,last_event_at,last_event_type,"
+              "started_at,updated_at) VALUES('s1','/a','working',?,'tool',?,?)",(T0,T0,T0))
+    c.close()
+    hook("post_tool_use.sh", {"session_id":"s1","tool_name":"Bash","tool_input":{},
+                              "tool_response":"ok","hook_event_name":"PostToolUse"},
+         {"HERD_TOOL_THROTTLE":"0"})
+    c = sqlite3.connect(DBPATH)
+    le = c.execute("SELECT last_event_at FROM sessions WHERE session_id='s1'").fetchone()[0]
+    check("50 post_tool_use advances last_event_at", le != T0,
+          f"a busy session must never read as silent; last_event_at={le}")
+    c.close()
+
+# NOTE the session_id differs from check 50's. The throttle state is a tmpfs
+# file keyed by session_id, so reusing 's1' here would inherit check 50's
+# just-written timestamp and suppress all five calls — the check would fail
+# while the hook behaved perfectly.
+with guard("50b throttle suppresses a burst but keeps the first write"):
+    c = fresh()
+    c.execute("INSERT INTO sessions(session_id,cwd,status,last_event_at,last_event_type,"
+              "started_at,updated_at) VALUES('s2','/a','working',?,'tool',?,?)",(T0,T0,T0))
+    c.close()
+    for _ in range(5):
+        hook("post_tool_use.sh", {"session_id":"s2","tool_name":"Bash","tool_input":{},
+                                  "tool_response":"ok","hook_event_name":"PostToolUse"},
+             {"HERD_TOOL_THROTTLE":"60"})
+    c = sqlite3.connect(DBPATH)
+    ev = c.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    le = c.execute("SELECT last_event_at FROM sessions WHERE session_id='s2'").fetchone()[0]
+    check("50b throttle suppresses a burst but keeps the first write",
+          ev == 1 and le != T0,
+          f"5 tool calls -> {ev} write(s), last_event_at moved={le != T0}")
+    c.close()
+
+# ── 51. Stop — the 'waiting' signal klawde has no hook for ────────────────
+with guard("51 stop sets waiting and re-arms attention"):
+    c = fresh()
+    pk = c.execute("INSERT INTO sessions(session_id,cwd,status,last_event_at,last_event_type,"
+                   "started_at,updated_at) VALUES('s1','/a','working',?,'tool',?,?)",(T0,T0,T0)).lastrowid
+    c.execute("INSERT INTO herd_attention(session_pk,attention_at,paged_at,paged_level,ack_at)"
+              " VALUES(?,?,?,2,?)",(pk,T0,T0,T0))
+    c.close()
+    hook("stop.sh", {"session_id":"s1","stop_hook_active":False,
+                     "last_assistant_message":"done","hook_event_name":"Stop"})
+    c = sqlite3.connect(DBPATH); c.row_factory = sqlite3.Row
+    r = c.execute("SELECT status,last_event_type FROM sessions WHERE session_id='s1'").fetchone()
+    att = c.execute("SELECT COUNT(*) FROM herd_attention WHERE session_pk=?",(pk,)).fetchone()[0]
+    check("51 stop sets waiting and re-arms attention",
+          r["status"]=="waiting" and r["last_event_type"]=="stop" and att==0,
+          f"status={r['status']} etype={r['last_event_type']} attention_rows={att}")
+    c.close()
+
+# ── 52. Notification filters to permission_prompt only ────────────────────
+with guard("52 notification ignores idle_prompt, honours permission_prompt"):
+    c = fresh()
+    c.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at)"
+              " VALUES('s1','/a','working',?,?)",(T0,T0))
+    c.close()
+    hook("notification.sh", {"session_id":"s1","notification_type":"idle_prompt",
+                             "message":"Claude is waiting","hook_event_name":"Notification"})
+    c = sqlite3.connect(DBPATH)
+    after_idle = c.execute("SELECT status FROM sessions WHERE session_id='s1'").fetchone()[0]
+    c.close()
+    hook("notification.sh", {"session_id":"s1","notification_type":"permission_prompt",
+                             "message":"allow?","hook_event_name":"Notification"})
+    c = sqlite3.connect(DBPATH)
+    after_perm = c.execute("SELECT status FROM sessions WHERE session_id='s1'").fetchone()[0]
+    check("52 notification ignores idle_prompt, honours permission_prompt",
+          after_idle=="working" and after_perm=="needs_approval",
+          f"idle->{after_idle}, permission->{after_perm}; Stop owns 'waiting', not idle_prompt")
+    c.close()
+
+# ── 53. SessionEnd is the hook-driven death, and frees the handles ────────
+with guard("53 session_end stops the session and frees job+window"):
+    c = fresh()
+    pk = c.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at)"
+                   " VALUES('s1','/a','working',?,?)",(T0,T0)).lastrowid
+    c.execute("INSERT INTO herd_sessions(session_pk,job_name,created_at,kitty_socket,"
+              "window_id,source,verified_at) VALUES(?,'api',?,?,5,'spawn',?)",(pk,T0,SOCK,T0))
+    c.close()
+    hook("session_end.sh", {"session_id":"s1","reason":"prompt_input_exit",
+                            "hook_event_name":"SessionEnd"})
+    c = sqlite3.connect(DBPATH); c.row_factory = sqlite3.Row
+    r = c.execute("SELECT s.status,s.status_source,s.stopped_at,h.live FROM sessions s "
+                  "JOIN herd_sessions h ON h.session_pk=s.id WHERE s.session_id='s1'").fetchone()
+    check("53 session_end stops the session and frees job+window",
+          r["status"]=="stopped" and r["stopped_at"] is not None and r["live"]==0
+          and r["status_source"]=="hook",
+          f"status_source={r['status_source']} (hook KNOWS; reconcile only infers 'pid'); live={r['live']}")
+    c.close()
+
+# ── 54. bind() must refuse an unbound param, never bind NULL silently ─────
+# sqlite3's own `.param set` fails exactly this way: mis-tokenize the value and
+# the parameter is silently NULL. That is how you lose data quietly.
+with guard("54 bind() refuses unbound params"):
+    r = subprocess.run(["bash","-c",
+        f'. "{HOOKS}/common.sh"; bind "UPDATE sessions SET cwd = :cwd WHERE session_id = :session_id;"'],
+        capture_output=True, text=True, env=dict(os.environ, HERD_P_cwd="/a"))
+    check("54 bind() refuses unbound params", r.returncode != 0 and ":session_id" in r.stderr,
+          f"rc={r.returncode}, stderr mentions the missing param")
+
+# ── 54b. the single-pass property, through the real bind() ───────────────
+with guard("54b bind() does not rescan substituted values"):
+    r = subprocess.run(["bash","-c",
+        f'. "{HOOKS}/common.sh"; bind "UPDATE sessions SET cwd = :cwd, updated_at = :now;"'],
+        capture_output=True, text=True,
+        env=dict(os.environ, HERD_P_cwd="/tmp/:now/x", HERD_P_now="T1"))
+    check("54b bind() does not rescan substituted values",
+          "'/tmp/:now/x'" in r.stdout, f"a cwd containing ':now' survives: {r.stdout.strip()}")
+
+shutil.rmtree(RUNTIME, ignore_errors=True)
 
 print("\n" + "═"*72)
 if FAILED:
