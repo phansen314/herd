@@ -24,8 +24,6 @@ valid_sid "$SID" || exit 0
 
 now_pair
 export HERD_P_session_id="$SID" HERD_P_now="$NOW_ISO" \
-       HERD_P_status="needs_approval" HERD_P_etype="notify"
-run W4_event >/dev/null 2>&1
-export HERD_P_raw=""
-run W4_event_log >/dev/null 2>&1
+       HERD_P_status="needs_approval" HERD_P_etype="notify" HERD_P_raw=""
+run_tx W4_event W4_event_log >/dev/null 2>&1
 exit 0

@@ -22,15 +22,12 @@ SID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
 valid_sid "$SID" || exit 0
 now_pair
 
+# Status -> waiting, log the 'stop' event, and RE-ARM attention — all in ONE
+# transaction. The re-arm clears any silence herd already paged about so the
+# rule may trip fresh; W6d_rearm_sid is why ack means "I've seen THIS silence",
+# not "never bother me about this session again". No inlined SQL — every write
+# routes through writes.sql (check 56).
 export HERD_P_session_id="$SID" HERD_P_now="$NOW_ISO" \
-       HERD_P_status="waiting" HERD_P_etype="stop"
-run W4_event >/dev/null 2>&1
-export HERD_P_raw=""
-run W4_event_log >/dev/null 2>&1
-
-# The turn ended, so any silence herd already paged about is over: clear the
-# attention row and let the rule trip fresh. W6d_rearm_sid is the RE-ARM — ack
-# means "I've seen THIS silence", not "never bother me about this session
-# again". Goes through run()/writes.sql like every other write: no inlined SQL.
-run W6d_rearm_sid >/dev/null 2>&1
+       HERD_P_status="waiting" HERD_P_etype="stop" HERD_P_raw=""
+run_tx W4_event W4_event_log W6d_rearm_sid >/dev/null 2>&1
 exit 0

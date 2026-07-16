@@ -21,13 +21,12 @@ SID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
 valid_sid "$SID" || exit 0
 now_pair
 
-# Log the event BEFORE the death: W4_event_log resolves session_pk through
-# sessions, and W4_end does not delete the row, but ordering keeps the trail
-# honest if that ever changes.
+# Event log + death in ONE transaction: the forensic 'end' event and the
+# stopped_at write land together or not at all. Log first so the trail is
+# honest if W4_end ever changes to delete the row. W4_end fires
+# trg_herd_job_death -> live=0, freeing the job name and the window slot.
 export HERD_P_session_id="$SID" HERD_P_now="$NOW_ISO" HERD_P_etype="end" HERD_P_raw=""
-run W4_event_log >/dev/null 2>&1
-
-run W4_end >/dev/null 2>&1     # fires trg_herd_job_death -> live=0, frees job+window
+run_tx W4_event_log W4_end >/dev/null 2>&1
 
 rm -f "$HERD_RUNTIME/herd-tool-$SID" 2>/dev/null
 exit 0

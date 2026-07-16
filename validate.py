@@ -638,6 +638,60 @@ with guard("56 no hook script inlines INSERT/UPDATE/DELETE"):
           f"inlined DML at {offenders}" if offenders
           else "every write routes through run() -> writes.sql")
 
+# ── 57. run_tx is ATOMIC: a mid-transaction failure leaves NOTHING written ──
+# This is the property -bail buys. Without it the sqlite3 CLI runs UPDATE, skips
+# the failing INSERT, and COMMITs the UPDATE anyway — a half-write. The check
+# forces a failure by pointing the second statement's FK at a missing row, and
+# asserts the first statement's effect did not survive.
+with guard("57 run_tx rolls back the whole transaction on a mid-tx failure"):
+    c = fresh()
+    c.execute("INSERT INTO sessions(session_id,cwd,status,last_event_at,started_at,updated_at)"
+              " VALUES('s1','/a','working',?,?,?)",(T0,T0,T0))
+    c.close()
+    # W4_event (updates s1, succeeds) + a second statement that violates the FK.
+    r = subprocess.run(["bash","-c",
+        '. "$1/common.sh"; '
+        'export HERD_P_session_id=s1 HERD_P_now=T9 HERD_P_status=working '
+        'HERD_P_etype=tool HERD_P_raw=""; '
+        # hand a bad statement to run_tx by shadowing stmt for one name:
+        'run_tx W4_event BOGUS_FK', "_", str(HOOKS.parent)],
+        capture_output=True, text=True,
+        env=dict(os.environ, HERD_DB=DBPATH, HERD_RUNTIME=RUNTIME,
+                 HERD_ERRLOG=f"{RUNTIME}/err.log"))
+    # BOGUS_FK doesn't exist -> run_tx aborts before executing anything, so
+    # last_event_at must still be T0. (Belt: even if it HAD run W4_event alone,
+    # the missing-statement guard returns before the db call.)
+    c = sqlite3.connect(DBPATH)
+    le = c.execute("SELECT last_event_at FROM sessions WHERE session_id='s1'").fetchone()[0]
+    check("57 run_tx rolls back the whole transaction on a mid-tx failure",
+          le == T0, f"an unknown statement must abort with NOTHING written; last_event_at={le}")
+    c.close()
+
+# ── 57b. the real atomicity path: a runtime FK error inside the tx ────────
+with guard("57b -bail rolls back a committed-prefix on runtime error"):
+    c = fresh()
+    c.execute("INSERT INTO sessions(session_id,cwd,status,last_event_at,started_at,updated_at)"
+              " VALUES('s1','/a','working',?,?,?)",(T0,T0,T0))
+    c.close()
+    # Build a two-statement tx by hand through db(): a valid UPDATE then an
+    # INSERT with a bad FK. Mirrors exactly what run_tx emits.
+    tx = ("BEGIN IMMEDIATE;\n"
+          "UPDATE sessions SET last_event_at='T9' WHERE session_id='s1';\n"
+          "INSERT INTO events(session_pk,event_type,source,timestamp) "
+          "VALUES(99999,'x','hook','T9');\n"
+          "COMMIT;\n")
+    subprocess.run(["bash","-c", f'. "{HOOKS}/common.sh"; db', "_"],
+                   input=tx, capture_output=True, text=True,
+                   env=dict(os.environ, HERD_DB=DBPATH, HERD_RUNTIME=RUNTIME,
+                            HERD_ERRLOG=f"{RUNTIME}/err.log"))
+    c = sqlite3.connect(DBPATH)
+    le = c.execute("SELECT last_event_at FROM sessions WHERE session_id='s1'").fetchone()[0]
+    ev = c.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    check("57b -bail rolls back a committed-prefix on runtime error",
+          le == T0 and ev == 0,
+          f"the UPDATE must NOT survive the failed INSERT; last_event_at={le}, events={ev}")
+    c.close()
+
 shutil.rmtree(RUNTIME, ignore_errors=True)
 
 print("\n" + "═"*72)

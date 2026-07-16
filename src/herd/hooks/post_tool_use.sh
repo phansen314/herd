@@ -37,14 +37,11 @@ if [ -f "$TFILE" ]; then
     esac
 fi
 
-export HERD_P_session_id="$SID" HERD_P_now="$NOW_ISO" \
-       HERD_P_status="working" HERD_P_etype="tool"
-run W4_event >/dev/null 2>&1
-
 # raw_json is NULL here BY CONTRACT — this fires per tool call and the events
-# table is unbounded.
-export HERD_P_raw=""
-run W4_event_log >/dev/null 2>&1
+# table is unbounded. status + event land in ONE transaction, ONE sqlite3 fork.
+export HERD_P_session_id="$SID" HERD_P_now="$NOW_ISO" \
+       HERD_P_status="working" HERD_P_etype="tool" HERD_P_raw=""
+run_tx W4_event W4_event_log >/dev/null 2>&1
 
 # tempfile+rename: a torn write would leave a partial epoch for the next tick
 # to read, and a non-numeric one falls through to an unthrottled write.

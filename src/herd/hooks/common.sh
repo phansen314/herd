@@ -72,7 +72,14 @@ valid_sid() { case "$1" in ''|*[!a-zA-Z0-9-]*) return 1 ;; *) return 0 ;; esac; 
 # /tmp/klawde-db-err.$$ path in a world-writable directory.
 db() {
     local err="$HERD_RUNTIME/herd-db-err.$$" rc
+    # -bail IS LOAD-BEARING for run_tx. Without it the sqlite3 CLI does not stop
+    # on a statement error: it prints the error, SKIPS to the next statement,
+    # and runs COMMIT anyway — committing everything before the failure while
+    # still exiting nonzero. So `BEGIN; a; b(fails); COMMIT` half-commits `a`.
+    # With -bail it stops at the error, never reaches COMMIT, and the open
+    # transaction rolls back when sqlite3 exits. Verified both ways.
     sqlite3 \
+        -bail \
         -cmd ".timeout 3000" \
         -cmd "PRAGMA foreign_keys=ON" \
         -cmd "PRAGMA synchronous=NORMAL" \
@@ -159,4 +166,32 @@ run() {
     else
         printf '%s\n' "$bound" | db
     fi
+}
+
+# run_tx <name> [<name> ...] — extract+bind each statement, wrap them in ONE
+# BEGIN IMMEDIATE ... COMMIT, execute in a SINGLE sqlite3 fork.
+#
+# Two wins, both real:
+#   - one fork and one WAL commit instead of N. On the hot path (post_tool_use,
+#     fires per tool call) that halves the sqlite3 spawns.
+#   - ATOMICITY. An event and its status change land together or not at all;
+#     -bail + the transaction guarantee no half-write survives a mid-tx error.
+#
+# BEGIN IMMEDIATE, never plain BEGIN: a deferred transaction upgrades to a write
+# lock lazily on the first write, and that upgrade can throw SQLITE_BUSY_SNAPSHOT
+# which the busy timeout cannot retry away. IMMEDIATE takes the write lock up
+# front, so the only wait is the ordinary one the busy timeout handles.
+#
+# Binding happens for ALL statements BEFORE any SQL runs, so an unbound param
+# aborts the whole thing with nothing executed — never a partial transaction.
+run_tx() {
+    local name sql bound body=""
+    for name in "$@"; do
+        sql=$(stmt "$name")
+        if [ -z "$sql" ]; then herd_log "no such statement: $name"; return 1; fi
+        bound=$(bind "$sql") || { herd_log "unbound params in $name"; return 1; }
+        body="$body$bound
+"
+    done
+    printf 'BEGIN IMMEDIATE;\n%sCOMMIT;\n' "$body" | db
 }
