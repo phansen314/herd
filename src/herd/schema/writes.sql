@@ -38,6 +38,13 @@ VALUES(:pk, :job, :now, :socket, :oswin, :tab, :win, :job, 'spawn', :now);
 -- filter `stopped_at IS NULL`, so that session goes invisible and collects no
 -- metrics, silently. Filtering by the session's own stopped_at (not a stored
 -- herd flag) is the whole point of the decouple: one source of truth.
+--
+-- ROUTING READ, NOT A DATA READ. The herd_sessions subquery only selects WHICH
+-- session row to adopt (the placeholder herd created at spawn). Every value
+-- WRITTEN into the core row is a Claude signal (:session_id, :cwd, :model, …) —
+-- no tier-2 value ever enters a core column. validate.py enforces this: in a
+-- core writer, herd_ may appear only after WHERE (routing), never in the SET
+-- list. Same for W3a_discover and W5b_adopt.
 -- :name W2_adopt
 UPDATE sessions
 SET session_id      = :session_id,

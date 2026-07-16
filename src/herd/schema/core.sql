@@ -78,6 +78,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     status              TEXT NOT NULL DEFAULT 'unknown'
                         CHECK (status IN ('working','waiting','needs_approval',
                                           'stopped','unknown')),
+    -- status_source is OBSERVATION PROVENANCE, not herd's relationship to the
+    -- session. The status VALUE is always Claude's; this records the channel it
+    -- was seen through: 'hook' (Claude reported it), 'reconcile' (herd's
+    -- discovery inferred it), 'pid' (a liveness check inferred it). Any tool
+    -- observing these sessions would record the same distinction — it lets the
+    -- TUI show how much to trust a status. The mechanism names are herd's, but
+    -- the fact ("this status was seen via a liveness check") is not.
     status_source       TEXT CHECK (status_source IN ('hook','reconcile','pid')),
 
     -- ── the two clocks — DO NOT CONFLATE ─────────────────────────────────

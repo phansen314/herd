@@ -79,6 +79,28 @@ check("no tier-2 DDL attaches to the sessions table",
 check("no `live` denormalization column anywhere",
       "live" not in "".join(l.split("--")[0] for l in HERD.splitlines()).lower())
 
+# ── Core columns receive ONLY Claude/process signals, never a tier-2 VALUE ──
+# Accepted design: three adopt-path writers (W2/W3a/W5b) READ herd_sessions to
+# ROUTE their write ("which session row is this arriving Claude session?"). That
+# is a routing key, not data. The invariant that must hold is that no tier-2
+# VALUE ever lands in a core column. Enforce it structurally: in every statement
+# that writes sessions/events, the value-producing region — everything BEFORE
+# the first WHERE (the SET list, the INSERT projection, the VALUES tuple) — must
+# not reference a herd_ table. The routing region (WHERE and its subqueries) may.
+_core_writers = [n for n, s in W.items()
+                 if re.search(r"\b(INSERT\s+INTO|UPDATE)\s+(sessions|events)\b",
+                              "\n".join(l.split("--")[0] for l in s.splitlines()), re.I)]
+_leaks = []
+for n in _core_writers:
+    code = "\n".join(l.split("--")[0] for l in W[n].splitlines())
+    values_region = re.split(r"\bWHERE\b", code, maxsplit=1, flags=re.I)[0]
+    if re.search(r"\bherd_(sessions|attention)\b", values_region, re.I):
+        _leaks.append(n)
+check("core columns take values only from Claude/process signals (routing reads OK)",
+      not _leaks,
+      f"tier-2 VALUE leaked into a core column in {_leaks}" if _leaks
+      else f"all {len(_core_writers)} core writers: herd_ appears only in routing (WHERE), never in values")
+
 # ── 45/46. THE TIER THESIS, EXECUTED ──────────────────────────────────────
 # Tier 1 claims to be "facts that would be true if herd didn't exist". Until
 # now that was asserted by grepping for the string 'herd_' — but the schema was
