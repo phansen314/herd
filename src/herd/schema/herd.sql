@@ -14,9 +14,17 @@
 -- ── HERD_SESSIONS ──────────────────────────────────────────────────────────
 -- Merged placement + job. One row per session herd knows about.
 --
+-- LIVENESS IS NOT STORED HERE. It lives in exactly one place — sessions.stopped_at
+-- (NULL == live) — and is read by JOIN. herd_sessions once carried a `live`
+-- column denormalized from it via a trigger on sessions; that produced a
+-- PERMANENT desync on resume (the trigger fired on death but nothing reset it
+-- when W2b revived a session), and it was the only reason tier 2 reached into
+-- tier 1 at all. Removed. "Is this window/job held by a live session?" is a
+-- JOIN to sessions, never a local flag. See writes.sql W2/W3a/R_job_live.
+--
 -- MUTABILITY CONTRACT — reconcile rewrites this row on every tick, so:
 --   IMMUTABLE (set once at spawn/discovery, reconcile MUST NOT touch):
---       job_name, created_at, live
+--       job_name, created_at
 --   MUTABLE (reconcile overwrites freely):
 --       kitty_socket, os_window_id, tab_id, window_id, window_title,
 --       herd_var, source, verified_at
@@ -41,14 +49,6 @@ CREATE TABLE IF NOT EXISTS herd_sessions (
                               -- NOT sessions.session_name — that one is
                               -- user-mutable and would break our handle.
     created_at   TEXT,
-    live         INTEGER NOT NULL DEFAULT 1,
-                              -- Denormalized from sessions.stopped_at.
-                              -- UNAVOIDABLE: SQLite prohibits subqueries in
-                              -- partial index WHERE clauses, so
-                              --   WHERE (SELECT stopped_at FROM sessions ...)
-                              -- is rejected outright. Merging placement+jobs
-                              -- does NOT remove this need. Maintained by
-                              -- trg_herd_job_death below.
 
     -- ── mutable: kitty placement, rewritten each reconcile ───────────────
     kitty_socket TEXT NOT NULL,   -- $KITTY_LISTEN_ON. window_id is MEANINGLESS
@@ -84,42 +84,29 @@ CREATE TABLE IF NOT EXISTS herd_sessions (
                                   -- last reconcile tick.
 );
 
+-- PLAIN, NON-UNIQUE lookup indexes. They are NOT uniqueness constraints —
+-- uniqueness ("one live session per window", "recyclable job names") is a
+-- property of reconcile's ground-truth rebuild + the R_job_live spawn check,
+-- not of the schema. Deliberately so: DB-enforced uniqueness needed the `live`
+-- denormalization, and that denormalization was the resume-desync bug. A window
+-- and a job are RECYCLABLE HANDLES — a dead row and a live row may share a
+-- (socket, window_id) or a job_name; the JOIN to sessions.stopped_at tells them
+-- apart. Dead rows keep their placement as history.
+--
 -- Reconcile's join: kitty hands us (socket, window_id); find the session.
 -- Composite because window_id alone is not unique across kitty instances.
---
--- `live = 1` IS LOAD-BEARING. Without it a DEAD session owns (socket,
--- window_id) forever, and the most ordinary thing a user can do — exit claude
--- and start another in the same window — makes the new session's placement
--- INSERT fail on UNIQUE. The session lands in tier 1 with no placement: listed
--- but unjumpable, and nothing surfaces an error. Same argument as
--- idx_herd_job_live below: a kitty window is a RECYCLABLE HANDLE, exactly like
--- a job name. Dead rows keep window_id as history.
---
--- THE CONTRACT THIS CREATES — read before writing any query on this key:
--- (kitty_socket, window_id) is now unique only among LIVE rows. A scalar
--- subquery keyed on the pair can therefore match a dead row and a live row and
--- SQLite will pick one ARBITRARILY. Every read, guard, or join on this pair
--- MUST carry `AND live = 1`. See writes.sql W2/W3a.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_herd_window
-    ON herd_sessions(kitty_socket, window_id)
-    WHERE window_id IS NOT NULL AND live = 1;
+CREATE INDEX IF NOT EXISTS idx_herd_window
+    ON herd_sessions(kitty_socket, window_id);
 
--- Job names are RECYCLABLE HANDLES, not permanent identifiers: unique among
--- live jobs only, so `herd new api-refactor` works again tomorrow after
--- today's died, while history is retained.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_herd_job_live
-    ON herd_sessions(job_name) WHERE live = 1 AND job_name IS NOT NULL;
+-- Spawn-time recyclable-handle check (R_job_live) looks up by job_name.
+CREATE INDEX IF NOT EXISTS idx_herd_job
+    ON herd_sessions(job_name);
 
--- Maintains the `live` denormalization. DECLARED HERE (tier 2 owns it) but
--- ATTACHED to sessions (tier 1). That keeps core/schema.sql free of any
--- mention of herd — the boundary is a SOURCE-level property. Same allowed
--- direction as reconcile writing tier-1 rows: tier2 -> tier1 is fine.
-CREATE TRIGGER IF NOT EXISTS trg_herd_job_death
-AFTER UPDATE OF stopped_at ON sessions
-WHEN NEW.stopped_at IS NOT NULL AND OLD.stopped_at IS NULL
-BEGIN
-    UPDATE herd_sessions SET live = 0 WHERE session_pk = NEW.id;
-END;
+-- NO TRIGGER. Tier 1 (sessions) has ZERO tier-2 machinery attached to it — the
+-- boundary is strictly one-way now (tier2 -> tier1 via FK only). The old
+-- trg_herd_job_death maintained the `live` denormalization; with liveness read
+-- by JOIN, there is nothing to maintain, and the resume desync it caused is
+-- gone by construction.
 
 
 -- ── HERD_ATTENTION ─────────────────────────────────────────────────────────

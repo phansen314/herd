@@ -17,27 +17,27 @@
 INSERT INTO sessions(cwd, status, status_source, started_at, updated_at)
 VALUES(:cwd, 'unknown', 'reconcile', :now, :now);
 -- :name W1_spawn_herd
-INSERT INTO herd_sessions(session_pk, job_name, created_at, live,
+INSERT INTO herd_sessions(session_pk, job_name, created_at,
                           kitty_socket, os_window_id, tab_id, window_id,
                           herd_var, source, verified_at)
-VALUES(:pk, :job, :now, 1, :socket, :oswin, :tab, :win, :job, 'spawn', :now);
+VALUES(:pk, :job, :now, :socket, :oswin, :tab, :win, :job, 'spawn', :now);
 
 
 -- ── W2. ADOPT via window_id (core/session_start.sh) ───────────────────────
 -- The hook runs INSIDE the kitty window, so $KITTY_WINDOW_ID is free from env
 -- (klawde's kitty_start.sh does exactly this — zero forks). A kitty window has
--- exactly one LIVE claude in it, so (socket, window_id, live=1) is an exact
+-- exactly one LIVE claude in it, so (socket, window_id) + liveness is an exact
 -- join key.
 -- This sidesteps pid entirely for the spawn path: SPIKE-1 is NOT blocking here.
 -- Idempotent: `AND session_id IS NULL` makes a re-fire a no-op.
 --
--- `AND live = 1` IS LOAD-BEARING (and `AND stopped_at IS NULL` is its belt).
--- A window outlives the claude in it. Without the liveness filter the subquery
--- matches the DEAD predecessor that still owns this window_id — and because
--- the pair is unique only among live rows, it can match BOTH and SQLite picks
--- one arbitrarily. Observed: Claude's UUID bound to the stopped row while the
--- live session stayed unadopted; R1 and W5 both filter `stopped_at IS NULL`,
--- so that session goes invisible and collects no metrics, silently.
+-- The liveness JOIN (`s.stopped_at IS NULL` inside the subquery) IS LOAD-BEARING.
+-- A window outlives the claude in it, so a DEAD predecessor row still owns this
+-- window_id. Without the filter the subquery matches it and binds Claude's UUID
+-- to the stopped row while the live session stays unadopted — R1 and W5 both
+-- filter `stopped_at IS NULL`, so that session goes invisible and collects no
+-- metrics, silently. Filtering by the session's own stopped_at (not a stored
+-- herd flag) is the whole point of the decouple: one source of truth.
 -- :name W2_adopt
 UPDATE sessions
 SET session_id      = :session_id,
@@ -49,9 +49,10 @@ SET session_id      = :session_id,
     last_event_at   = :now,
     last_event_type = 'start',
     updated_at      = :now
-WHERE id = (SELECT session_pk FROM herd_sessions
-            WHERE kitty_socket = :socket AND window_id = :win
-              AND live = 1)
+WHERE id = (SELECT h.session_pk FROM herd_sessions h
+            JOIN sessions s ON s.id = h.session_pk
+            WHERE h.kitty_socket = :socket AND h.window_id = :win
+              AND s.stopped_at IS NULL)
   AND session_id IS NULL
   AND stopped_at IS NULL;
 
@@ -103,21 +104,25 @@ ON CONFLICT(session_id) DO UPDATE SET
 -- exists with this pid/cwd"), not a herd fact. A different discoverer could do
 -- the same. Guarded so a re-tick is a no-op.
 --
--- `AND live = 1` IS LOAD-BEARING: without it a dead row still satisfies the
--- NOT EXISTS, so a session started in a REUSED window is never inserted at all.
+-- The liveness JOIN IS LOAD-BEARING: without `s.stopped_at IS NULL` a dead row
+-- still satisfies the NOT EXISTS, so a session started in a REUSED window is
+-- never inserted at all. Match by the session's own liveness, not a stored flag.
 -- :name W3a_discover
 INSERT INTO sessions(pid, cwd, status, status_source, started_at, updated_at)
 SELECT :pid, :cwd, 'unknown', 'reconcile', :now, :now
-WHERE NOT EXISTS (SELECT 1 FROM herd_sessions
-                  WHERE kitty_socket = :socket AND window_id = :win
-                    AND live = 1)
+WHERE NOT EXISTS (SELECT 1 FROM herd_sessions h
+                  JOIN sessions s ON s.id = h.session_pk
+                  WHERE h.kitty_socket = :socket AND h.window_id = :win
+                    AND s.stopped_at IS NULL)
 ON CONFLICT(pid) WHERE stopped_at IS NULL AND pid IS NOT NULL DO NOTHING;
 
 -- W3b: refresh placement. MUTABILITY CONTRACT — columns named explicitly;
--- job_name / created_at / live are NEVER in this list.
+-- job_name / created_at are NEVER in this list (there is no `live` anymore).
 -- The trailing WHERE is a NO-OP SUPPRESSOR: in steady state reconcile writes
 -- ZERO rows, which is what keeps WAL contention off the hooks' hot path.
 -- `IS NOT` (NULL-safe), never `!=`.
+-- Window reuse just works: a dead row and this live row may share (socket,
+-- window_id) — there is no UNIQUE index to violate, and the JOIN separates them.
 -- :name W3b_placement
 INSERT INTO herd_sessions(session_pk, kitty_socket, os_window_id, tab_id,
                           window_id, window_title, herd_var, source, verified_at)
@@ -137,7 +142,7 @@ WHERE herd_sessions.kitty_socket IS NOT excluded.kitty_socket
    OR herd_sessions.tab_id       IS NOT excluded.tab_id
    OR herd_sessions.window_id    IS NOT excluded.window_id
    OR herd_sessions.window_title IS NOT excluded.window_title;
-    -- job_name, created_at, live: ABSENT BY CONTRACT. Do not add them.
+    -- job_name, created_at: ABSENT BY CONTRACT. Do not add them.
     -- source preserves 'spawn' — provenance shouldn't decay to 'reconcile'.
     -- NOTE: verified_at is deliberately NOT a reason to write. Refreshing it
     -- on an unchanged placement would defeat the suppressor and put a write on
@@ -152,7 +157,8 @@ UPDATE sessions SET pid = :pid, updated_at = :now
 WHERE id = :pk AND pid IS NULL;
 
 -- W3d: rows whose pid is dead. Replaces klawde's 4-hour zombie-reap heuristic
--- with an exact local answer. Fires trg_herd_job_death -> frees the job name.
+-- with an exact local answer. Setting stopped_at makes every liveness JOIN see
+-- this session as dead -> its window and job free automatically (no trigger).
 --
 -- LIVENESS COMES FROM THE PROCESS TABLE, NOT FROM `ls`. Absence from `ls` is
 -- evidence about PLACEMENT and must never reach this statement: a socket blip,
@@ -207,16 +213,17 @@ SELECT id, :etype, 'hook', :now, :raw FROM sessions WHERE session_id = :session_
 
 -- W4b: SESSION END. The only hook-driven death, and distinct from W3d_reap:
 -- this one KNOWS (status_source='hook'), where reconcile only INFERS from the
--- process table ('pid'). Fires trg_herd_job_death -> frees the job name and the
--- window slot.
+-- process table ('pid'). Setting stopped_at makes every liveness JOIN see the
+-- session as dead — job name and window slot free automatically, no trigger.
 --
 -- session_end.sh MUST be registered BLOCKING, never async. An async hook can be
--- killed when the session exits, leaving stopped_at NULL and the row live until
--- reconcile notices. Worse, on `/clear` Claude emits SessionEnd then
--- SessionStart for the NEW session in the SAME window: if the end hasn't landed
--- first, both rows are live in one window and the new placement collides on
--- idx_herd_window. klawde learned this the hard way and documented it; its own
--- live settings.json still has the async bug its commit message warns against.
+-- killed when the session exits, leaving stopped_at NULL and the session
+-- appearing live until reconcile notices. On `/clear` Claude emits SessionEnd
+-- then SessionStart for the NEW session in the SAME window: if the end hasn't
+-- landed first, two sessions read as live in one window — harmless now (the
+-- JOIN + reconcile's rebuild resolve it), but the death should still land
+-- promptly. klawde's own live settings.json still has the async bug its commit
+-- message warns against.
 -- :name W4_end
 UPDATE sessions
 SET status          = 'stopped',
@@ -259,12 +266,15 @@ WHERE session_id = :session_id AND stopped_at IS NULL;
 -- does — it never needed them in the payload. That lets a reconciled session
 -- pick up metrics with no hooks wired.
 -- Still an UPDATE of an existing row: statusline never creates one.
+-- Same liveness JOIN as W2: bind the LIVE row in this window, never a dead
+-- predecessor that still owns the same (socket, window_id).
 -- :name W5b_adopt
 UPDATE sessions
 SET session_id = :session_id, updated_at = :now
-WHERE id = (SELECT session_pk FROM herd_sessions
-            WHERE kitty_socket = :socket AND window_id = :win
-              AND live = 1)
+WHERE id = (SELECT h.session_pk FROM herd_sessions h
+            JOIN sessions s ON s.id = h.session_pk
+            WHERE h.kitty_socket = :socket AND h.window_id = :win
+              AND s.stopped_at IS NULL)
   AND session_id IS NULL
   AND stopped_at IS NULL;
 
@@ -305,6 +315,19 @@ DELETE FROM herd_attention WHERE session_pk = :pk;
 -- :name W6d_rearm_sid
 DELETE FROM herd_attention
 WHERE session_pk = (SELECT id FROM sessions WHERE session_id = :session_id);
+
+
+-- ── R_job_live. RECYCLABLE-HANDLE CHECK (herd/kitty spawn) ─────────────────
+-- Job names are recyclable handles: `herd new api` must work again tomorrow
+-- after today's `api` died. There is no UNIQUE index enforcing this anymore
+-- (that needed the `live` denormalization, which was the resume-desync bug).
+-- Instead spawn asks: does a LIVE session already hold this name? Liveness is
+-- the session's own stopped_at, by JOIN — recyclability falls out for free,
+-- history is retained (dead rows keep their job_name). Returns a row iff taken.
+-- :name R_job_live
+SELECT h.session_pk FROM herd_sessions h
+JOIN sessions s ON s.id = h.session_pk
+WHERE h.job_name = :job AND s.stopped_at IS NULL;
 
 
 -- ── R1. THE TUI's MAIN READ ───────────────────────────────────────────────

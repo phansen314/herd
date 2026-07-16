@@ -68,8 +68,16 @@ check("schema/core.sql contains no herd_ tables",
 check("schema/core.sql declares no triggers",
       "create trigger" not in core_code)
 herd_code = "\n".join(l.split("--")[0] for l in HERD.splitlines()).lower()
-check("schema/herd.sql owns the trigger on sessions",
-      "create trigger" in herd_code and "on sessions" in herd_code)
+# The decouple removed the ONLY thing tier 2 attached to tier 1. Assert it stays
+# gone: no trigger anywhere, and nothing in herd.sql declares ON sessions. The
+# boundary is now strictly one-way (tier2 -> tier1 via FK), with zero tier-2
+# machinery reaching back into the core table.
+check("schema/herd.sql declares no trigger (decoupled)",
+      "create trigger" not in herd_code)
+check("no tier-2 DDL attaches to the sessions table",
+      "on sessions" not in herd_code)
+check("no `live` denormalization column anywhere",
+      "live" not in "".join(l.split("--")[0] for l in HERD.splitlines()).lower())
 
 # ── 45/46. THE TIER THESIS, EXECUTED ──────────────────────────────────────
 # Tier 1 claims to be "facts that would be true if herd didn't exist". Until
@@ -86,16 +94,28 @@ with guard("45 tier 1 applies standalone (herd absent entirely)"):
           t == ['events','sessions'],
           f"a herd-less install is a working install; tables={t}")
 
-with guard("46 tier 2 cannot stand without tier 1"):
+# 46 changed with the decouple. It used to prove the dependency at DDL time —
+# CREATE TRIGGER ... ON sessions failed if sessions didn't exist. With the
+# trigger gone, herd.sql applies standalone (SQLite does not validate FK parent
+# tables at CREATE TABLE time). So the dependency is now purely a RUNTIME fact:
+# tier 2 is inert without tier 1. Assert BOTH halves — the DDL change AND that
+# tier 2 remains non-functional alone.
+with guard("46 tier 2 applies standalone but is inert without tier 1"):
     if os.path.exists("g.db"): os.remove("g.db")
-    c2 = sqlite3.connect("g.db")
+    c2 = sqlite3.connect("g.db"); c2.isolation_level = None
+    c2.executescript(HERD)                       # applies standalone now — the new fact
+    c2.execute("PRAGMA foreign_keys=ON")
+    inert = False
     try:
-        c2.executescript(HERD)
-        check("46 tier 2 cannot stand without tier 1", False,
-              "herd.sql applied with no sessions table — the dependency is not real")
-    except sqlite3.OperationalError as e:
-        check("46 tier 2 cannot stand without tier 1", True,
-              f"one-way dependency proven: {e}")
+        # every use of herd_sessions must reach `sessions`; with it absent, even
+        # an insert cannot resolve its FK parent — tier 2 does nothing on its own.
+        c2.execute("INSERT INTO herd_sessions(session_pk,kitty_socket,source,verified_at)"
+                   " VALUES(1,'k','spawn',?)",(T0,))
+    except sqlite3.OperationalError:
+        inert = True
+    check("46 tier 2 applies standalone but is inert without tier 1", inert,
+          "herd.sql creates its tables alone, but every row it holds dangles off "
+          "sessions — the direction is real, just no longer DDL-enforced")
     c2.close(); os.remove("g.db")
 
 print("\n\033[1m═══ B. SCHEMA APPLIES ═══\033[0m")
@@ -110,9 +130,9 @@ print("\n\033[1m═══ C. THE SURROGATE KEY (the spine) ═══\033[0m")
 c = fresh()
 pk = c.execute("INSERT INTO sessions(cwd,status,status_source,started_at,updated_at) "
                "VALUES('/code/app','unknown','reconcile',?,?)",(T0,T0)).lastrowid
-c.execute("INSERT INTO herd_sessions(session_pk,job_name,created_at,live,kitty_socket,"
+c.execute("INSERT INTO herd_sessions(session_pk,job_name,created_at,kitty_socket,"
           "os_window_id,tab_id,window_id,herd_var,source,verified_at) "
-          "VALUES(?,?,?,1,?,?,?,?,?,'spawn',?)",
+          "VALUES(?,?,?,?,?,?,?,?,'spawn',?)",
           (pk,"api-refactor",T0,"unix:/tmp/kitty-1",1,3,7,"api-refactor",T0))
 c.execute("INSERT INTO herd_attention(session_pk,attention_at) VALUES(?,?)",(pk,T0))
 check("tier-2 rows exist with session_id NULL",
@@ -139,16 +159,15 @@ check("multiple unadopted rows coexist (UNIQUE ignores NULL)",
 print("\n\033[1m═══ D. MUTABILITY CONTRACT (reconcile must not clobber) ═══\033[0m")
 c = fresh()
 pk = c.execute("INSERT INTO sessions(cwd,started_at,updated_at) VALUES('/a',?,?)",(T0,T0)).lastrowid
-c.execute("INSERT INTO herd_sessions(session_pk,job_name,created_at,live,kitty_socket,"
-          "window_id,herd_var,source,verified_at) VALUES(?,?,?,1,?,?,?,'spawn',?)",
+c.execute("INSERT INTO herd_sessions(session_pk,job_name,created_at,kitty_socket,"
+          "window_id,herd_var,source,verified_at) VALUES(?,?,?,?,?,?,'spawn',?)",
           (pk,"api-refactor",T0,"unix:/tmp/kitty-1",7,"api-refactor",T0))
 c.execute(W["W3b_placement"], {"pk":pk,"socket":"unix:/tmp/kitty-9","oswin":2,"tab":5,
                                "win":42,"title":"new title","var":None,"now":T2})
-r = c.execute("SELECT job_name,created_at,live,window_id,tab_id,source,herd_var,verified_at "
+r = c.execute("SELECT job_name,created_at,window_id,tab_id,source,herd_var,verified_at "
               "FROM herd_sessions WHERE session_pk=?",(pk,)).fetchone()
 check("reconcile preserves job_name", r["job_name"] == "api-refactor")
 check("reconcile preserves created_at", r["created_at"] == T0)
-check("reconcile preserves live", r["live"] == 1)
 check("reconcile preserves herd_var (COALESCE)", r["herd_var"] == "api-refactor",
       "NULL from reconcile must not erase the spawn-time var")
 check("reconcile preserves source='spawn'", r["source"] == "spawn", "provenance doesn't decay")
@@ -156,37 +175,40 @@ check("reconcile DOES update window_id", r["window_id"] == 42)
 check("reconcile DOES update tab_id", r["tab_id"] == 5)
 check("reconcile DOES update verified_at", r["verified_at"] == T2)
 
-print("\n\033[1m═══ E. JOB NAMES: recyclable handles + history ═══\033[0m")
+print("\n\033[1m═══ E. JOB NAMES: recyclable handles via R_job_live (no trigger, no UNIQUE) ═══\033[0m")
+# Recyclability is now the R_job_live check + sessions.stopped_at, not a partial
+# UNIQUE index maintained by a trigger. "Taken" == a LIVE session holds the name.
 c = fresh()
+def job_holder(conn, job):
+    r = conn.execute(W["R_job_live"], {"job": job}).fetchone()
+    return r["session_pk"] if r else None
+
 p1 = c.execute("INSERT INTO sessions(cwd,started_at,updated_at) VALUES('/a',?,?)",(T0,T0)).lastrowid
 c.execute("INSERT INTO herd_sessions(session_pk,job_name,created_at,kitty_socket,window_id,source,verified_at)"
           " VALUES(?,?,?,?,?,'spawn',?)",(p1,"api-refactor",T0,"unix:/tmp/k1",7,T0))
+check("R_job_live reports the live holder", job_holder(c, "api-refactor") == p1,
+      "spawn checks this and refuses a name a live session already holds")
+# the DB does NOT reject a duplicate insert anymore — the app must consult
+# R_job_live first. Prove the constraint is gone (so a stale/dead row can't block):
 p2 = c.execute("INSERT INTO sessions(cwd,started_at,updated_at) VALUES('/b',?,?)",(T0,T0)).lastrowid
-try:
-    c.execute("INSERT INTO herd_sessions(session_pk,job_name,created_at,kitty_socket,window_id,source,verified_at)"
-              " VALUES(?,?,?,?,?,'spawn',?)",(p2,"api-refactor",T0,"unix:/tmp/k1",8,T0))
-    check("duplicate live job_name rejected", False, "it was ALLOWED")
-except sqlite3.IntegrityError:
-    check("duplicate live job_name rejected", True)
-# kill session 1 -> trigger must free the name
-c.execute("UPDATE sessions SET stopped_at=? WHERE id=?",(T2,p1))
-check("trg_herd_job_death fired",
-      c.execute("SELECT live FROM herd_sessions WHERE session_pk=?",(p1,)).fetchone()[0] == 0)
+c.execute("UPDATE sessions SET stopped_at=? WHERE id=?",(T2,p1))   # holder dies (just stopped_at)
+check("death frees the name with no trigger", job_holder(c, "api-refactor") is None,
+      "setting stopped_at makes R_job_live see it dead — no live column to desync")
+# reuse: session 2 takes the name. history retained (both rows keep job_name).
 c.execute("INSERT INTO herd_sessions(session_pk,job_name,created_at,kitty_socket,window_id,source,verified_at)"
           " VALUES(?,?,?,?,?,'spawn',?)",(p2,"api-refactor",T2,"unix:/tmp/k1",8,T2))
 check("name reusable after death",
       c.execute("SELECT COUNT(*) FROM herd_sessions WHERE job_name='api-refactor'").fetchone()[0] == 2,
       "history retained: 2 rows, one live one dead")
-# trigger must NOT fire on unrelated updates
-c.execute("UPDATE sessions SET updated_at=? WHERE id=?",(T2,p2))
-check("trigger ignores non-death updates",
-      c.execute("SELECT live FROM herd_sessions WHERE session_pk=?",(p2,)).fetchone()[0] == 1)
-# NULL job_name (reconciled sessions) must not collide
+check("R_job_live returns exactly the LIVE holder among history",
+      job_holder(c, "api-refactor") == p2,
+      "dead + live rows share the name; the JOIN picks the live one")
+# NULL job_name (reconciled sessions) never collides and is never 'held'
 p3 = c.execute("INSERT INTO sessions(cwd,started_at,updated_at) VALUES('/c',?,?)",(T0,T0)).lastrowid
 p4 = c.execute("INSERT INTO sessions(cwd,started_at,updated_at) VALUES('/d',?,?)",(T0,T0)).lastrowid
 c.execute("INSERT INTO herd_sessions(session_pk,kitty_socket,window_id,source,verified_at) VALUES(?,?,?,'reconcile',?)",(p3,"unix:/tmp/k1",20,T0))
 c.execute("INSERT INTO herd_sessions(session_pk,kitty_socket,window_id,source,verified_at) VALUES(?,?,?,'reconcile',?)",(p4,"unix:/tmp/k1",21,T0))
-check("many NULL job_names coexist", True, "reconciled sessions have no job")
+check("many NULL job_names coexist", job_holder(c, None) is None, "reconciled sessions have no job")
 
 print("\n\033[1m═══ F. PID / LIVENESS ═══\033[0m")
 c = fresh()
@@ -280,17 +302,23 @@ try:
     check("FK enforced on herd_sessions", False, "orphan accepted!")
 except sqlite3.IntegrityError:
     check("FK enforced on herd_sessions", True)
-# composite window uniqueness
+# (socket,window_id) is DELIBERATELY NOT unique anymore. A dead row and a live
+# row may share a window — that is what makes window reuse and resume work
+# without a `live` denormalization. The liveness JOIN separates them; reconcile's
+# ground-truth rebuild keeps at most one LIVE row per window (an app invariant,
+# tested in the reconcile fixture, not by a DB constraint).
 p2 = c.execute("INSERT INTO sessions(cwd,started_at,updated_at) VALUES('/b',?,?)",(T0,T0)).lastrowid
 c.execute("INSERT INTO herd_sessions(session_pk,kitty_socket,window_id,source,verified_at) VALUES(?,?,?,'spawn',?)",(pk,"unix:/tmp/k1",7,T0))
-try:
-    c.execute("INSERT INTO herd_sessions(session_pk,kitty_socket,window_id,source,verified_at) VALUES(?,?,?,'spawn',?)",(p2,"unix:/tmp/k1",7,T0))
-    check("(socket,window_id) unique", False, "duplicate window accepted!")
-except sqlite3.IntegrityError:
-    check("(socket,window_id) unique", True, "one claude per kitty window")
-c.execute("INSERT INTO herd_sessions(session_pk,kitty_socket,window_id,source,verified_at) VALUES(?,?,?,'spawn',?)",(p2,"unix:/tmp/kitty-OTHER",7,T0))
-check("same window_id on DIFFERENT socket is legal", True,
-      "listen_on unix:/tmp/kitty-{kitty_pid} => per-instance id space")
+c.execute("UPDATE sessions SET stopped_at=? WHERE id=?",(T1,pk))   # first holder dies
+c.execute("INSERT INTO herd_sessions(session_pk,kitty_socket,window_id,source,verified_at) VALUES(?,?,?,'spawn',?)",(p2,"unix:/tmp/k1",7,T0))
+check("(socket,window_id) may repeat across a dead+live pair", True,
+      "no UNIQUE constraint — window is a recyclable handle; JOIN tells them apart")
+live_in_win = c.execute(
+    "SELECT h.session_pk FROM herd_sessions h JOIN sessions s ON s.id=h.session_pk "
+    "WHERE h.kitty_socket='unix:/tmp/k1' AND h.window_id=7 AND s.stopped_at IS NULL").fetchall()
+check("exactly one LIVE session resolves for the reused window",
+      [r["session_pk"] for r in live_in_win] == [p2],
+      "the JOIN returns only the live occupant; the dead row is history")
 
 print("\n\033[1m═══ L. TUI MAIN QUERY ═══\033[0m")
 c = fresh()
@@ -319,30 +347,56 @@ check("attention-first ordering", rows[0]["cwd"] == "/app" and rows[0]["attentio
 # ═══════════════════════════════════════════════════════════════════════════
 print("\n\033[1m═══ M. WINDOW REUSE + WRITE PATHS (41-44) ═══\033[0m")
 
-# ── 41. a window is a RECYCLABLE HANDLE, exactly like a job name ───────────
-c = fresh()
+# ── 41. a window is a RECYCLABLE HANDLE — dead + live rows coexist, JOIN splits ──
 SOCK = "unix:/tmp/kitty-20035"
+def live_in_window(conn, sock, win):
+    return [r["session_pk"] for r in conn.execute(
+        "SELECT h.session_pk FROM herd_sessions h JOIN sessions s ON s.id=h.session_pk "
+        "WHERE h.kitty_socket=? AND h.window_id=? AND s.stopped_at IS NULL", (sock, win))]
+
+c = fresh()
 a = c.execute("INSERT INTO sessions(pid,cwd,started_at,updated_at) VALUES(111,'/code/herd',?,?)",(T0,T0)).lastrowid
 c.execute("INSERT INTO herd_sessions(session_pk,created_at,kitty_socket,window_id,source,verified_at)"
           " VALUES(?,?,?,5,'reconcile',?)",(a,T0,SOCK,T0))
 c.execute("UPDATE sessions SET stopped_at=?,status='stopped' WHERE id=?",(T1,a))
 b = c.execute("INSERT INTO sessions(pid,cwd,started_at,updated_at) VALUES(222,'/code/herd',?,?)",(T2,T2)).lastrowid
-try:
-    c.execute("INSERT INTO herd_sessions(session_pk,created_at,kitty_socket,window_id,source,verified_at)"
-              " VALUES(?,?,?,5,'reconcile',?)",(b,T2,SOCK,T2))
-    check("41 window reuse: new session gets placement in a reused window", True,
-          "dead row keeps window_id as history")
-except sqlite3.IntegrityError as e:
-    check("41 window reuse: new session gets placement in a reused window", False,
-          f"dead session owns the window forever: {e}")
-# ...and the original invariant must survive the fix
-c3 = c.execute("INSERT INTO sessions(pid,cwd,started_at,updated_at) VALUES(333,'/x',?,?)",(T2,T2)).lastrowid
-try:
-    c.execute("INSERT INTO herd_sessions(session_pk,created_at,kitty_socket,window_id,source,verified_at)"
-              " VALUES(?,?,?,5,'reconcile',?)",(c3,T2,SOCK,T2))
-    check("41b two LIVE sessions in one window still rejected", False, "REGRESSION: allowed!")
-except sqlite3.IntegrityError:
-    check("41b two LIVE sessions in one window still rejected", True, "invariant preserved")
+# no UNIQUE index: the reused-window placement INSERT simply succeeds now.
+c.execute("INSERT INTO herd_sessions(session_pk,created_at,kitty_socket,window_id,source,verified_at)"
+          " VALUES(?,?,?,5,'reconcile',?)",(b,T2,SOCK,T2))
+check("41 window reuse: new session gets placement in a reused window",
+      live_in_window(c, SOCK, 5) == [b],
+      "dead A + live B share window 5; the JOIN returns only B (A is history)")
+# The 'one live per window' invariant is now app-level (reconcile's rebuild), not
+# a DB constraint. The DB DELIBERATELY allows two live rows — assert that, so a
+# future reader doesn't expect the old UNIQUE to catch a rebuild bug.
+c.execute("UPDATE sessions SET stopped_at=NULL WHERE id=?",(a,))   # force both live
+check("41b DB no longer rejects two live rows in one window (app-level now)",
+      len(live_in_window(c, SOCK, 5)) == 2,
+      "reconcile's ground-truth rebuild keeps it to one; the reconcile fixture tests that")
+
+# ── 41c. THE RESUME REGRESSION — the reason this whole pass exists ─────────
+# Old model: die -> trigger live=0; resume (W2b sets stopped_at=NULL) never reset
+# live, so job/window read as free forever while the session was live. Permanent
+# desync. New model: liveness IS stopped_at, so revive is self-consistent with
+# no flag to forget. This check FAILS on the old schema and passes on the new.
+c = fresh()
+pk = c.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at)"
+               " VALUES('u1','/code/herd','working',?,?)",(T0,T0)).lastrowid
+c.execute("INSERT INTO herd_sessions(session_pk,job_name,created_at,kitty_socket,"
+          "window_id,source,verified_at) VALUES(?,'api',?,?,5,'spawn',?)",(pk,T0,SOCK,T0))
+c.execute(W["W4_end"], {"session_id":"u1","now":T1})            # die (SessionEnd)
+dead_job = c.execute(W["R_job_live"], {"job":"api"}).fetchone()
+dead_win = live_in_window(c, SOCK, 5)
+c.execute(W["W2b_insert"], {"session_id":"u1","cwd":"/code/herd","model":"opus",
+                            "transcript":"/t.jsonl","now":T2})  # claude --resume
+revived_job = c.execute(W["R_job_live"], {"job":"api"}).fetchone()
+revived_win = live_in_window(c, SOCK, 5)
+check("41c resume revives job+window with no stored flag to desync",
+      dead_job is None and dead_win == []
+      and revived_job is not None and revived_job["session_pk"] == pk and revived_win == [pk],
+      f"dead(job={dead_job and dead_job['session_pk']},win={dead_win}) -> "
+      f"revived(job={revived_job and revived_job['session_pk']},win={revived_win}); "
+      "old model left both empty forever")
 
 # ── 42. THE THESIS: last_event_at must advance on repeated same-status events ──
 # post_tool_use.sh is the hot path and always sends status='working'. A guard of
@@ -395,27 +449,32 @@ with guard("43b W5b statusline-adopt also targets the LIVE row"):
           live_sid == "uuid-C" and dead_sid is None,
           f"dead={dead_sid} live={live_sid}")
 
-# ── 44. source-level: the (socket, window_id) contract ────────────────────
-# The pair is unique only among LIVE rows, so a scalar subquery on it can match
-# a dead row AND a live row — SQLite then picks one arbitrarily. Every query on
-# the pair must carry `AND live = 1`. No runtime test catches a NEW query that
-# forgets; this does.
+# ── 44. source-level: liveness is derived, never stored ───────────────────
+# The invariant flipped with the decouple. It USED to be "every (socket,window)
+# lookup carries AND live=1". It is now "liveness is read from sessions, never a
+# herd_sessions.live column" — so any statement that looks up a session by
+# (socket, window_id) must JOIN sessions and filter stopped_at, and the word
+# `live` must not appear as a column reference anywhere.
 writes_code = "\n".join(l.split("--")[0] for l in WRITES.splitlines())
 stmts = [s for s in writes_code.split(";") if "window_id" in s and "kitty_socket" in s]
-offenders = [" ".join(s.split())[:60] for s in stmts
-             if re.search(r"WHERE[\s\S]*kitty_socket\s*=", s, re.I) and not re.search(r"live\s*=\s*1", s, re.I)]
-check("44 every (socket,window_id) lookup filters live=1", not offenders,
-      f"unguarded: {offenders}" if offenders else "W2, W3a, W5b all guarded")
-# Ask the DB what the index actually IS. Regexing the source text here reads the
-# PROSE in the neighbouring idx_herd_job_live comment (which legitimately says
-# "live = 1") and passes even when the index predicate is gone — a check that
-# cannot fail is worse than no check, because it manufactures confidence.
+lookups = [s for s in stmts if re.search(r"WHERE[\s\S]*kitty_socket\s*=", s, re.I)]
+offenders = [" ".join(s.split())[:70] for s in lookups
+             if not re.search(r"stopped_at\s+IS\s+NULL", s, re.I)]
+check("44 every (socket,window_id) lookup derives liveness via stopped_at",
+      not offenders,
+      f"un-joined: {offenders}" if offenders else "W2, W3a, W5b all JOIN sessions.stopped_at")
+check("44a no `live` column reference survives in the write paths",
+      not re.search(r"\blive\s*=\s*1\b", writes_code, re.I),
+      "the denormalization is gone; nothing may filter on it")
+# Ask the DB what the index actually IS — it must NOT be unique now.
 c = fresh()
 idx_sql = c.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_herd_window'").fetchone()
-check("44b idx_herd_window is partial on live=1",
-      idx_sql is not None and re.search(r"live\s*=\s*1", idx_sql[0], re.I) is not None,
-      "a dead session must not own a window forever; "
-      + (f"predicate: {idx_sql[0].split('WHERE')[-1].strip()}" if idx_sql else "index MISSING"))
+check("44b idx_herd_window is a plain (non-unique) lookup index",
+      idx_sql is not None and "unique" not in idx_sql[0].lower(),
+      f"got: {idx_sql[0] if idx_sql else 'MISSING'}")
+check("44b2 herd_sessions has no `live` column",
+      not any(r[1] == "live" for r in c.execute("PRAGMA table_info(herd_sessions)")),
+      "liveness lives only in sessions.stopped_at")
 # and the inverse of 42, at source level: statusline may never carry a clock
 w5 = W["W5_statusline"].split("--")[0]
 check("44c W5_statusline never touches last_event_*", "last_event" not in w5.lower(),
@@ -571,6 +630,8 @@ with guard("52 notification ignores idle_prompt, honours permission_prompt"):
     c.close()
 
 # ── 53. SessionEnd is the hook-driven death, and frees the handles ────────
+# No trigger, no live flag: setting stopped_at is what makes R_job_live and the
+# window JOIN see the session as dead. The slot frees automatically.
 with guard("53 session_end stops the session and frees job+window"):
     c = fresh()
     pk = c.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at)"
@@ -581,12 +642,15 @@ with guard("53 session_end stops the session and frees job+window"):
     hook("session_end.sh", {"session_id":"s1","reason":"prompt_input_exit",
                             "hook_event_name":"SessionEnd"})
     c = sqlite3.connect(DBPATH); c.row_factory = sqlite3.Row
-    r = c.execute("SELECT s.status,s.status_source,s.stopped_at,h.live FROM sessions s "
-                  "JOIN herd_sessions h ON h.session_pk=s.id WHERE s.session_id='s1'").fetchone()
+    r = c.execute("SELECT status,status_source,stopped_at FROM sessions WHERE session_id='s1'").fetchone()
+    job_free = c.execute(W["R_job_live"], {"job":"api"}).fetchone() is None
+    win_free = not c.execute("SELECT 1 FROM herd_sessions h JOIN sessions s ON s.id=h.session_pk "
+                             "WHERE h.window_id=5 AND s.stopped_at IS NULL").fetchone()
     check("53 session_end stops the session and frees job+window",
-          r["status"]=="stopped" and r["stopped_at"] is not None and r["live"]==0
-          and r["status_source"]=="hook",
-          f"status_source={r['status_source']} (hook KNOWS; reconcile only infers 'pid'); live={r['live']}")
+          r["status"]=="stopped" and r["stopped_at"] is not None
+          and r["status_source"]=="hook" and job_free and win_free,
+          f"status_source={r['status_source']} (hook KNOWS; reconcile infers 'pid'); "
+          f"job_free={job_free} win_free={win_free}")
     c.close()
 
 # ── 54. bind() must refuse an unbound param, never bind NULL silently ─────
