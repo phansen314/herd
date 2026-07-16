@@ -29,8 +29,8 @@ export HERD_P_raw=""
 run W4_event_log >/dev/null 2>&1
 
 # The turn ended, so any silence herd already paged about is over: clear the
-# attention row and let the rule trip fresh. W6d is the RE-ARM — ack means
-# "I've seen THIS silence", not "never bother me about this session again".
-printf 'DELETE FROM herd_attention WHERE session_pk = (SELECT id FROM sessions WHERE session_id = %s);\n' \
-    "'${SID//\'/\'\'}'" | db >/dev/null 2>&1
+# attention row and let the rule trip fresh. W6d_rearm_sid is the RE-ARM — ack
+# means "I've seen THIS silence", not "never bother me about this session
+# again". Goes through run()/writes.sql like every other write: no inlined SQL.
+run W6d_rearm_sid >/dev/null 2>&1
 exit 0

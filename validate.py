@@ -608,6 +608,36 @@ with guard("54b bind() does not rescan substituted values"):
     check("54b bind() does not rescan substituted values",
           "'/tmp/:now/x'" in r.stdout, f"a cwd containing ':now' survives: {r.stdout.strip()}")
 
+# ── 55. stop.sh re-arms through writes.sql (W6d_rearm_sid), end to end ────
+with guard("55 stop re-arm goes through the canonical statement"):
+    c = fresh()
+    pk = c.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at)"
+                   " VALUES('s9','/a','working',?,?)",(T0,T0)).lastrowid
+    c.execute("INSERT INTO herd_attention(session_pk,attention_at,paged_level) VALUES(?,?,3)",(pk,T0))
+    c.close()
+    hook("stop.sh", {"session_id":"s9","stop_hook_active":False,"hook_event_name":"Stop"})
+    c = sqlite3.connect(DBPATH)
+    att = c.execute("SELECT COUNT(*) FROM herd_attention WHERE session_pk=?",(pk,)).fetchone()[0]
+    check("55 stop re-arm goes through the canonical statement", att==0,
+          "attention row cleared by W6d_rearm_sid, not by inlined SQL")
+    c.close()
+
+# ── 56. NO hook may inline DML. Every write goes through run()/writes.sql, or
+# the check-47 drift guard is blind to it and bind()'s quoting is bypassed. The
+# one exception is common.sh's db()/run() plumbing, which is the sanctioned path.
+with guard("56 no hook script inlines INSERT/UPDATE/DELETE"):
+    offenders = []
+    for shf in sorted(HOOKS.glob("*.sh")):
+        if shf.name == "common.sh":
+            continue   # the db()/run() wrapper IS the sanctioned SQL path
+        for i, line in enumerate(shf.read_text().splitlines(), 1):
+            code = line.split("#", 1)[0]
+            if re.search(r"\b(INSERT|UPDATE|DELETE)\s", code, re.I):
+                offenders.append(f"{shf.name}:{i}")
+    check("56 no hook script inlines INSERT/UPDATE/DELETE", not offenders,
+          f"inlined DML at {offenders}" if offenders
+          else "every write routes through run() -> writes.sql")
+
 shutil.rmtree(RUNTIME, ignore_errors=True)
 
 print("\n" + "═"*72)

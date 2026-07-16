@@ -296,6 +296,16 @@ WHERE session_pk = :pk
 -- :name W6d_rearm
 DELETE FROM herd_attention WHERE session_pk = :pk;
 
+-- W6d_sid: same re-arm, keyed by Claude's UUID instead of the surrogate pk.
+-- The pager (python) works from R1 and holds :pk; a HOOK only has session_id,
+-- so stop.sh needs this variant. Without it the hook would inline its own
+-- DELETE — a write path outside this file, invisible to the check-47 drift
+-- guard, re-introducing the hand-quoting bind() exists to kill. Same
+-- keyed-two-ways pattern as W2_adopt (socket,window) vs W2b_insert (session_id).
+-- :name W6d_rearm_sid
+DELETE FROM herd_attention
+WHERE session_pk = (SELECT id FROM sessions WHERE session_id = :session_id);
+
 
 -- ── R1. THE TUI's MAIN READ ───────────────────────────────────────────────
 -- One query, all four tables. Attention-first ordering.
