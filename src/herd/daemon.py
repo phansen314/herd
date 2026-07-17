@@ -21,14 +21,20 @@ its resources and stop paging you even when you are not looking. This is what
 It soft-marks `stopped_at` (NULL -> timestamp) and NEVER deletes rows — this is
 live-set correctness, not table-size management. Pruning is a separate concern.
 
-IO (read_proc_table / boot_time_iso) is split from logic (reap_once / boot_sweep /
-_dead) so the tick is testable with an injected process table — the same discipline
-as claude_pid()/_walk_claude() in hooks/common.sh. The canonical W3d/W3e statements
-are loaded through herd.db.load_statements(), never inlined, so the daemon and the
-suite exercise the SAME SQL.
+The loop carries TWO layers (see _attention_enabled): the CORE reaper (tier 1,
+always) and the HERD attention tick (tier 2, gated by HERD_ATTENTION). Run herd for
+pure core data collection with HERD_ATTENTION=0 and build your own tooling on the
+sessions table; the tier-1/tier-2 seam the schema enforces is honored here too.
 
-    python -m herd.daemon          # run the reap loop
-    python -m herd.daemon --once   # one boot-sweep + reap tick, then exit
+IO (read_proc_table / boot_time_iso) is split from logic (reap_once / boot_sweep /
+_dead / needs_attention / attention_tick) so ticks are testable with injected
+inputs — the same discipline as claude_pid()/_walk_claude() in hooks/common.sh. The
+canonical W3d/W3e/W6 statements load through herd.db.load_statements(), never
+inlined, so the daemon and the suite exercise the SAME SQL.
+
+    python -m herd.daemon          # reaper + attention (default)
+    python -m herd.daemon --once   # one tick, then exit
+    HERD_ATTENTION=0 python -m herd.daemon   # core-only: reaper, no herd_attention
 """
 import datetime
 import os
@@ -45,6 +51,36 @@ W = load_statements()
 # matches this. A node-based install overrides both via HERD_CLAUDE_NAME so the hook
 # (which finds the pid) and the reaper (which keeps it alive) stay consistent.
 CLAUDE_NAME = os.environ.get("HERD_CLAUDE_NAME", "claude")
+
+# ── attention: the silence rule ──────────────────────────────────────────────
+# "Needs attention" is DERIVED here every tick from a session's status + how long
+# it has been in it (now - last_event_at), never stored as a flag. What persists in
+# herd_attention is the EDGE (attention_at: when the rule first tripped). A session
+# is page-worthy when Claude is blocked ON YOU or wedged:
+#   waiting        — turn ended, Claude wants input; grace before it's "waiting on you"
+#   needs_approval — a permission prompt is up; shorter grace
+#   working        — no new event in a long time -> likely stuck
+# Thresholds are seconds, env-overridable for tuning. Statuses not listed (stopped,
+# unknown) are never page-worthy. Actually NOTIFYING you (notify-send / a TUI badge)
+# is a separate actuator, deliberately deferred — this chunk maintains the signal.
+ATTENTION_SECS = {
+    "waiting":        int(os.environ.get("HERD_WAIT_SECS", "30")),
+    "needs_approval": int(os.environ.get("HERD_APPROVAL_SECS", "15")),
+    "working":        int(os.environ.get("HERD_STUCK_SECS", "300")),
+}
+
+
+def _attention_enabled():
+    """The daemon has TWO layers on one loop:
+      CORE (tier 1)  — the reaper: writes sessions.stopped_at from ps liveness. A
+                       fact true whether or not herd exists. ALWAYS runs.
+      HERD (tier 2)  — the attention tick: writes herd_attention, herd's OPINION
+                       about which sessions need YOU. Gated by HERD_ATTENTION.
+    Default on. Set HERD_ATTENTION=0/false/no/off for CORE-ONLY collection: the
+    sessions table stays maintained, herd_attention is never touched, and you can
+    build your own tooling on top. This keeps the tier-1/tier-2 seam the schema
+    enforces visible at the process boundary too."""
+    return os.environ.get("HERD_ATTENTION", "1").strip().lower() not in ("0", "false", "no", "off")
 
 # Matches common.sh: HERD_DB or ~/.herd/herd.db.
 DEFAULT_DB = os.environ.get("HERD_DB", str(pathlib.Path.home() / ".herd" / "herd.db"))
@@ -148,12 +184,68 @@ def boot_sweep(conn, now, boot_time):
         conn.execute(W["W3e_boot_sweep"], {"now": now, "boot_time": boot_time})
 
 
+# ── attention tick ───────────────────────────────────────────────────────────
+def _epoch(iso):
+    """Parse an ISO-UTC stamp (with or without millis) to epoch seconds, or None."""
+    if not iso:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return (datetime.datetime.strptime(iso, fmt)
+                    .replace(tzinfo=datetime.timezone.utc).timestamp())
+        except ValueError:
+            continue
+    return None
+
+
+def needs_attention(status, last_event_at, now):
+    """True when a session has been in a page-worthy status longer than its
+    threshold. Unlisted statuses (stopped/unknown) and unparseable stamps -> False."""
+    secs = ATTENTION_SECS.get(status)
+    if secs is None:
+        return False
+    a, b = _epoch(last_event_at), _epoch(now)
+    if a is None or b is None:
+        return False
+    return (b - a) >= secs
+
+
+def attention_tick(conn, now):
+    """Keep herd_attention in sync with the derived silence rule. Arms a session
+    that newly needs attention (W6a, edge-preserving) and disarms one that no longer
+    does (W6d). The daemon owns the derived edge; ack/paging (deferred) layer on top.
+    Returns (armed, disarmed) counts."""
+    armed = disarmed = 0
+    rows = conn.execute(
+        "SELECT s.id, s.status, s.last_event_at, "
+        "       (a.session_pk IS NOT NULL) AS is_armed "
+        "FROM sessions s LEFT JOIN herd_attention a ON a.session_pk = s.id "
+        "WHERE s.stopped_at IS NULL"
+    ).fetchall()
+    for r in rows:
+        na = needs_attention(r["status"], r["last_event_at"], now)
+        if na and not r["is_armed"]:
+            conn.execute(W["W6a_arm"], {"pk": r["id"], "now": now})
+            armed += 1
+        elif not na and r["is_armed"]:
+            conn.execute(W["W6d_rearm"], {"pk": r["id"]})
+            disarmed += 1
+    return armed, disarmed
+
+
 # ── driver ───────────────────────────────────────────────────────────────────
-def run(interval=2.0, db_path=None, once=False):
+def run(interval=2.0, db_path=None, once=False, attend=None):
+    """CORE reaper every tick; HERD attention tick only when enabled (attend, or
+    HERD_ATTENTION when attend is None)."""
+    if attend is None:
+        attend = _attention_enabled()
     conn = connect(db_path or DEFAULT_DB)   # one RW connection: busy_timeout + WAL
     boot_sweep(conn, _now_iso(), boot_time_iso())
     while True:
-        reap_once(conn, read_proc_table(), _now_iso())
+        now = _now_iso()
+        reap_once(conn, read_proc_table(), now)       # tier 1 — always
+        if attend:
+            attention_tick(conn, now)                 # tier 2 — herd's opinion
         if once:
             return
         time.sleep(interval)

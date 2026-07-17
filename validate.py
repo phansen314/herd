@@ -1159,7 +1159,7 @@ check("70 W2b_placement records the hook's window (source=hook, no job)",
 # is hook-written. W2b_placement's surviving value — the jump target — is check 70.)
 
 print("\n\033[1m═══ R. LIVENESS REAPER (daemon.py) ═══\033[0m")
-from herd.daemon import reap_once, boot_sweep, _parse_proc_table, _dead
+from herd.daemon import reap_once, boot_sweep, _parse_proc_table, _dead, needs_attention, attention_tick
 
 def _live_sess(conn, sid, pid, started=T0, le=T0):
     return conn.execute(
@@ -1225,6 +1225,96 @@ check("_parse_proc_table parses state+basename(comm), skips junk/short lines",
 check("_dead: absent->True, zombie->True, non-claude->True, live claude->False",
       _dead(1,{}) and _dead(1,{1:("Z","claude")}) and _dead(1,{1:("S","bash")})
       and not _dead(1,{1:("S","claude")}))
+
+print("\n\033[1m═══ S. ATTENTION TICK (daemon.py) ═══\033[0m")
+# The silence rule, derived from status + (now - last_event_at). Actuator deferred.
+T0_20 = "2026-07-15T10:00:20.000Z"   # T0 + 20s
+T0_10 = "2026-07-15T10:00:10.000Z"   # T0 + 10s
+T0_240 = "2026-07-15T10:04:00.000Z"  # T0 + 240s
+check("needs_attention: waiting trips after its grace (>=30s), not before",
+      needs_attention("waiting", T0, T1) and not needs_attention("waiting", T0, T0))
+check("needs_attention: needs_approval grace is ~15s",
+      needs_attention("needs_approval", T0, T0_20) and not needs_attention("needs_approval", T0, T0_10))
+check("needs_attention: working is 'stuck' only after ~5min",
+      needs_attention("working", T0, T1) and not needs_attention("working", T0, T0_240))
+check("needs_attention: stopped/unknown never trip; NULL last_event never trips",
+      not needs_attention("stopped", T0, T2) and not needs_attention("unknown", T0, T2)
+      and not needs_attention("working", None, T2))
+
+def _att(conn, pk):
+    r = conn.execute("SELECT attention_at FROM herd_attention WHERE session_pk=?",(pk,)).fetchone()
+    return r["attention_at"] if r else None
+
+# arms a session past threshold; leaves a fresh one alone.
+c = fresh()
+w = c.execute("INSERT INTO sessions(session_id,cwd,status,last_event_at,last_event_type,started_at,updated_at)"
+              " VALUES('w','/a','waiting',?,'stop',?,?)",(T0,T0,T0)).lastrowid
+fresh_s = c.execute("INSERT INTO sessions(session_id,cwd,status,last_event_at,last_event_type,started_at,updated_at)"
+                    " VALUES('f','/a','waiting',?,'stop',?,?)",(T1,T1,T1)).lastrowid
+armed, dis = attention_tick(c, T1)   # w waited 5min (arm), f just started (no)
+check("attention_tick arms a session past its silence threshold, not a fresh one",
+      armed==1 and dis==0 and _att(c,w)==T1 and _att(c,fresh_s) is None,
+      f"armed={armed} disarmed={dis} w={_att(c,w)!r} fresh={_att(c,fresh_s)!r}")
+
+# the edge is not re-stamped on a later tick while the condition persists.
+c.execute("UPDATE sessions SET updated_at=? WHERE id=?",(T2,w))
+attention_tick(c, T2)   # w still waiting on the SAME last_event_at=T0
+check("attention_tick preserves the edge (W6a COALESCE), doesn't re-stamp",
+      _att(c,w)==T1, f"edge moved to {_att(c,w)!r} (must stay {T1})")
+
+# disarms when the condition clears (session resumed working, recent activity).
+c = fresh()
+d = c.execute("INSERT INTO sessions(session_id,cwd,status,last_event_at,last_event_type,started_at,updated_at)"
+              " VALUES('d','/a','working',?,'tool',?,?)",(T1,T1,T1)).lastrowid
+c.execute("INSERT INTO herd_attention(session_pk,attention_at) VALUES(?,?)",(d,T0))  # was armed
+armed, dis = attention_tick(c, T1)   # working, active 0s ago -> not page-worthy
+check("attention_tick disarms a session whose silence cleared",
+      dis==1 and armed==0 and _att(c,d) is None,
+      f"armed={armed} disarmed={dis} row={_att(c,d)!r}")
+
+# stopped sessions are outside the tick entirely (never armed).
+c = fresh()
+s = c.execute("INSERT INTO sessions(session_id,cwd,status,last_event_at,last_event_type,started_at,updated_at,stopped_at)"
+              " VALUES('s','/a','waiting',?,'stop',?,?,?)",(T0,T0,T0,T1)).lastrowid
+armed, _ = attention_tick(c, T2)
+check("attention_tick ignores stopped sessions", armed==0 and _att(c,s) is None)
+
+# ── the CORE/HERD layer gate: HERD_ATTENTION ──────────────────────────────────
+from herd.daemon import _attention_enabled, run as _daemon_run
+import datetime as _dt
+def _env(**kw):
+    saved = {k: os.environ.get(k) for k in kw}
+    os.environ.update({k: v for k, v in kw.items() if v is not None})
+    for k, v in kw.items():
+        if v is None: os.environ.pop(k, None)
+    return saved
+def _restore(saved):
+    for k, v in saved.items():
+        if v is None: os.environ.pop(k, None)
+        else: os.environ[k] = v
+
+_s = _env(HERD_ATTENTION=None); check("HERD_ATTENTION default on (herd's full behavior)", _attention_enabled()); _restore(_s)
+_s = _env(HERD_ATTENTION="0"); off0 = _attention_enabled(); _restore(_s)
+_s = _env(HERD_ATTENTION="off"); offw = _attention_enabled(); _restore(_s)
+_s = _env(HERD_ATTENTION="1"); on1 = _attention_enabled(); _restore(_s)
+check("HERD_ATTENTION 0/off -> core-only, 1 -> on",
+      not off0 and not offw and on1, f"0={off0} off={offw} 1={on1}")
+
+# run() honors the gate end-to-end: a waiting session is armed only with attention on.
+# started_at=now (survives boot_sweep), last_event 5min ago (trips the waiting rule).
+_now = _dt.datetime.now(_dt.timezone.utc)
+_iso = lambda d: d.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+c = fresh()
+c.execute("INSERT INTO sessions(session_id,cwd,status,last_event_at,last_event_type,started_at,updated_at)"
+          " VALUES('wf','/a','waiting',?,'stop',?,?)",
+          (_iso(_now - _dt.timedelta(seconds=300)), _iso(_now), _iso(_now - _dt.timedelta(seconds=300))))
+DBP = os.path.abspath("f.db")
+_daemon_run(db_path=DBP, once=True, attend=False)
+_off = c.execute("SELECT COUNT(*) FROM herd_attention").fetchone()[0]
+_daemon_run(db_path=DBP, once=True, attend=True)
+_on = c.execute("SELECT COUNT(*) FROM herd_attention").fetchone()[0]
+check("run() gates attention: core-only writes zero herd_attention, herd mode arms",
+      _off == 0 and _on == 1, f"attend=False rows={_off} (want 0); attend=True rows={_on} (want 1)")
 
 print("\n" + "═"*72)
 if FAILED:
