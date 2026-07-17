@@ -33,7 +33,7 @@ def load_statements(src=None):
 
     Every consumer loads the SHIPPING statements through here. Nothing may keep
     its own transcription of a write path: the original validate.py re-typed
-    W3b/W2/W5 inline, which let the real write path rot while the suite stayed
+    W2b/W2/W5 inline, which let the real write path rot while the suite stayed
     green. Four defects survived 40 checks that way.
     """
     text = WRITES.read_text() if src is None else src

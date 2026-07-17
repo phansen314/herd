@@ -20,17 +20,19 @@
 -- PERMANENT desync on resume (the trigger fired on death but nothing reset it
 -- when W2b revived a session), and it was the only reason tier 2 reached into
 -- tier 1 at all. Removed. "Is this window/job held by a live session?" is a
--- JOIN to sessions, never a local flag. See writes.sql W2/W3a/R_job_live.
+-- JOIN to sessions, never a local flag. See writes.sql W2/R_job_live.
 --
--- MUTABILITY CONTRACT — reconcile rewrites this row on every tick, so:
---   IMMUTABLE (set once at spawn/discovery, reconcile MUST NOT touch):
+-- MUTABILITY CONTRACT — this row is written by spawn (W1) and by the hook
+-- (W2b_placement on a re-fire, e.g. resume in a new window). The ps daemon never
+-- touches tier 2. So:
+--   IMMUTABLE (set once at spawn, later writers MUST NOT touch):
 --       job_name, created_at
---   MUTABLE (reconcile overwrites freely):
+--   MUTABLE (a hook re-fire may overwrite):
 --       kitty_socket, window_id, herd_var, source, verified_at
 -- This is enforced by DISCIPLINE, not structure: name your columns in the
--- UPDATE, never blanket-overwrite. Precedent: klawde's session_start.sh
--- ON CONFLICT DO UPDATE names each column and deliberately preserves
--- started_at. See UPSERT_RECONCILE in herd/kitty/reconcile.py.
+-- UPDATE, never blanket-overwrite. W2b_placement omits job_name/created_at (and
+-- keeps source='spawn') so a resumed spawned session never loses its job identity;
+-- validate.py section D proves it.
 --
 -- PLACEMENT IS A CACHE, NOT A FACT. Never trusted on the focus path: herd
 -- re-derives from `kitten @ ls` (~20-23ms over a unix socket — MEASURED; the
@@ -79,7 +81,9 @@ CREATE TABLE IF NOT EXISTS herd_sessions (
                                   -- `env:`.) Match values are unanchored regex:
                                   -- anchor them (^...$) or `job` matches
                                   -- `job-2`.
-    source       TEXT NOT NULL CHECK (source IN ('spawn','hook','reconcile')),
+    source       TEXT NOT NULL CHECK (source IN ('spawn','hook')),
+                              -- 'spawn' (W1) or 'hook' (W2b_placement). 'reconcile'
+                              -- was kitty-discovery's provenance — deleted with it.
     verified_at  TEXT NOT NULL    -- staleness made explicit. TUI renders a
                                   -- placement as degraded when older than the
                                   -- last reconcile tick.

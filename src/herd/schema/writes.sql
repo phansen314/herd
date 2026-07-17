@@ -144,90 +144,23 @@ WHERE herd_sessions.kitty_socket IS NOT excluded.kitty_socket
    OR herd_sessions.window_id    IS NOT excluded.window_id;
 
 
--- ── W3. RECONCILE (herd/kitty) ────────────────────────────────────────────
--- `kitten @ ls` yields a tree: os_windows[] > tabs[] > windows[].
+-- ── W3. LIVENESS REAPER (herd/daemon.py) ──────────────────────────────────
+-- What "reconcile" shrank to. Hooks own identity, placement, and pid now, so the
+-- old `kitten @ ls` discovery (W3a), per-tick placement refresh (W3b) and pid-fill
+-- (W3c) are gone. What remains is silent-death detection: a session killed with
+-- -9 / crashed / whose terminal closed fires no SessionEnd, so its row would sit
+-- live forever. The daemon polls the PROCESS TABLE and reaps.
 --
--- DO NOT FILTER ON THE WINDOW's cmdline/pid. They belong to the SHELL, not to
--- claude. Measured across 5 live windows: window-level `cmdline ~= claude`
--- found 1 of 3 real sessions, and kitty's own `--match cmdline:claude` found
--- the same 1 — a FALSE POSITIVE, because that shell was launched as
---   bash -l -i -c claude "..."; exec bash
--- so the string 'claude' is pinned in the shell's launch cmdline forever and
--- keeps matching long after claude exited.
---
--- The claude process is in foreground_processes[], alongside claude's own MCP
--- children (e.g. [claude:234203, sh:234351, node:234353]). Select it with:
---
---   claudes(W) = [p for p in W.foreground_processes
---                 if basename(p.cmdline[0]) == 'claude'   # exact, never substring
---                 and proc[p.pid].ppid == W.pid]          # verified on 3 windows
---
--- The ppid test is what excludes the MCP children and a nested claude; resolve
--- ppids from ONE batched `ps -eo pid=,ppid=,stat=` per tick, never per-process.
--- Take pid AND cwd from that claude proc, not from the window.
---
--- W3a: window we've never seen -> create a tier-1 row. This is the ONE place
--- tier 2 writes tier 1. Allowed: it asserts a TIER-1 FACT ("a claude process
--- exists with this pid/cwd"), not a herd fact. A different discoverer could do
--- the same. Guarded so a re-tick is a no-op.
---
--- The liveness JOIN IS LOAD-BEARING: without `s.stopped_at IS NULL` a dead row
--- still satisfies the NOT EXISTS, so a session started in a REUSED window is
--- never inserted at all. Match by the session's own liveness, not a stored flag.
--- :name W3a_discover
-INSERT INTO sessions(pid, cwd, status, status_source, started_at, updated_at)
-SELECT :pid, :cwd, 'unknown', 'reconcile', :now, :now
-WHERE NOT EXISTS (SELECT 1 FROM herd_sessions h
-                  JOIN sessions s ON s.id = h.session_pk
-                  WHERE h.kitty_socket = :socket AND h.window_id = :win
-                    AND s.stopped_at IS NULL)
-ON CONFLICT(pid) WHERE stopped_at IS NULL AND pid IS NOT NULL DO NOTHING;
+-- LIVENESS COMES FROM THE PROCESS TABLE, NEVER FROM kitty. Absence from a kitty
+-- `ls` is evidence about PLACEMENT: a socket blip, an `ls` timeout,
+-- allow_remote_control off, or a missed socket would each mass-reap every live row
+-- at once. When a claude really dies, `ps` says so within a tick. daemon._dead()
+-- also treats state 'Z' as dead (a zombie still passes kill -0) and a recycled pid
+-- (comm != claude) as dead. See src/herd/daemon.py.
 
--- W3b: refresh placement. MUTABILITY CONTRACT — columns named explicitly;
--- job_name / created_at are NEVER in this list (there is no `live` anymore).
--- The trailing WHERE is a NO-OP SUPPRESSOR: in steady state reconcile writes
--- ZERO rows, which is what keeps WAL contention off the hooks' hot path.
--- `IS NOT` (NULL-safe), never `!=`.
--- Window reuse just works: a dead row and this live row may share (socket,
--- window_id) — there is no UNIQUE index to violate, and the JOIN separates them.
--- :name W3b_placement
-INSERT INTO herd_sessions(session_pk, kitty_socket, window_id,
-                          herd_var, source, verified_at)
-VALUES(:pk, :socket, :win, :var, 'reconcile', :now)
-ON CONFLICT(session_pk) DO UPDATE SET
-    kitty_socket = excluded.kitty_socket,
-    window_id    = excluded.window_id,
-    herd_var     = COALESCE(herd_sessions.herd_var, excluded.herd_var),
-    source       = CASE WHEN herd_sessions.source = 'spawn' THEN 'spawn'
-                        ELSE excluded.source END,
-    verified_at  = excluded.verified_at
-WHERE herd_sessions.kitty_socket IS NOT excluded.kitty_socket
-   OR herd_sessions.window_id    IS NOT excluded.window_id;
-    -- job_name, created_at: ABSENT BY CONTRACT. Do not add them.
-    -- source preserves 'spawn' — provenance shouldn't decay to 'reconcile'.
-    -- NOTE: verified_at is deliberately NOT a reason to write. Refreshing it
-    -- on an unchanged placement would defeat the suppressor and put a write on
-    -- every tick. Staleness is read against the last successful tick instead.
-
--- W3c: pid from kitty (NOT from hooks — see SPIKE-1). Only fill when unknown;
--- never overwrite, or a pid-reuse race could repoint a live row.
--- :pid MUST be claude's pid (foreground_processes), never window.pid — that is
--- the shell, and it outlives claude, which would make the session immortal.
--- :name W3c_pid
-UPDATE sessions SET pid = :pid, updated_at = :now
-WHERE id = :pk AND pid IS NULL;
-
--- W3d: rows whose pid is dead. Replaces klawde's 4-hour zombie-reap heuristic
--- with an exact local answer. Setting stopped_at makes every liveness JOIN see
--- this session as dead -> its window and job free automatically (no trigger).
---
--- LIVENESS COMES FROM THE PROCESS TABLE, NOT FROM `ls`. Absence from `ls` is
--- evidence about PLACEMENT and must never reach this statement: a socket blip,
--- an `ls` timeout, allow_remote_control off, or a missed socket would each
--- mass-reap every live row at once. When kitty really dies its claudes really
--- die, and the process table says so within 1s without consulting the socket.
--- Caller must also treat state 'Z' as dead: claude exits, the shell hasn't
--- reaped, /proc/PID still exists and kill -0 still succeeds -> immortal row.
+-- W3d: reap one session whose pid the daemon found dead. Setting stopped_at makes
+-- every liveness JOIN see it dead -> its window and job free automatically (no
+-- trigger). status_source='pid' records that death was inferred, not hook-reported.
 -- :name W3d_reap
 UPDATE sessions SET status = 'stopped', status_source = 'pid',
                     stopped_at = :now, updated_at = :now

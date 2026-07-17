@@ -53,6 +53,17 @@ check("every named statement is complete (no ';'-in-comment truncation)",
       f"truncated/incomplete: {_incomplete}" if _incomplete
       else f"all {len(W)} statements terminate cleanly")
 
+# The ps daemon replaced kitty-based reconcile: hooks own identity/placement/pid,
+# W3d/W3e do the reaping. W3a_discover (kitty window discovery), W3b_placement
+# (per-tick placement refresh) and W3c_pid (fill pid from `kitten @ ls`) are dead —
+# nothing calls them. Assert they are GONE so the retired architecture can't creep
+# back in as a dormant statement.
+_dead_stmts = [n for n in ("W3a_discover", "W3b_placement", "W3c_pid") if n in W]
+check("dead kitty-reconcile statements are deleted (W3a/W3b/W3c)",
+      not _dead_stmts,
+      f"still present: {_dead_stmts}" if _dead_stmts
+      else "reconcile is the ps daemon (W3d/W3e); no kitty discovery/placement/pid-fill")
+
 def fresh(tier2=True):
     if os.path.exists("f.db"): os.remove("f.db")
     for s in ("f.db-wal","f.db-shm"):
@@ -92,7 +103,7 @@ check("no `live` denormalization column anywhere",
       "live" not in "".join(l.split("--")[0] for l in HERD.splitlines()).lower())
 
 # ── Core columns receive ONLY Claude/process signals, never a tier-2 VALUE ──
-# Accepted design: three adopt-path writers (W2/W3a/W5b) READ herd_sessions to
+# Accepted design: the adopt-path writers (W2/W5b) READ herd_sessions to
 # ROUTE their write ("which session row is this arriving Claude session?"). That
 # is a routing key, not data. The invariant that must hold is that no tier-2
 # VALUE ever lands in a core column. Enforce it structurally: in every statement
@@ -201,24 +212,29 @@ check("multiple unadopted rows coexist (UNIQUE ignores NULL)",
        c.execute("INSERT INTO sessions(cwd,started_at,updated_at) VALUES('/y',?,?)",(T0,T0)),
        c.execute("SELECT COUNT(*) FROM sessions WHERE session_id IS NULL").fetchone()[0])[-1] == 2)
 
-print("\n\033[1m═══ D. MUTABILITY CONTRACT (reconcile must not clobber) ═══\033[0m")
+print("\n\033[1m═══ D. MUTABILITY CONTRACT (hook re-fire must not clobber) ═══\033[0m")
+# W2b_placement is the LIVING writer that upserts herd_sessions on a hook re-fire.
+# A resumed SPAWNED session must keep its job identity: job_name/created_at/herd_var
+# and source='spawn' are preserved (absent from the SET list), while the placement
+# columns it does own (kitty_socket, window_id, verified_at) update. (W3b, the old
+# reconcile writer this once tested, is deleted.)
 c = fresh()
-pk = c.execute("INSERT INTO sessions(cwd,started_at,updated_at) VALUES('/a',?,?)",(T0,T0)).lastrowid
+pk = c.execute("INSERT INTO sessions(session_id,cwd,started_at,updated_at) VALUES('u1','/a',?,?)",(T0,T0)).lastrowid
 c.execute("INSERT INTO herd_sessions(session_pk,job_name,created_at,kitty_socket,"
           "window_id,herd_var,source,verified_at) VALUES(?,?,?,?,?,?,'spawn',?)",
           (pk,"api-refactor",T0,"unix:/tmp/kitty-1",7,"api-refactor",T0))
-c.execute(W["W3b_placement"], {"pk":pk,"socket":"unix:/tmp/kitty-9",
-                               "win":42,"var":None,"now":T2})
+c.execute(W["W2b_placement"], {"session_id":"u1","socket":"unix:/tmp/kitty-9",
+                               "win":42,"now":T2})
 r = c.execute("SELECT job_name,created_at,kitty_socket,window_id,source,herd_var,verified_at "
               "FROM herd_sessions WHERE session_pk=?",(pk,)).fetchone()
-check("reconcile preserves job_name", r["job_name"] == "api-refactor")
-check("reconcile preserves created_at", r["created_at"] == T0)
-check("reconcile preserves herd_var (COALESCE)", r["herd_var"] == "api-refactor",
-      "NULL from reconcile must not erase the spawn-time var")
-check("reconcile preserves source='spawn'", r["source"] == "spawn", "provenance doesn't decay")
-check("reconcile DOES update window_id", r["window_id"] == 42)
-check("reconcile DOES update kitty_socket", r["kitty_socket"] == "unix:/tmp/kitty-9")
-check("reconcile DOES update verified_at", r["verified_at"] == T2)
+check("hook re-fire preserves job_name", r["job_name"] == "api-refactor")
+check("hook re-fire preserves created_at", r["created_at"] == T0)
+check("hook re-fire preserves herd_var", r["herd_var"] == "api-refactor",
+      "the hook can't know the spawn-time var and must not erase it")
+check("hook re-fire preserves source='spawn'", r["source"] == "spawn", "provenance doesn't decay to 'hook'")
+check("hook re-fire DOES update window_id", r["window_id"] == 42)
+check("hook re-fire DOES update kitty_socket", r["kitty_socket"] == "unix:/tmp/kitty-9")
+check("hook re-fire DOES update verified_at", r["verified_at"] == T2)
 
 print("\n\033[1m═══ E. JOB NAMES: recyclable handles via R_job_live (no trigger, no UNIQUE) ═══\033[0m")
 # Recyclability is now the R_job_live check + sessions.stopped_at, not a partial
@@ -251,8 +267,8 @@ check("R_job_live returns exactly the LIVE holder among history",
 # NULL job_name (reconciled sessions) never collides and is never 'held'
 p3 = c.execute("INSERT INTO sessions(cwd,started_at,updated_at) VALUES('/c',?,?)",(T0,T0)).lastrowid
 p4 = c.execute("INSERT INTO sessions(cwd,started_at,updated_at) VALUES('/d',?,?)",(T0,T0)).lastrowid
-c.execute("INSERT INTO herd_sessions(session_pk,kitty_socket,window_id,source,verified_at) VALUES(?,?,?,'reconcile',?)",(p3,"unix:/tmp/k1",20,T0))
-c.execute("INSERT INTO herd_sessions(session_pk,kitty_socket,window_id,source,verified_at) VALUES(?,?,?,'reconcile',?)",(p4,"unix:/tmp/k1",21,T0))
+c.execute("INSERT INTO herd_sessions(session_pk,kitty_socket,window_id,source,verified_at) VALUES(?,?,?,'hook',?)",(p3,"unix:/tmp/k1",20,T0))
+c.execute("INSERT INTO herd_sessions(session_pk,kitty_socket,window_id,source,verified_at) VALUES(?,?,?,'hook',?)",(p4,"unix:/tmp/k1",21,T0))
 check("many NULL job_names coexist", job_holder(c, None) is None, "reconciled sessions have no job")
 
 print("\n\033[1m═══ F. PID / LIVENESS ═══\033[0m")
@@ -405,12 +421,12 @@ def live_in_window(conn, sock, win):
 c = fresh()
 a = c.execute("INSERT INTO sessions(pid,cwd,started_at,updated_at) VALUES(111,'/code/herd',?,?)",(T0,T0)).lastrowid
 c.execute("INSERT INTO herd_sessions(session_pk,created_at,kitty_socket,window_id,source,verified_at)"
-          " VALUES(?,?,?,5,'reconcile',?)",(a,T0,SOCK,T0))
+          " VALUES(?,?,?,5,'hook',?)",(a,T0,SOCK,T0))
 c.execute("UPDATE sessions SET stopped_at=?,status='stopped' WHERE id=?",(T1,a))
 b = c.execute("INSERT INTO sessions(pid,cwd,started_at,updated_at) VALUES(222,'/code/herd',?,?)",(T2,T2)).lastrowid
 # no UNIQUE index: the reused-window placement INSERT simply succeeds now.
 c.execute("INSERT INTO herd_sessions(session_pk,created_at,kitty_socket,window_id,source,verified_at)"
-          " VALUES(?,?,?,5,'reconcile',?)",(b,T2,SOCK,T2))
+          " VALUES(?,?,?,5,'hook',?)",(b,T2,SOCK,T2))
 check("41 window reuse: new session gets placement in a reused window",
       live_in_window(c, SOCK, 5) == [b],
       "dead A + live B share window 5; the JOIN returns only B (A is history)")
@@ -469,11 +485,11 @@ def reused_window():
     c = fresh()
     a = c.execute("INSERT INTO sessions(pid,cwd,started_at,updated_at) VALUES(111,'/code/herd',?,?)",(T0,T0)).lastrowid
     c.execute("INSERT INTO herd_sessions(session_pk,created_at,kitty_socket,window_id,source,verified_at)"
-              " VALUES(?,?,?,5,'reconcile',?)",(a,T0,SOCK,T0))
+              " VALUES(?,?,?,5,'hook',?)",(a,T0,SOCK,T0))
     c.execute("UPDATE sessions SET stopped_at=?,status='stopped' WHERE id=?",(T1,a))
     b = c.execute("INSERT INTO sessions(pid,cwd,started_at,updated_at) VALUES(222,'/code/herd',?,?)",(T2,T2)).lastrowid
     c.execute("INSERT INTO herd_sessions(session_pk,created_at,kitty_socket,window_id,source,verified_at)"
-              " VALUES(?,?,?,5,'reconcile',?)",(b,T2,SOCK,T2))
+              " VALUES(?,?,?,5,'hook',?)",(b,T2,SOCK,T2))
     return c, a, b
 
 with guard("43 W2 adopts the LIVE row, not the dead predecessor"):
@@ -516,7 +532,7 @@ offenders = [" ".join(s.split())[:70] for s in lookups
              if not re.search(r"stopped_at\s+IS\s+NULL", s, re.I)]
 check("44 every (socket,window_id) lookup derives liveness via stopped_at",
       not offenders,
-      f"un-joined: {offenders}" if offenders else "W2, W3a, W5b all JOIN sessions.stopped_at")
+      f"un-joined: {offenders}" if offenders else "W2, W5b all JOIN sessions.stopped_at")
 check("44a no `live` column reference survives in the write paths",
       not re.search(r"\blive\s*=\s*1\b", writes_code, re.I),
       "the denormalization is gone; nothing may filter on it")
@@ -925,7 +941,7 @@ with guard("61 Path C: statusline adopts a reconciled session from its env"):
     pk = c.execute("INSERT INTO sessions(pid,cwd,status,status_source,started_at,updated_at)"
                    " VALUES(4242,'/code/herd','unknown','reconcile',?,?)",(T0,T0)).lastrowid
     c.execute("INSERT INTO herd_sessions(session_pk,created_at,kitty_socket,window_id,source,verified_at)"
-              " VALUES(?,?,?,5,'reconcile',?)",(pk,T0,SOCK,T0))
+              " VALUES(?,?,?,5,'hook',?)",(pk,T0,SOCK,T0))
     c.close()
     statusline({"session_id":"uuid-x","model":{"id":"opus"},"cwd":"/code/herd",
                 "context_window":{"used_percentage":30},"cost":{"total_cost_usd":0.10}},
@@ -1108,17 +1124,20 @@ c.execute(W["W2c_pid_claim"], {"pid":"","session_id":"whoever","now":T1})   # em
 check("68e W2c_pid_claim with unknown pid (NULL) reaps nothing",
       c.execute("SELECT stopped_at FROM sessions WHERE id=?",(k,)).fetchone()["stopped_at"] is None)
 
-# 69. Every value of the herd_sessions.source CHECK must be WRITTEN by some
-# statement. 'hook' sat in the CHECK (herd.sql:81) with no writer — a reserved
-# plug. Assert no source enum value is orphaned, so this cannot silently recur.
+# 69. Every value the herd_sessions.source CHECK ALLOWS must be WRITTEN by some
+# statement (and every written value must be allowed). 'hook' once sat in the CHECK
+# with no writer — a reserved plug; 'reconcile' is the inverse hazard now that
+# kitty-discovery is deleted. Derive the allowed set from the schema so the two
+# can't drift, and assert it equals the set of source literals the writers use.
+_allowed = set(re.search(r"source\s+TEXT[^,]*CHECK\s*\(\s*source\s+IN\s*\(([^)]*)\)",
+                         HERD, re.I).group(1).replace("'", "").replace(" ", "").split(","))
 _src_writers = "\n".join(s for n, s in W.items()
                          if re.search(r"INSERT\s+INTO\s+herd_sessions", s, re.I))
 _src_code = "\n".join(l.split("--")[0] for l in _src_writers.splitlines())
-_missing = [v for v in ("spawn", "hook", "reconcile") if f"'{v}'" not in _src_code]
-check("69 no herd_sessions.source enum value is orphaned (all are written)",
-      not _missing,
-      f"CHECK allows spawn/hook/reconcile; written by NO statement: {_missing}"
-      if _missing else "spawn, hook, reconcile each have a writer")
+_written = {v for v in _allowed | {"reconcile"} if f"'{v}'" in _src_code}
+check("69 herd_sessions.source: allowed set == written set (no orphan either way)",
+      _allowed == _written,
+      f"allowed={sorted(_allowed)} written={sorted(_written)}")
 
 # 70. W2b_placement records the hook's window as source='hook', with NULL job_name
 # (herd didn't name it) — the plug for the seam. pk resolved off session_id, so it
@@ -1135,25 +1154,9 @@ check("70 W2b_placement records the hook's window (source=hook, no job)",
       and _pl["window_id"]==8 and _pl["job_name"] is None,
       f"placement={dict(_pl) if _pl else None}")
 
-# 71. THE SEAM CLOSED, END TO END. With placement present, reconcile's W3a_discover
-# for the SAME (socket,window) is a no-op (no duplicate half-row), AND W3c_pid —
-# reached via the placement JOIN reconcile actually uses — fills the pid the seam
-# previously stranded. Both failures this plan removes, asserted on one fixture.
-c = fresh()
-c.execute(W["W2b_insert"], {"session_id":"u1","cwd":"/code/herd","model":"opus",
-                            "transcript":"/t.jsonl","now":T0,"pid":None})
-c.execute(W["W2b_placement"], {"session_id":"u1","socket":SOCK,"win":8,"now":T0})
-_before = c.execute("SELECT COUNT(*) FROM sessions WHERE stopped_at IS NULL").fetchone()[0]
-c.execute(W["W3a_discover"], {"pid":2000,"cwd":"/code/herd","socket":SOCK,"win":8,"now":T1})
-_after = c.execute("SELECT COUNT(*) FROM sessions WHERE stopped_at IS NULL").fetchone()[0]
-_pk = c.execute("SELECT h.session_pk FROM herd_sessions h JOIN sessions s ON s.id=h.session_pk "
-                "WHERE h.kitty_socket=? AND h.window_id=8 AND s.stopped_at IS NULL",
-                (SOCK,)).fetchone()["session_pk"]
-c.execute(W["W3c_pid"], {"pk":_pk,"pid":2000,"now":T1})
-_pidfill = c.execute("SELECT pid FROM sessions WHERE id=?",(_pk,)).fetchone()["pid"]
-check("71 placement blocks the duplicate-discover AND lets W3c reach the pid",
-      _before==1 and _after==1 and _pidfill==2000,
-      f"live before={_before} after W3a={_after} (must stay 1); pid via placement-join={_pidfill}")
+# (Check 71 removed: it guarded W3a_discover's duplicate-row hazard + W3c_pid fill,
+# both deleted with kitty-reconcile. No row-inserter remains to duplicate, and pid
+# is hook-written. W2b_placement's surviving value — the jump target — is check 70.)
 
 print("\n\033[1m═══ R. LIVENESS REAPER (daemon.py) ═══\033[0m")
 from herd.daemon import reap_once, boot_sweep, _parse_proc_table, _dead

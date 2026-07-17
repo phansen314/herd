@@ -19,7 +19,8 @@
 --   notification.sh    status='needs_approval', last_event_*
 --   post_tool_use.sh   status='working', last_event_*   [HOT PATH]
 --   statusline.sh      metrics + updated_at ONLY. NEVER last_event_*.
---   herd reconcile     INSERT for undiscovered sessions; pid; stopped_at
+--   herd daemon        stopped_at on silent death (reaper: W3d/W3e, ps liveness).
+--                      NOT an inserter — hooks own identity/placement/pid now.
 -- ═══════════════════════════════════════════════════════════════════════════
 
 -- auto_vacuum MUST precede any populate; a journal_mode change counts as one.
