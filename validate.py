@@ -741,6 +741,19 @@ with guard("56 no hook script inlines INSERT/UPDATE/DELETE"):
           f"inlined DML at {offenders}" if offenders
           else "every write routes through run() -> writes.sql")
 
+# ── 56b. EVERY hook must be EXECUTABLE ────────────────────────────────────
+# settings.json hook commands and the statusline wrapper invoke these scripts
+# DIRECTLY (`"/path/hook.sh"`), which needs the exec bit. Every test here runs
+# them as `bash <path>`, which does NOT — so a non-executable hook is a silent
+# no-op in production while the whole suite stays green. That shipped: the
+# statusline was created via Write after the chmod pass, lost the bit, and the
+# wrapper died with "Permission denied" (exit 126) leaving a blank statusline.
+with guard("56b every hook script is executable"):
+    not_exec = [p.name for p in sorted(HOOKS.glob("*.sh")) if not os.access(p, os.X_OK)]
+    check("56b every hook script is executable", not not_exec,
+          f"NOT executable (would be a silent no-op when invoked directly): {not_exec}"
+          if not_exec else f"all {len(list(HOOKS.glob('*.sh')))} hooks have the exec bit")
+
 # ── 57. run_tx is ATOMIC: a mid-transaction failure leaves NOTHING written ──
 # This is the property -bail buys. Without it the sqlite3 CLI runs UPDATE, skips
 # the failing INSERT, and COMMITs the UPDATE anyway — a half-write. The check

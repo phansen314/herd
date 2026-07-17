@@ -121,26 +121,42 @@ def rewire_wrapper(text):
 
 # ── self-test: run the WIRED hook against a temp DB ────────────────────────
 def selftest():
-    """Prove the wired session_start + statusline actually write, using a throwaway
-    DB so the real one is untouched."""
+    """Prove the wired hooks actually write, using a throwaway DB so the real one
+    is untouched.
+
+    Invokes each script the way PRODUCTION does — directly, NOT via `bash <path>`.
+    That distinction is the whole point: settings.json and the statusline wrapper
+    exec these paths, so a missing +x is a silent no-op. Running them through
+    `bash` here would mask exactly the bug that shipped a blank statusline.
+    """
+    # session_id must satisfy valid_sid() — alphanumerics + hyphens only.
+    SID = "herd-selftest-0000-4000-8000-000000000001"
     with tempfile.TemporaryDirectory(prefix="herd-selftest-") as tmp:
         env = dict(os.environ, HERD_DB=f"{tmp}/t.db", HERD_RUNTIME=tmp,
                    HERD_ERRLOG=f"{tmp}/err.log")
-        connect(f"{tmp}/t.db").close()
         c = connect(f"{tmp}/t.db"); apply_schema(c); c.close()
-        subprocess.run(["bash", hook_cmd("session_start.sh")],
-                       input='{"session_id":"selftest","cwd":"/x","model":"m","source":"startup"}',
+
+        not_exec = [p.name for p in sorted(HOOKS_DIR.glob("*.sh"))
+                    if not os.access(p, os.X_OK)]
+        if not_exec:
+            return False, {"not_executable": not_exec}
+
+        subprocess.run([hook_cmd("session_start.sh")],          # direct exec
+                       input=f'{{"session_id":"{SID}","cwd":"/x","model":"m","source":"startup"}}',
                        capture_output=True, text=True, env=env)
-        subprocess.run(["bash", STATUSLINE],
-                       input='{"session_id":"selftest","model":{"id":"m"},"cwd":"/x",'
-                             '"context_window":{"used_percentage":10},"cost":{"total_cost_usd":0.5}}',
-                       capture_output=True, text=True, env=env)
+        sl = subprocess.run([STATUSLINE],                        # direct exec
+                            input=f'{{"session_id":"{SID}","model":{{"id":"m"}},"cwd":"/x",'
+                                  '"context_window":{"used_percentage":10},"cost":{"total_cost_usd":0.5}}',
+                            capture_output=True, text=True, env=env)
         c = connect(f"{tmp}/t.db")
         row = c.execute("SELECT status, context_percent FROM sessions "
-                        "WHERE session_id='selftest'").fetchone()
+                        "WHERE session_id=?", (SID,)).fetchone()
         c.close()
-        ok = row is not None and row["status"] == "working" and row["context_percent"] == 10
-        return ok, dict(row) if row else None
+        ok = (row is not None and row["status"] == "working"
+              and row["context_percent"] == 10
+              and sl.returncode == 0 and sl.stdout.strip() != "")
+        return ok, dict(row) if row else {"statusline_rc": sl.returncode,
+                                          "statusline_out": sl.stdout.strip()}
 
 
 def install(dry=False):
