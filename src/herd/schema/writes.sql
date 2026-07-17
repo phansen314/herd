@@ -51,6 +51,10 @@ SET session_id      = :session_id,
     cwd             = :cwd,
     model           = :model,
     transcript_path = :transcript,
+    pid             = :pid,          -- claude's own pid (claude_pid ppid-walk). The
+                                     -- SessionStart hook is a live descendant of
+                                     -- claude, so this is exact. W2c_pid_claim has
+                                     -- already freed any stale holder of it.
     status          = 'working',
     status_source   = 'hook',
     last_event_at   = :now,
@@ -66,10 +70,10 @@ WHERE id = (SELECT h.session_pk FROM herd_sessions h
 -- W2b. Fallback when W2 matched nothing (no herd_sessions row: hooks wired but
 -- herd never saw this window). Plain upsert on Claude's own key.
 -- :name W2b_insert
-INSERT INTO sessions(session_id, cwd, model, transcript_path, status,
+INSERT INTO sessions(session_id, cwd, model, transcript_path, pid, status,
                      status_source, last_event_at, last_event_type,
                      started_at, updated_at)
-VALUES(:session_id, :cwd, :model, :transcript, 'working', 'hook',
+VALUES(:session_id, :cwd, :model, :transcript, :pid, 'working', 'hook',
        :now, 'start', :now, :now)
 ON CONFLICT(session_id) DO UPDATE SET
     cwd             = excluded.cwd,
@@ -77,18 +81,34 @@ ON CONFLICT(session_id) DO UPDATE SET
     model           = COALESCE(excluded.model, sessions.model),
     status          = 'working',
     stopped_at      = NULL,          -- resume revives a stopped session
-    pid             = NULL,          -- ...at an UNKNOWN location. The old pid died
-                                     -- with the old window and may now be recycled
-                                     -- by an unrelated process. Carrying it forward
-                                     -- lets W3d reap the just-resumed session (or,
-                                     -- on reuse, makes the row immortal). Cleared
-                                     -- here. Reconcile's W3c refills it next tick
-                                     -- via the placement row W2b_placement writes.
+    pid             = excluded.pid,  -- ...with the RESUMED process's own pid. The
+                                     -- SessionStart hook re-walks to claude on every
+                                     -- (re)start, so the fresh pid replaces the dead
+                                     -- old one directly (no null-and-wait). W2c_pid_
+                                     -- claim already reaped any stale holder of it,
+                                     -- so idx_sessions_pid_live cannot reject this.
     last_event_at   = excluded.last_event_at,
     last_event_type = excluded.last_event_type,
     updated_at      = excluded.updated_at;
     -- NOTE: started_at deliberately preserved. Resume = same session, fresh
     -- location; Duration reflects total age. (klawde's semantics — correct.)
+
+-- W2c_pid_claim. Runs at SessionStart BEFORE the pid is written, in its own txn, so
+-- idx_sessions_pid_live (one LIVE row per pid) is clear before W2_adopt/W2b_insert
+-- stamp :pid. Reaps any OTHER live row still holding this pid — provably stale: the
+-- hook runs AS a descendant of the claude that owns :pid RIGHT NOW, so a different
+-- live row claiming it died silently (no SessionEnd) and its pid was recycled to us.
+-- Without this, that stale row would make the new session's pid write fail the
+-- UNIQUE index, and the error-swallowing hook would drop the session silently.
+--
+-- Excludes our own row (session_id match) so a resume doesn't reap itself. When the
+-- walk failed, :pid binds NULL and `pid = NULL` matches nothing — a clean no-op.
+-- status_source='pid' (death inferred from liveness, like W3d); NEVER last_event_*.
+-- :name W2c_pid_claim
+UPDATE sessions SET status = 'stopped', status_source = 'pid',
+                    stopped_at = :now, updated_at = :now
+WHERE pid = :pid AND stopped_at IS NULL
+  AND (session_id IS NULL OR session_id IS NOT :session_id);
 
 -- W2b_placement. The tier-2 half of the W2b fallback. W2b_insert writes the
 -- session row (tier 1); this records the kitty window the hook is STANDING IN, so

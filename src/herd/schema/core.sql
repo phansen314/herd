@@ -45,20 +45,22 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_id          TEXT UNIQUE,   -- Claude's UUID. NULL until adopted.
                                        -- SQLite UNIQUE ignores NULLs, so many
                                        -- unadopted rows coexist.
-    pid                 INTEGER,       -- liveness oracle (kill -0). Sourced
-                                       -- from `kitten @ ls`, NOT from hooks.
-                                       -- See SPIKE-1.
+    pid                 INTEGER,       -- liveness oracle (kill -0). Sourced from
+                                       -- the SessionStart hook's claude_pid()
+                                       -- ppid-walk (common.sh). SPIKE-1 (pid must
+                                       -- come from `kitten @ ls`) is OVERTURNED:
+                                       -- the blocking hook is a live descendant of
+                                       -- claude, so the walk is exact and cleaner
+                                       -- than the ls route (MCP children and other
+                                       -- sessions are siblings, never ancestors).
                                        --
-                                       -- MEASURED: this is CLAUDE's pid, taken
-                                       -- from foreground_processes[], NEVER the
-                                       -- window-level .pid — that one is the
-                                       -- SHELL, which outlives claude and would
-                                       -- make the session immortal. The claude
-                                       -- proc is identified by
-                                       -- ppid == window.pid (verified on 3
-                                       -- live windows); this also excludes
-                                       -- claude's MCP children, which appear in
-                                       -- the same foreground_processes list.
+                                       -- LOAD-BEARING: this is CLAUDE's pid (walked
+                                       -- to the first ancestor comm=='claude'),
+                                       -- NEVER the window shell — that outlives
+                                       -- claude and would make the session
+                                       -- immortal. W2c_pid_claim keeps one LIVE row
+                                       -- per pid (idx_sessions_pid_live) by reaping
+                                       -- a stale holder before a new claim.
 
     -- ── location ─────────────────────────────────────────────────────────
     cwd                 TEXT NOT NULL,

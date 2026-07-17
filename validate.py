@@ -185,7 +185,7 @@ check("tier-2 rows exist with session_id NULL",
       "spawned session has job+placement+attention before Claude reports a UUID")
 # adopt — the SHIPPING W2
 n = c.execute(W["W2_adopt"], {"session_id":"a3f9-uuid","cwd":"/code/app","model":"opus",
-                              "transcript":"/t.jsonl","now":T1,
+                              "transcript":"/t.jsonl","now":T1,"pid":4242,
                               "socket":"unix:/tmp/kitty-1","win":7}).rowcount
 check("W2 adopt via (socket,window_id)", n == 1)
 r = c.execute("""SELECT s.session_id,h.job_name,h.window_id,a.attention_at
@@ -193,7 +193,7 @@ r = c.execute("""SELECT s.session_id,h.job_name,h.window_id,a.attention_at
                  LEFT JOIN herd_attention a ON a.session_pk=s.id WHERE s.id=?""",(pk,)).fetchone()
 check("tier-2 survives adoption", tuple(r) == ("a3f9-uuid","api-refactor",7,T0), str(tuple(r)))
 n2 = c.execute(W["W2_adopt"], {"session_id":"a3f9-uuid","cwd":"/code/app","model":"opus",
-                               "transcript":"/t.jsonl","now":T1,
+                               "transcript":"/t.jsonl","now":T1,"pid":4242,
                                "socket":"unix:/tmp/kitty-1","win":7}).rowcount
 check("W2 adopt is idempotent", n2 == 0, "re-fire is a no-op")
 check("multiple unadopted rows coexist (UNIQUE ignores NULL)",
@@ -436,7 +436,7 @@ c.execute(W["W4_end"], {"session_id":"u1","now":T1})            # die (SessionEn
 dead_job = c.execute(W["R_job_live"], {"job":"api"}).fetchone()
 dead_win = live_in_window(c, SOCK, 5)
 c.execute(W["W2b_insert"], {"session_id":"u1","cwd":"/code/herd","model":"opus",
-                            "transcript":"/t.jsonl","now":T2})  # claude --resume
+                            "transcript":"/t.jsonl","now":T2,"pid":None})  # claude --resume
 revived_job = c.execute(W["R_job_live"], {"job":"api"}).fetchone()
 revived_win = live_in_window(c, SOCK, 5)
 check("41c resume revives job+window with no stored flag to desync",
@@ -479,7 +479,7 @@ def reused_window():
 with guard("43 W2 adopts the LIVE row, not the dead predecessor"):
     c, a, b = reused_window()
     c.execute(W["W2_adopt"], {"session_id":"uuid-B","cwd":"/code/herd","model":"opus",
-                              "transcript":"/t.jsonl","now":T2,"socket":SOCK,"win":5})
+                              "transcript":"/t.jsonl","now":T2,"pid":222,"socket":SOCK,"win":5})
     dead_sid = c.execute("SELECT session_id FROM sessions WHERE id=?",(a,)).fetchone()[0]
     live_sid = c.execute("SELECT session_id FROM sessions WHERE id=?",(b,)).fetchone()[0]
     check("43 W2 adopts the LIVE row, not the dead predecessor",
@@ -1033,20 +1033,80 @@ check("67 sessions.id is AUTOINCREMENT — a deleted id is never recycled",
       f"deleted id={i1}, next id={i2} (must be > {i1}); "
       f"sqlite_sequence(sessions)={_seq['seq'] if _seq else None}")
 
-# 68. Resume must CLEAR a stale pid. W2b revives (stopped_at=NULL); the old pid
-# died with the old window. If it survives, reconcile's W3d reaps the just-resumed
-# session, or a recycled pid makes the row immortal. 41c inserts with NO pid, so
-# it never exercised this path — the hole this closes.
+# 68. Resume sets the FRESH walked pid. The SessionStart hook re-walks to claude on
+# every (re)start, so revive overwrites the stale pid with the resumed process's own
+# — not NULL (the da36a8f stopgap, now reverted), and not the dead old pid.
 c = fresh()
 c.execute("INSERT INTO sessions(session_id,pid,cwd,status,started_at,updated_at)"
           " VALUES('u9',111,'/code/herd','working',?,?)",(T0,T0))
 c.execute(W["W4_end"], {"session_id":"u9","now":T1})               # die (SessionEnd)
 c.execute(W["W2b_insert"], {"session_id":"u9","cwd":"/code/herd","model":"opus",
-                            "transcript":"/t.jsonl","now":T2})     # claude --resume
+                            "transcript":"/t.jsonl","now":T2,"pid":999})  # claude --resume
 _pid = c.execute("SELECT pid FROM sessions WHERE session_id='u9'").fetchone()["pid"]
-check("68 W2b revive clears the stale pid (reconcile refills it via W3c)",
-      _pid is None,
-      f"pid after revive={_pid} (must be None; the resumed proc has a fresh pid)")
+check("68 W2b revive sets the fresh walked pid (not the stale one, not NULL)",
+      _pid == 999,
+      f"pid after revive={_pid} (must be 999 — the resumed proc's own pid, replacing 111)")
+
+# 68b. Both SessionStart writers stamp the walked pid onto the tier-1 row.
+c = fresh()
+n = c.execute("INSERT INTO sessions(cwd,status,status_source,started_at,updated_at) "
+              "VALUES('/code/app','unknown','reconcile',?,?)",(T0,T0)).lastrowid
+c.execute("INSERT INTO herd_sessions(session_pk,job_name,created_at,kitty_socket,"
+          "window_id,herd_var,source,verified_at) VALUES(?,?,?,?,?,?,'spawn',?)",
+          (n,"api",T0,"unix:/tmp/kitty-1",7,"api",T0))
+c.execute(W["W2_adopt"], {"session_id":"a1","cwd":"/code/app","model":"opus",
+                          "transcript":"/t.jsonl","now":T1,
+                          "socket":"unix:/tmp/kitty-1","win":7,"pid":555})
+check("68b W2_adopt stamps the walked pid",
+      c.execute("SELECT pid FROM sessions WHERE session_id='a1'").fetchone()["pid"] == 555)
+c = fresh()
+c.execute(W["W2b_insert"], {"session_id":"b1","cwd":"/x","model":"opus",
+                            "transcript":"/t.jsonl","now":T0,"pid":555})
+check("68b W2b_insert stamps the walked pid on a fresh insert",
+      c.execute("SELECT pid FROM sessions WHERE session_id='b1'").fetchone()["pid"] == 555)
+
+# 68c. W2c_pid_claim reaps a stale live holder of the pid, never the claiming
+# session itself. The claim runs at SessionStart before pid is stamped.
+c = fresh()
+a = c.execute("INSERT INTO sessions(session_id,pid,cwd,status,started_at,updated_at)"
+              " VALUES('old',777,'/a','working',?,?)",(T0,T0)).lastrowid
+c.execute(W["W2c_pid_claim"], {"pid":777,"session_id":"new","now":T1})
+ra = c.execute("SELECT status,status_source,stopped_at FROM sessions WHERE id=?",(a,)).fetchone()
+check("68c W2c_pid_claim reaps the stale live holder of the pid",
+      ra["stopped_at"] == T1 and ra["status"] == "stopped" and ra["status_source"] == "pid",
+      f"stale holder: {dict(ra)}")
+# self-exclusion: a live row whose session_id IS the claimant must survive.
+c = fresh()
+s = c.execute("INSERT INTO sessions(session_id,pid,cwd,status,started_at,updated_at)"
+              " VALUES('me',888,'/a','working',?,?)",(T0,T0)).lastrowid
+c.execute(W["W2c_pid_claim"], {"pid":888,"session_id":"me","now":T1})
+check("68c W2c_pid_claim never reaps the claiming session itself",
+      c.execute("SELECT stopped_at FROM sessions WHERE id=?",(s,)).fetchone()["stopped_at"] is None)
+
+# 68d. THE MONEY CHECK: claim + insert is collision-safe. A stale-live row holds
+# pid 777; the new session claims it, then W2b_insert stamps 777 — the UNIQUE index
+# idx_sessions_pid_live does NOT reject the write, because the stale holder is gone.
+c = fresh()
+old = c.execute("INSERT INTO sessions(session_id,pid,cwd,status,started_at,updated_at)"
+                " VALUES('ghost',777,'/a','working',?,?)",(T0,T0)).lastrowid
+with guard("68d claim+insert is collision-safe under idx_sessions_pid_live"):
+    c.execute(W["W2c_pid_claim"], {"pid":777,"session_id":"fresh","now":T1})
+    c.execute(W["W2b_insert"], {"session_id":"fresh","cwd":"/b","model":"opus",
+                                "transcript":"/t.jsonl","now":T1,"pid":777})  # would raise pre-steal
+    live = c.execute("SELECT id FROM sessions WHERE pid=777 AND stopped_at IS NULL").fetchall()
+    check("68d claim+insert is collision-safe under idx_sessions_pid_live",
+          len(live) == 1
+          and c.execute("SELECT session_id FROM sessions WHERE id=?",(live[0]['id'],)).fetchone()[0] == "fresh"
+          and c.execute("SELECT stopped_at FROM sessions WHERE id=?",(old,)).fetchone()["stopped_at"] == T1,
+          "the ghost is reaped and the new session owns pid 777, one live row")
+
+# 68e. claim is a no-op when the walk failed (pid NULL): reaps nothing.
+c = fresh()
+k = c.execute("INSERT INTO sessions(session_id,pid,cwd,status,started_at,updated_at)"
+              " VALUES('keep',321,'/a','working',?,?)",(T0,T0)).lastrowid
+c.execute(W["W2c_pid_claim"], {"pid":"","session_id":"whoever","now":T1})   # empty -> NULL
+check("68e W2c_pid_claim with unknown pid (NULL) reaps nothing",
+      c.execute("SELECT stopped_at FROM sessions WHERE id=?",(k,)).fetchone()["stopped_at"] is None)
 
 # 69. Every value of the herd_sessions.source CHECK must be WRITTEN by some
 # statement. 'hook' sat in the CHECK (herd.sql:81) with no writer — a reserved
@@ -1065,7 +1125,7 @@ check("69 no herd_sessions.source enum value is orphaned (all are written)",
 # lands on the row W2b_insert just wrote in the same transaction.
 c = fresh()
 c.execute(W["W2b_insert"], {"session_id":"u1","cwd":"/code/herd","model":"opus",
-                            "transcript":"/t.jsonl","now":T0})
+                            "transcript":"/t.jsonl","now":T0,"pid":None})
 c.execute(W["W2b_placement"], {"session_id":"u1","socket":SOCK,"win":8,"now":T0})
 _pl = c.execute("SELECT h.source,h.kitty_socket,h.window_id,h.job_name "
                 "FROM herd_sessions h JOIN sessions s ON s.id=h.session_pk "
@@ -1081,7 +1141,7 @@ check("70 W2b_placement records the hook's window (source=hook, no job)",
 # previously stranded. Both failures this plan removes, asserted on one fixture.
 c = fresh()
 c.execute(W["W2b_insert"], {"session_id":"u1","cwd":"/code/herd","model":"opus",
-                            "transcript":"/t.jsonl","now":T0})
+                            "transcript":"/t.jsonl","now":T0,"pid":None})
 c.execute(W["W2b_placement"], {"session_id":"u1","socket":SOCK,"win":8,"now":T0})
 _before = c.execute("SELECT COUNT(*) FROM sessions WHERE stopped_at IS NULL").fetchone()[0]
 c.execute(W["W3a_discover"], {"pid":2000,"cwd":"/code/herd","socket":SOCK,"win":8,"now":T1})

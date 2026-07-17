@@ -5,9 +5,14 @@
 #   W2  adopt — herd already has a row for this kitty window (spawned by herd,
 #       or discovered by reconcile) that is waiting for Claude's UUID. Joins on
 #       (socket, window_id) from the ENVIRONMENT: the hook runs inside the
-#       window, so $KITTY_WINDOW_ID is free. No pid needed — this is why
-#       SPIKE-1 never blocked the spawn path.
+#       window, so $KITTY_WINDOW_ID is free — no pid needed to ROUTE the write.
 #   W2b insert — no such row (not in kitty, or herd never saw this window).
+#
+# pid: this blocking hook ALSO captures claude's pid (claude_pid ppid-walk) and
+# stamps it on the row — the reaper's liveness oracle. SPIKE-1 (pid must come from
+# kitty) is overturned: the hook is a live descendant of claude, so the walk is
+# exact and cleaner than kitten @ ls. Only this blocking hook does it; async hooks
+# can be reparented away from claude.
 #
 # source='compact' and 'resume' are the SAME session continuing: W2b preserves
 # started_at and clears stopped_at, so duration reflects total age.
@@ -33,6 +38,13 @@ now_pair
 
 export HERD_P_session_id="$SID" HERD_P_cwd="$CWD" HERD_P_model="$MODEL" \
        HERD_P_transcript="$TRANSCRIPT" HERD_P_now="$NOW_ISO"
+
+# claude's pid, walked from this (blocking) hook — see claude_pid() in common.sh.
+# Empty when the walk fails; bind() then stores NULL and the reaper simply skips the
+# row. Claim it FIRST (own txn) so any stale live holder is freed before we stamp it,
+# keeping idx_sessions_pid_live satisfiable. Independent of kitty.
+export HERD_P_pid="$(claude_pid)"
+run W2c_pid_claim >/dev/null 2>&1
 
 ADOPTED=0; IN_KITTY=0
 if [ -n "${KITTY_WINDOW_ID:-}" ] && [ -n "${KITTY_LISTEN_ON:-}" ]; then
