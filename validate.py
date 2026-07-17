@@ -914,6 +914,56 @@ with guard("63 statusline never moves last_event_at"):
 
 shutil.rmtree(RUNTIME, ignore_errors=True)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# P. INSTALLER — klawde -> herd settings.json surgery (pure functions)
+# ═══════════════════════════════════════════════════════════════════════════
+print("\n\033[1m═══ P. INSTALLER (64-66) ═══\033[0m")
+from herd import install as _install
+
+# a synthetic klawde-shaped config: the HTTP PreToolUse hook and the cdh block
+# must survive; the klawde commands must be replaced.
+KLAWDE_CFG = {"hooks": {
+    "PreToolUse":  [{"matcher":".*","hooks":[{"type":"http","url":"http://localhost:8765/x","timeout":5}]}],
+    "SessionStart":[{"hooks":[{"type":"command","command":"/h/.klawde/session_start.sh"},
+                              {"type":"command","command":"/h/.klawde/kitty_start.sh","async":True}]}],
+    "SessionEnd":  [{"hooks":[{"type":"command","command":"/h/.klawde/session_end.sh","async":True}]}],
+    "Notification":[{"hooks":[{"type":"command","command":"/h/.klawde/notification.sh","async":True}]}],
+    "PostToolUse": [{"hooks":[{"type":"command","command":"/h/.klawde/post_tool_use.sh","async":True}]},
+                    {"hooks":[{"type":"command","command":"cdh-claude-hook postToolUse","async":True}]}],
+}}
+
+with guard("64 installer preserves cdh + PreToolUse, replaces klawde, fixes async"):
+    out = _install.rewire_settings(KLAWDE_CFG)
+    def _cmds(d, e): return [h.get("command","") for b in d["hooks"].get(e,[]) for h in b["hooks"]]
+    def _async(d, e): return [h.get("async",False) for b in d["hooks"].get(e,[]) for h in b["hooks"]]
+    ok = (
+        any("cdh-claude-hook" in c for c in _cmds(out,"PostToolUse"))            # cdh preserved
+        and any(h.get("type")=="http" for b in out["hooks"]["PreToolUse"] for h in b["hooks"])  # HTTP preserved
+        and not any("/.klawde/" in c for e in out["hooks"] for c in _cmds(out,e))  # klawde gone
+        and _async(out,"SessionEnd")==[False]                                    # async bug fixed
+        and _async(out,"SessionStart")==[False]                                  # blocking
+        and any("stop.sh" in c for c in _cmds(out,"Stop"))                       # Stop added
+        and _async(out,"Stop")==[True]
+        and not any("kitty_start" in c for e in out["hooks"] for c in _cmds(out,e))  # merged away
+        and len(_cmds(out,"SessionStart"))==1
+    )
+    check("64 installer preserves cdh + PreToolUse, replaces klawde, fixes async", ok,
+          f"PostToolUse={_cmds(out,'PostToolUse')} SessionEnd_async={_async(out,'SessionEnd')}")
+
+with guard("65 installer is idempotent (re-running changes nothing)"):
+    once = _install.rewire_settings(KLAWDE_CFG)
+    twice = _install.rewire_settings(once)
+    check("65 installer is idempotent (re-running changes nothing)", once == twice,
+          "a second rewire must not duplicate herd blocks")
+
+with guard("66 wrapper swap: klawde statusline -> herd, idempotent"):
+    w0 = 'CAV=$(bash caveman)\nprintf "%s ┃ " "$CAV"\n"$HOME/.klawde/statusline.sh"\n'
+    w1, rep = _install.rewire_wrapper(w0)
+    w2, _ = _install.rewire_wrapper(w1)
+    check("66 wrapper swap: klawde statusline -> herd, idempotent",
+          rep and ".klawde/statusline.sh" not in w1 and _install.STATUSLINE in w1 and w1 == w2,
+          "caveman segment kept, klawde statusline replaced, second run is a no-op")
+
 print("\n" + "═"*72)
 if FAILED:
     print(f"\033[31m{len(FAILED)} FAILED:\033[0m " + ", ".join(FAILED)); sys.exit(1)
