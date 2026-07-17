@@ -26,8 +26,7 @@
 --   IMMUTABLE (set once at spawn/discovery, reconcile MUST NOT touch):
 --       job_name, created_at
 --   MUTABLE (reconcile overwrites freely):
---       kitty_socket, os_window_id, tab_id, window_id, window_title,
---       herd_var, source, verified_at
+--       kitty_socket, window_id, herd_var, source, verified_at
 -- This is enforced by DISCIPLINE, not structure: name your columns in the
 -- UPDATE, never blanket-overwrite. Precedent: klawde's session_start.sh
 -- ON CONFLICT DO UPDATE names each column and deliberately preserves
@@ -56,14 +55,16 @@ CREATE TABLE IF NOT EXISTS herd_sessions (
                                   -- {kitty_pid} gives each kitty instance its
                                   -- own socket and its own id space. Never
                                   -- match on window_id alone.
-    os_window_id INTEGER,
-    tab_id       INTEGER,         -- MEASURED: focus does NOT need a separate
-                                  -- focus-tab call — `focus-window --match
-                                  -- id:N` on a window in a background tab
-                                  -- activates that tab and returns 0. Kept for
-                                  -- rendering/grouping, not for the jump.
-    window_id    INTEGER,         -- kitty's leaf id. MUTABLE across restarts.
-    window_title TEXT,
+    window_id    INTEGER,         -- kitty's leaf id ($KITTY_WINDOW_ID). MUTABLE
+                                  -- across restarts. (socket, window_id) is the
+                                  -- whole jump key — MEASURED: `focus-window
+                                  -- --match id:N` on a window in a background tab
+                                  -- activates that tab and returns 0, so no
+                                  -- tab_id/os_window_id is needed. Those, plus
+                                  -- window_title, were render-only and came ONLY
+                                  -- from `kitten @ ls`; they were the sole reason
+                                  -- the write path touched kitty and are dropped.
+                                  -- The TUI fetches grouping/titles on demand.
     herd_var     TEXT,            -- HERD_JOB user var, stamped at spawn via
                                   -- `kitten @ launch --var HERD_JOB=<name>`.
                                   -- The durable handle: `--match

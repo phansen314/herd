@@ -18,9 +18,9 @@ INSERT INTO sessions(cwd, status, status_source, started_at, updated_at)
 VALUES(:cwd, 'unknown', 'reconcile', :now, :now);
 -- :name W1_spawn_herd
 INSERT INTO herd_sessions(session_pk, job_name, created_at,
-                          kitty_socket, os_window_id, tab_id, window_id,
+                          kitty_socket, window_id,
                           herd_var, source, verified_at)
-VALUES(:pk, :job, :now, :socket, :oswin, :tab, :win, :job, 'spawn', :now);
+VALUES(:pk, :job, :now, :socket, :win, :job, 'spawn', :now);
 
 
 -- ── W2. ADOPT via window_id (core/session_start.sh) ───────────────────────
@@ -110,10 +110,9 @@ ON CONFLICT(session_id) DO UPDATE SET
 -- job_name / created_at are ABSENT by the mutability contract (herd.sql:25): a
 -- hook session has no job, and a resumed SPAWNED session must not have its job
 -- erased. source is NOT in the SET list, so a 'spawn'/'reconcile' row whose W2
--- missed is not downgraded to 'hook'. os_window_id/tab_id/herd_var are omitted —
--- the hook cannot know them from env; reconcile's W3b fills them next tick. The
--- trailing WHERE is the same no-op suppressor as W3b: a re-fired hook in an
--- unchanged window writes zero rows.
+-- missed is not downgraded to 'hook'. herd_var is omitted — the hook cannot know
+-- it from env; W3b (or spawn) owns it. The trailing WHERE is the same no-op
+-- suppressor as W3b: a re-fired hook in an unchanged window writes zero rows.
 -- :name W2b_placement
 INSERT INTO herd_sessions(session_pk, kitty_socket, window_id, source, verified_at)
 SELECT id, :socket, :win, 'hook', :now FROM sessions WHERE session_id = :session_id
@@ -172,24 +171,18 @@ ON CONFLICT(pid) WHERE stopped_at IS NULL AND pid IS NOT NULL DO NOTHING;
 -- Window reuse just works: a dead row and this live row may share (socket,
 -- window_id) — there is no UNIQUE index to violate, and the JOIN separates them.
 -- :name W3b_placement
-INSERT INTO herd_sessions(session_pk, kitty_socket, os_window_id, tab_id,
-                          window_id, window_title, herd_var, source, verified_at)
-VALUES(:pk, :socket, :oswin, :tab, :win, :title, :var, 'reconcile', :now)
+INSERT INTO herd_sessions(session_pk, kitty_socket, window_id,
+                          herd_var, source, verified_at)
+VALUES(:pk, :socket, :win, :var, 'reconcile', :now)
 ON CONFLICT(session_pk) DO UPDATE SET
     kitty_socket = excluded.kitty_socket,
-    os_window_id = excluded.os_window_id,
-    tab_id       = excluded.tab_id,
     window_id    = excluded.window_id,
-    window_title = excluded.window_title,
     herd_var     = COALESCE(herd_sessions.herd_var, excluded.herd_var),
     source       = CASE WHEN herd_sessions.source = 'spawn' THEN 'spawn'
                         ELSE excluded.source END,
     verified_at  = excluded.verified_at
 WHERE herd_sessions.kitty_socket IS NOT excluded.kitty_socket
-   OR herd_sessions.os_window_id IS NOT excluded.os_window_id
-   OR herd_sessions.tab_id       IS NOT excluded.tab_id
-   OR herd_sessions.window_id    IS NOT excluded.window_id
-   OR herd_sessions.window_title IS NOT excluded.window_title;
+   OR herd_sessions.window_id    IS NOT excluded.window_id;
     -- job_name, created_at: ABSENT BY CONTRACT. Do not add them.
     -- source preserves 'spawn' — provenance shouldn't decay to 'reconcile'.
     -- NOTE: verified_at is deliberately NOT a reason to write. Refreshing it
@@ -408,7 +401,7 @@ WHERE h.job_name = :job AND s.stopped_at IS NULL;
 SELECT s.id, s.session_id, s.pid, s.cwd, s.status, s.model, s.session_name,
        s.context_percent, s.total_cost_usd, s.git_branch,
        s.last_event_at, s.last_event_type, s.started_at, s.updated_at,
-       h.job_name, h.kitty_socket, h.os_window_id, h.tab_id, h.window_id,
+       h.job_name, h.kitty_socket, h.window_id,
        h.herd_var, h.source, h.verified_at,
        a.attention_at, a.paged_at, a.paged_level, a.ack_at
 FROM sessions s

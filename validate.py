@@ -159,15 +159,26 @@ check("four tables", tabs == ['events','herd_attention','herd_sessions','session
 check("WAL mode", c.execute("PRAGMA journal_mode").fetchone()[0] == "wal")
 check("auto_vacuum=INCREMENTAL", c.execute("PRAGMA auto_vacuum").fetchone()[0] == 2)
 check("idempotent re-apply", (c.executescript(CORE), c.executescript(HERD), True)[-1])
+# herd_sessions carries only placement that matters. os_window_id/tab_id/
+# window_title were render-only, obtainable ONLY from `kitten @ ls`, and were the
+# sole reason the write path would query kitty. Dropped: the jump needs only
+# (kitty_socket, window_id), both of which the hook gets from env. The TUI fetches
+# grouping/titles on demand. This guard blocks their reintroduction.
+_hs_cols = {r[1] for r in c.execute("PRAGMA table_info(herd_sessions)")}
+_render_only = {"os_window_id", "tab_id", "window_title"} & _hs_cols
+check("herd_sessions has no render-only kitty columns (kitten @ ls off the write path)",
+      not _render_only,
+      f"still present: {sorted(_render_only)}" if _render_only
+      else "kitty_socket + window_id carry the jump; render data is fetched on demand")
 
 print("\n\033[1m═══ C. THE SURROGATE KEY (the spine) ═══\033[0m")
 c = fresh()
 pk = c.execute("INSERT INTO sessions(cwd,status,status_source,started_at,updated_at) "
                "VALUES('/code/app','unknown','reconcile',?,?)",(T0,T0)).lastrowid
 c.execute("INSERT INTO herd_sessions(session_pk,job_name,created_at,kitty_socket,"
-          "os_window_id,tab_id,window_id,herd_var,source,verified_at) "
-          "VALUES(?,?,?,?,?,?,?,?,'spawn',?)",
-          (pk,"api-refactor",T0,"unix:/tmp/kitty-1",1,3,7,"api-refactor",T0))
+          "window_id,herd_var,source,verified_at) "
+          "VALUES(?,?,?,?,?,?,'spawn',?)",
+          (pk,"api-refactor",T0,"unix:/tmp/kitty-1",7,"api-refactor",T0))
 c.execute("INSERT INTO herd_attention(session_pk,attention_at) VALUES(?,?)",(pk,T0))
 check("tier-2 rows exist with session_id NULL",
       c.execute("SELECT session_id FROM sessions WHERE id=?",(pk,)).fetchone()[0] is None,
@@ -196,9 +207,9 @@ pk = c.execute("INSERT INTO sessions(cwd,started_at,updated_at) VALUES('/a',?,?)
 c.execute("INSERT INTO herd_sessions(session_pk,job_name,created_at,kitty_socket,"
           "window_id,herd_var,source,verified_at) VALUES(?,?,?,?,?,?,'spawn',?)",
           (pk,"api-refactor",T0,"unix:/tmp/kitty-1",7,"api-refactor",T0))
-c.execute(W["W3b_placement"], {"pk":pk,"socket":"unix:/tmp/kitty-9","oswin":2,"tab":5,
-                               "win":42,"title":"new title","var":None,"now":T2})
-r = c.execute("SELECT job_name,created_at,window_id,tab_id,source,herd_var,verified_at "
+c.execute(W["W3b_placement"], {"pk":pk,"socket":"unix:/tmp/kitty-9",
+                               "win":42,"var":None,"now":T2})
+r = c.execute("SELECT job_name,created_at,kitty_socket,window_id,source,herd_var,verified_at "
               "FROM herd_sessions WHERE session_pk=?",(pk,)).fetchone()
 check("reconcile preserves job_name", r["job_name"] == "api-refactor")
 check("reconcile preserves created_at", r["created_at"] == T0)
@@ -206,7 +217,7 @@ check("reconcile preserves herd_var (COALESCE)", r["herd_var"] == "api-refactor"
       "NULL from reconcile must not erase the spawn-time var")
 check("reconcile preserves source='spawn'", r["source"] == "spawn", "provenance doesn't decay")
 check("reconcile DOES update window_id", r["window_id"] == 42)
-check("reconcile DOES update tab_id", r["tab_id"] == 5)
+check("reconcile DOES update kitty_socket", r["kitty_socket"] == "unix:/tmp/kitty-9")
 check("reconcile DOES update verified_at", r["verified_at"] == T2)
 
 print("\n\033[1m═══ E. JOB NAMES: recyclable handles via R_job_live (no trigger, no UNIQUE) ═══\033[0m")
