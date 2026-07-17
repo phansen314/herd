@@ -41,6 +41,18 @@ T2 = "2026-07-15T10:10:00.000Z"
 # reconcile will load the same statements the same way, so using it here tests it.
 W = load_statements()
 
+# ── STATEMENT INTEGRITY: every named statement must be COMPLETE ────────────
+# Both parsers (python load_statements + bash stmt()) terminate a statement at
+# the first ';'. A ';' inside an inline comment silently truncates the statement
+# to a prefix — sqlite3 then fails with "incomplete input", or worse, executes a
+# valid-but-partial statement. sqlite3.complete_statement() catches truncation
+# structurally. (This bit W5_statusline twice during the rate-limit extension.)
+_incomplete = [n for n, s in W.items() if not sqlite3.complete_statement(s.strip())]
+check("every named statement is complete (no ';'-in-comment truncation)",
+      not _incomplete,
+      f"truncated/incomplete: {_incomplete}" if _incomplete
+      else f"all {len(W)} statements terminate cleanly")
+
 def fresh(tier2=True):
     if os.path.exists("f.db"): os.remove("f.db")
     for s in ("f.db-wal","f.db-shm"):
@@ -253,8 +265,9 @@ c.execute("INSERT INTO sessions(session_id,cwd,status,last_event_at,last_event_t
           " VALUES('s1','/a','working',?,'tool',?,?)",(T0,T0,T0))
 # statusline ticks repeatedly — must move updated_at, must NOT move last_event_at
 for t in (T1,T2):
-    c.execute(W["W5_statusline"], {"model":None,"sname":None,"ctx":42,"cost":1.5,
-                                   "branch":None,"now":t,"session_id":"s1"})
+    c.execute(W["W5_statusline"], {"model":None,"sname":None,"ctx":42,"cost":1.5,"branch":None,
+                                   "rl5":None,"rl5reset":None,"rl7":None,"rl7reset":None,
+                                   "now":t,"session_id":"s1"})
 r = c.execute("SELECT last_event_at,updated_at FROM sessions WHERE session_id='s1'").fetchone()
 check("statusline moves updated_at", r["updated_at"] == T2)
 check("statusline does NOT move last_event_at", r["last_event_at"] == T0,
@@ -264,14 +277,16 @@ check("idle signal is real", r["last_event_at"] != r["updated_at"], gap)
 
 print("\n\033[1m═══ H. STATUSLINE MUST NOT CREATE OR RESURRECT ═══\033[0m")
 c = fresh()
-n = c.execute(W["W5_statusline"], {"model":None,"sname":None,"ctx":50,"cost":None,
-                                   "branch":None,"now":T1,"session_id":"ghost"}).rowcount
+n = c.execute(W["W5_statusline"], {"model":None,"sname":None,"ctx":50,"cost":None,"branch":None,
+                                   "rl5":None,"rl5reset":None,"rl7":None,"rl7reset":None,
+                                   "now":T1,"session_id":"ghost"}).rowcount
 check("statusline on unknown session is a no-op", n == 0,
       "UPDATE-only: never invents rows with empty cwd")
 c.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at,stopped_at)"
           " VALUES('dead','/a','stopped',?,?,?)",(T0,T0,T1))
-n = c.execute(W["W5_statusline"], {"model":None,"sname":None,"ctx":50,"cost":None,
-                                   "branch":None,"now":T2,"session_id":"dead"}).rowcount
+n = c.execute(W["W5_statusline"], {"model":None,"sname":None,"ctx":50,"cost":None,"branch":None,
+                                   "rl5":None,"rl5reset":None,"rl7":None,"rl7reset":None,
+                                   "now":T2,"session_id":"dead"}).rowcount
 check("statusline cannot resurrect a stopped session", n == 0)
 
 print("\n\033[1m═══ I. PAGER LIFECYCLE ═══\033[0m")
@@ -497,8 +512,10 @@ check("44b idx_herd_window is a plain (non-unique) lookup index",
 check("44b2 herd_sessions has no `live` column",
       not any(r[1] == "live" for r in c.execute("PRAGMA table_info(herd_sessions)")),
       "liveness lives only in sessions.stopped_at")
-# and the inverse of 42, at source level: statusline may never carry a clock
-w5 = W["W5_statusline"].split("--")[0]
+# and the inverse of 42, at source level: statusline may never carry a clock.
+# Strip comments PER LINE (not .split('--')[0], which drops everything after the
+# first comment and would miss a last_event_at assignment placed after one).
+w5 = "\n".join(l.split("--")[0] for l in W["W5_statusline"].splitlines())
 check("44c W5_statusline never touches last_event_*", "last_event" not in w5.lower(),
       "the one invariant no runtime test survives someone 'optimizing' the statusline")
 
@@ -776,6 +793,123 @@ with guard("57b -bail rolls back a committed-prefix on runtime error"):
     check("57b -bail rolls back a committed-prefix on runtime error",
           le == T0 and ev == 0,
           f"the UPDATE must NOT survive the failed INSERT; last_event_at={le}, events={ev}")
+    c.close()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# O. STATUSLINE — the sink + render + fingerprint cache + Path C, end to end
+# ═══════════════════════════════════════════════════════════════════════════
+print("\n\033[1m═══ O. STATUSLINE (58-63) ═══\033[0m")
+
+def statusline(payload, env=None):
+    return hook("statusline.sh", payload, env)
+
+SL_PAY = {"session_id":"s1","model":{"id":"claude-opus-4-8"},"session_name":"sess",
+          "cwd":"/code/herd","context_window":{"used_percentage":42.7},
+          "cost":{"total_cost_usd":1.50},
+          "rate_limits":{"five_hour":{"used_percentage":73.5,"resets_at":1784172774},
+                         "seven_day":{"used_percentage":12,"resets_at":1784259174}}}
+
+# ── 58. W5 captures rate limits; resets_at epoch -> ISO; absent keeps prior ──
+with guard("58 W5 captures rate limits with epoch->ISO conversion"):
+    c = fresh()
+    c.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at)"
+              " VALUES('s1','/a','working',?,?)",(T0,T0))
+    c.execute(W["W5_statusline"], {"model":None,"sname":None,"ctx":None,"cost":None,"branch":None,
+                                   "rl5":"73.5","rl5reset":"1784172774","rl7":"12","rl7reset":"1784259174",
+                                   "now":T1,"session_id":"s1"})
+    r = c.execute("SELECT rate_limit_5h_percent,rate_limit_5h_resets_at FROM sessions WHERE session_id='s1'").fetchone()
+    got_iso = r["rate_limit_5h_resets_at"]
+    # a later tick with NO rate limits must NOT wipe them (COALESCE keeps prior)
+    c.execute(W["W5_statusline"], {"model":None,"sname":None,"ctx":None,"cost":None,"branch":None,
+                                   "rl5":None,"rl5reset":None,"rl7":None,"rl7reset":None,
+                                   "now":T2,"session_id":"s1"})
+    kept = c.execute("SELECT rate_limit_5h_percent FROM sessions WHERE session_id='s1'").fetchone()[0]
+    check("58 W5 captures rate limits with epoch->ISO conversion",
+          r["rate_limit_5h_percent"]==73.5 and got_iso=="2026-07-16T03:32:54Z" and kept==73.5,
+          f"5h%={r['rate_limit_5h_percent']} resets={got_iso} (epoch converted); absent-tick kept={kept}")
+
+# ── 59. statusline.sh sinks metrics into an adopted row ───────────────────
+with guard("59 statusline sinks metrics + renders the herd line"):
+    c = fresh()
+    pk = c.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at)"
+                   " VALUES('s1','/code/herd','working',?,?)",(T0,T0)).lastrowid
+    c.execute("INSERT INTO herd_sessions(session_pk,job_name,created_at,kitty_socket,"
+              "window_id,source,verified_at) VALUES(?,'api-refactor',?,?,5,'spawn',?)",(pk,T0,SOCK,T0))
+    c.close()
+    r = statusline(SL_PAY)
+    c = sqlite3.connect(DBPATH); c.row_factory = sqlite3.Row
+    row = c.execute("SELECT context_percent,total_cost_usd,rate_limit_5h_percent,rate_limit_5h_resets_at,model"
+                    " FROM sessions WHERE session_id='s1'").fetchone()
+    check("59 statusline sinks metrics + renders the herd line",
+          row["context_percent"]==42 and isinstance(row["context_percent"],int)
+          and row["total_cost_usd"]==1.5
+          and row["rate_limit_5h_percent"]==73.5 and row["rate_limit_5h_resets_at"]=="2026-07-16T03:32:54Z"
+          and "api-refactor" in r.stdout,
+          f"row={dict(row)} render={r.stdout.strip()!r}")
+    c.close()
+
+# ── 60. fingerprint HIT: a repeat identical tick does ZERO DB writes ──────
+with guard("60 identical tick is a fingerprint hit (no DB write)"):
+    c = fresh()
+    c.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at)"
+              " VALUES('s1','/code/herd','working',?,?)",(T0,T0))
+    c.close()
+    statusline(SL_PAY)                              # tick 1: sink
+    c = sqlite3.connect(DBPATH)
+    before = c.execute("SELECT updated_at FROM sessions WHERE session_id='s1'").fetchone()[0]
+    c.close()
+    r2 = statusline(SL_PAY)                          # tick 2: identical -> cache hit
+    c = sqlite3.connect(DBPATH)
+    after = c.execute("SELECT updated_at FROM sessions WHERE session_id='s1'").fetchone()[0]
+    check("60 identical tick is a fingerprint hit (no DB write)",
+          before == after and r2.stdout.strip() != "",
+          f"updated_at before={before} after={after} (equal => no write); render still emitted")
+    c.close()
+
+# ── 61. Path C: statusline adopts a reconciled-but-unadopted row ──────────
+with guard("61 Path C: statusline adopts a reconciled session from its env"):
+    c = fresh()
+    pk = c.execute("INSERT INTO sessions(pid,cwd,status,status_source,started_at,updated_at)"
+                   " VALUES(4242,'/code/herd','unknown','reconcile',?,?)",(T0,T0)).lastrowid
+    c.execute("INSERT INTO herd_sessions(session_pk,created_at,kitty_socket,window_id,source,verified_at)"
+              " VALUES(?,?,?,5,'reconcile',?)",(pk,T0,SOCK,T0))
+    c.close()
+    statusline({"session_id":"uuid-x","model":{"id":"opus"},"cwd":"/code/herd",
+                "context_window":{"used_percentage":30},"cost":{"total_cost_usd":0.10}},
+               {"KITTY_WINDOW_ID":"5","KITTY_LISTEN_ON":SOCK})
+    c = sqlite3.connect(DBPATH); c.row_factory = sqlite3.Row
+    row = c.execute("SELECT session_id,context_percent FROM sessions WHERE id=?",(pk,)).fetchone()
+    check("61 Path C: statusline adopts a reconciled session from its env",
+          row["session_id"]=="uuid-x" and row["context_percent"]==30,
+          f"adopted={row['session_id']} metrics_filled={row['context_percent']}")
+    c.close()
+
+# ── 62. statusline never resurrects a stopped session (full-script path) ──
+with guard("62 statusline tick on a stopped session is a no-op"):
+    c = fresh()
+    c.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at,stopped_at)"
+              " VALUES('dead','/x','stopped',?,?,?)",(T0,T0,T1))
+    c.close()
+    statusline({"session_id":"dead","model":{"id":"opus"},"cwd":"/x",
+                "context_window":{"used_percentage":99},"cost":{"total_cost_usd":5}})
+    c = sqlite3.connect(DBPATH); c.row_factory = sqlite3.Row
+    row = c.execute("SELECT context_percent,stopped_at FROM sessions WHERE session_id='dead'").fetchone()
+    check("62 statusline tick on a stopped session is a no-op",
+          row["context_percent"] is None and row["stopped_at"]==T1,
+          f"ctx={row['context_percent']} (must be None) stopped_at={row['stopped_at']} (must persist)")
+    c.close()
+
+# ── 63. never touches last_event_* (full-script path, not just the SQL) ────
+with guard("63 statusline never moves last_event_at"):
+    c = fresh()
+    c.execute("INSERT INTO sessions(session_id,cwd,status,last_event_at,last_event_type,"
+              "started_at,updated_at) VALUES('s1','/code/herd','working',?,'tool',?,?)",(T0,T0,T0))
+    c.close()
+    statusline(SL_PAY)
+    c = sqlite3.connect(DBPATH)
+    le = c.execute("SELECT last_event_at FROM sessions WHERE session_id='s1'").fetchone()[0]
+    check("63 statusline never moves last_event_at", le == T0,
+          f"last_event_at={le} must stay at the hook-set value; statusline owns only updated_at")
     c.close()
 
 shutil.rmtree(RUNTIME, ignore_errors=True)

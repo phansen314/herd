@@ -251,9 +251,20 @@ WHERE session_id = :session_id AND stopped_at IS NULL;
 UPDATE sessions SET
     model                = COALESCE(:model, model),
     session_name         = COALESCE(:sname, session_name),
-    context_percent      = COALESCE(:ctx, context_percent),
+    context_percent      = COALESCE(CAST(:ctx AS INTEGER), context_percent),
     total_cost_usd       = COALESCE(:cost, total_cost_usd),
     git_branch           = COALESCE(:branch, git_branch),
+    -- rate limits: payload gives resets_at as a UNIX EPOCH, converted to ISO in
+    -- SQLite (zero date forks). NULL-safe -- bind() emits NULL for an absent
+    -- value, strftime(...,NULL,...) yields NULL, COALESCE keeps the prior value.
+    -- NB inline comments must not contain a statement terminator char, since
+    -- both statement parsers cut at the first one they see.
+    rate_limit_5h_percent   = COALESCE(:rl5, rate_limit_5h_percent),
+    rate_limit_5h_resets_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%SZ', :rl5reset, 'unixepoch'),
+                                       rate_limit_5h_resets_at),
+    rate_limit_7d_percent   = COALESCE(:rl7, rate_limit_7d_percent),
+    rate_limit_7d_resets_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%SZ', :rl7reset, 'unixepoch'),
+                                       rate_limit_7d_resets_at),
     prev_cost_usd        = CASE WHEN prev_cost_sampled_at IS NULL
                              OR (strftime('%s','now')
                                  - strftime('%s', prev_cost_sampled_at)) > 300
@@ -322,6 +333,19 @@ DELETE FROM herd_attention WHERE session_pk = :pk;
 -- :name W6d_rearm_sid
 DELETE FROM herd_attention
 WHERE session_pk = (SELECT id FROM sessions WHERE session_id = :session_id);
+
+
+-- ── R_statusline. RENDER INPUTS (core/statusline.sh) ──────────────────────
+-- The herd status line shows the job name (tier 2) and a burn rate (from the
+-- prev_cost pair W5 maintains) — neither is in the payload. One read per
+-- fingerprint MISS feeds the render; unchanged ticks print the cached line and
+-- never run this. LEFT JOIN so an unadopted/untracked session still returns a
+-- row (empty job). `|`-joined for a single-field bash read.
+-- :name R_statusline
+SELECT COALESCE(h.job_name,'') || '|' || COALESCE(s.prev_cost_usd,'')
+       || '|' || COALESCE(s.prev_cost_sampled_at,'')
+FROM sessions s LEFT JOIN herd_sessions h ON h.session_pk = s.id
+WHERE s.session_id = :session_id;
 
 
 -- ── R_job_live. RECYCLABLE-HANDLE CHECK (herd/kitty spawn) ─────────────────
