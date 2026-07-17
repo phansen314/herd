@@ -65,6 +65,40 @@ herd_log() {
 # in it would otherwise escape $HERD_RUNTIME.
 valid_sid() { case "$1" in ''|*[!a-zA-Z0-9-]*) return 1 ;; *) return 0 ;; esac; }
 
+# ── claude pid (process-ancestry walk) ──────────────────────────────────────
+# Find claude's pid by walking the process tree UP from this hook to the first
+# ancestor named `claude`. SPIKE-1 concluded pid must come from `kitten @ ls`;
+# this is the walk that may overturn that — see the spike.
+#
+# MEANINGFUL ONLY FROM A BLOCKING HOOK (SessionStart). An async hook can be
+# reparented away from claude (ppid -> 1), breaking the chain. SessionStart runs
+# while claude WAITS, so its chain is intact.
+#
+# From a hook's vantage EXACTLY ONE claude is an ancestor — its own session.
+# Other sessions' claudes and claude's own MCP children are SIBLINGS, never on the
+# upward path, so first-match-walking-up wins with no ppid cross-check (the
+# `kitten @ ls` route needed one because foreground_processes is a flat list).
+#
+# Identity is basename(comm) == claude, overridable via HERD_CLAUDE_NAME. The
+# intended robustness anchor for a differently-named install (e.g. node-based) is
+# basename($CLAUDE_CODE_EXECPATH); wire that through HERD_CLAUDE_NAME if needed.
+#
+# Split for testability: _walk_claude reads `pid ppid comm` lines on stdin so the
+# suite can inject a synthetic ancestry; claude_pid pipes the real ps in. ONE ps
+# fork, portable to Linux and macOS (no /proc dependency).
+_walk_claude() {
+    awk -v start="$1" -v want="${HERD_CLAUDE_NAME:-claude}" '
+        { nm=$3; sub(/.*\//,"",nm); pp[$1]=$2; comm[$1]=nm }
+        END {
+            p=start
+            while (p != "" && p != "1" && (p in pp)) {
+                if (comm[p]==want) { print p; exit }
+                p=pp[p]
+            }
+        }'
+}
+claude_pid() { ps -eo pid=,ppid=,comm= 2>/dev/null | _walk_claude "$$"; }
+
 # ── sqlite3 ───────────────────────────────────────────────────────────────
 # busy_timeout is NOT optional: WAL serialises writers, and without it a hook
 # fails outright the moment reconcile or the TUI holds the write lock.

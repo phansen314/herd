@@ -563,6 +563,29 @@ def bash_stmt(name):
 
 def norm(s): return " ".join(s.split())
 
+# ── walk-logic: _walk_claude picks the right ancestor (offline, synthetic tree) ──
+# The LIVE proof (real SessionStart lands claude's pid) is done by hand against the
+# error log — see the plan. This proves the awk walk's LOGIC deterministically by
+# injecting a fake `pid ppid comm` ancestry, so a regression in the traversal is
+# caught without a live claude.
+def walk_claude(start, table, want=None):
+    env = dict(os.environ)
+    if want is not None: env["HERD_CLAUDE_NAME"] = want
+    r = subprocess.run(["bash", "-c", f'. "{HOOKS}/common.sh"; _walk_claude "{start}"'],
+                       input="\n".join(table), capture_output=True, text=True, env=env)
+    return r.stdout.strip()
+
+# hook(100) -> sh(200) -> claude(300) -> sh(400) -> claude(500) -> kitty(600)
+_nested = ["100 200 bash","200 300 sh","300 400 claude","400 500 sh","500 600 claude","600 1 kitty"]
+check("walk returns the NEAREST claude ancestor (not a nested outer one)",
+      walk_claude("100", _nested) == "300", f"got {walk_claude('100', _nested)!r} (want 300)")
+check("walk basenames comm (full path /usr/bin/claude still matches)",
+      walk_claude("100", ["100 200 bash","200 300 sh","300 400 /usr/bin/claude"]) == "300")
+check("walk returns empty when no claude on the path (no infinite loop at root)",
+      walk_claude("100", ["100 200 bash","200 1 sh"]) == "")
+check("walk honours HERD_CLAUDE_NAME (node-based install anchor)",
+      walk_claude("100", ["100 200 bash","200 300 sh","300 400 node"], want="node") == "300")
+
 # ── 47. bash and python must extract the SAME statement ───────────────────
 # This is what makes "writes.sql is canonical" true for BOTH runtimes. Without
 # it, herd.db.load_statements() and the hooks' stmt() are two parsers of one
