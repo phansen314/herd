@@ -1155,6 +1155,74 @@ check("71 placement blocks the duplicate-discover AND lets W3c reach the pid",
       _before==1 and _after==1 and _pidfill==2000,
       f"live before={_before} after W3a={_after} (must stay 1); pid via placement-join={_pidfill}")
 
+print("\n\033[1m═══ R. LIVENESS REAPER (daemon.py) ═══\033[0m")
+from herd.daemon import reap_once, boot_sweep, _parse_proc_table, _dead
+
+def _live_sess(conn, sid, pid, started=T0, le=T0):
+    return conn.execute(
+        "INSERT INTO sessions(session_id,pid,cwd,status,status_source,"
+        "last_event_at,last_event_type,started_at,updated_at) "
+        "VALUES(?,?,'/a','working','hook',?,'tool',?,?)",
+        (sid, pid, le, started, started)).lastrowid
+
+# One fixture, four liveness verdicts: absent / zombie / recycled-to-nonclaude / live.
+c = fresh()
+a = _live_sess(c, "absent", 5000)
+z = _live_sess(c, "zombie", 5001)
+r = _live_sess(c, "recycled", 5002)
+ok = _live_sess(c, "alive", 5003)
+procs = {5001: ("Z", "claude"), 5002: ("S", "bash"), 5003: ("S", "claude")}  # 5000 absent
+n = reap_once(c, procs, T2)
+def _stopped(pk): return c.execute("SELECT stopped_at FROM sessions WHERE id=?",(pk,)).fetchone()[0]
+check("reaper reaps absent/zombie/recycled, keeps the live claude",
+      n == 3 and _stopped(a) and _stopped(z) and _stopped(r) and _stopped(ok) is None,
+      f"reaped={n} absent={_stopped(a)!r} zombie={_stopped(z)!r} recycled={_stopped(r)!r} alive={_stopped(ok)!r}")
+
+# pid-NULL rows are unjudgeable — never reaped (clean death comes via SessionEnd).
+c = fresh()
+k = c.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at) "
+              "VALUES('nopid','/a','working',?,?)",(T0,T0)).lastrowid
+check("reaper skips pid-NULL rows",
+      reap_once(c, {}, T2) == 0 and _stopped(k) is None)
+
+# W3d provenance + the two-clocks invariant: a reap sets stopped/pid, never a clock.
+c = fresh()
+d = _live_sess(c, "dead", 5010, started=T0, le=T0)
+reap_once(c, {}, T2)
+row = c.execute("SELECT status,status_source,stopped_at,last_event_at FROM sessions WHERE id=?",(d,)).fetchone()
+check("reaper marks status_source='pid' and never moves last_event_at",
+      row["status"]=="stopped" and row["status_source"]=="pid"
+      and row["stopped_at"]==T2 and row["last_event_at"]==T0,
+      f"{dict(row)} (last_event_at must stay {T0})")
+
+# reaping is idempotent — a second tick over the same dead pid reaps nothing.
+check("reaper is idempotent (already-stopped rows are not re-reaped)",
+      reap_once(c, {}, T2) == 0)
+
+# boot_sweep: reap live rows started BEFORE boot, spare those started after.
+c = fresh()
+old = _live_sess(c, "preboot", 6000, started=T0)
+new = _live_sess(c, "postboot", 6001, started=T2)
+boot_sweep(c, T2, T1)   # boot at T1
+check("boot_sweep reaps pre-boot rows, spares post-boot",
+      _stopped(old) and _stopped(new) is None,
+      f"preboot={_stopped(old)!r} postboot={_stopped(new)!r}")
+check("boot_sweep with unknown boot_time (None) is a no-op",
+      (lambda cc: (boot_sweep(cc, T2, None),
+                   cc.execute("SELECT stopped_at FROM sessions WHERE id=?",
+                              (_live_sess(cc,'x',6002,started=T0),)).fetchone()[0] is None)[-1])(fresh()))
+
+# _parse_proc_table: pid/state/comm, basenamed comm, junk-tolerant.
+pp = _parse_proc_table("  100 Ss /usr/bin/claude\n200 Z claude\nbogus line\n300 R\n400 Sl+ node\n")
+check("_parse_proc_table parses state+basename(comm), skips junk/short lines",
+      pp == {100:("S","claude"), 200:("Z","claude"), 400:("S","node")},
+      str(pp))
+
+# _dead unit: the four verdicts in isolation, incl. HERD_CLAUDE_NAME default.
+check("_dead: absent->True, zombie->True, non-claude->True, live claude->False",
+      _dead(1,{}) and _dead(1,{1:("Z","claude")}) and _dead(1,{1:("S","bash")})
+      and not _dead(1,{1:("S","claude")}))
+
 print("\n" + "═"*72)
 if FAILED:
     print(f"\033[31m{len(FAILED)} FAILED:\033[0m " + ", ".join(FAILED)); sys.exit(1)
