@@ -77,11 +77,52 @@ ON CONFLICT(session_id) DO UPDATE SET
     model           = COALESCE(excluded.model, sessions.model),
     status          = 'working',
     stopped_at      = NULL,          -- resume revives a stopped session
+    pid             = NULL,          -- ...at an UNKNOWN location. The old pid died
+                                     -- with the old window and may now be recycled
+                                     -- by an unrelated process. Carrying it forward
+                                     -- lets W3d reap the just-resumed session (or,
+                                     -- on reuse, makes the row immortal). Cleared
+                                     -- here. Reconcile's W3c refills it next tick
+                                     -- via the placement row W2b_placement writes.
     last_event_at   = excluded.last_event_at,
     last_event_type = excluded.last_event_type,
     updated_at      = excluded.updated_at;
     -- NOTE: started_at deliberately preserved. Resume = same session, fresh
     -- location; Duration reflects total age. (klawde's semantics — correct.)
+
+-- W2b_placement. The tier-2 half of the W2b fallback. W2b_insert writes the
+-- session row (tier 1); this records the kitty window the hook is STANDING IN, so
+-- a user-started `claude` (never spawned/discovered by herd) gets a placement row
+-- like every other tracked session. Without it that session has no (socket,
+-- window_id) -> pk mapping, so reconcile can neither fill its pid (W3c) nor avoid
+-- inserting a DUPLICATE live row (W3a's NOT EXISTS is vacuously true). This is the
+-- ONLY writer of source='hook' — the value the CHECK reserved for exactly this.
+--
+-- The hook holds BOTH identity keys at once — Claude's UUID (payload) and the
+-- window (env) — which no other actor does: hooks route by UUID, reconcile by
+-- window, and this is where the two are welded onto one row.
+--
+-- pk via a SELECT on session_id, NOT last_insert_rowid(): after W2b_insert's
+-- ON CONFLICT DO UPDATE, last_insert_rowid() returns the last INSERTed row, not
+-- the updated one. Same keyed-off-tier-1 shape as W6d_rearm_sid. Run inside the
+-- SAME run_tx as W2b_insert, so this SELECT sees that row uncommitted.
+--
+-- job_name / created_at are ABSENT by the mutability contract (herd.sql:25): a
+-- hook session has no job, and a resumed SPAWNED session must not have its job
+-- erased. source is NOT in the SET list, so a 'spawn'/'reconcile' row whose W2
+-- missed is not downgraded to 'hook'. os_window_id/tab_id/herd_var are omitted —
+-- the hook cannot know them from env; reconcile's W3b fills them next tick. The
+-- trailing WHERE is the same no-op suppressor as W3b: a re-fired hook in an
+-- unchanged window writes zero rows.
+-- :name W2b_placement
+INSERT INTO herd_sessions(session_pk, kitty_socket, window_id, source, verified_at)
+SELECT id, :socket, :win, 'hook', :now FROM sessions WHERE session_id = :session_id
+ON CONFLICT(session_pk) DO UPDATE SET
+    kitty_socket = excluded.kitty_socket,
+    window_id    = excluded.window_id,
+    verified_at  = excluded.verified_at
+WHERE herd_sessions.kitty_socket IS NOT excluded.kitty_socket
+   OR herd_sessions.window_id    IS NOT excluded.window_id;
 
 
 -- ── W3. RECONCILE (herd/kitty) ────────────────────────────────────────────

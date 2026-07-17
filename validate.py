@@ -494,7 +494,13 @@ with guard("43b W5b statusline-adopt also targets the LIVE row"):
 # `live` must not appear as a column reference anywhere.
 writes_code = "\n".join(l.split("--")[0] for l in WRITES.splitlines())
 stmts = [s for s in writes_code.split(";") if "window_id" in s and "kitty_socket" in s]
-lookups = [s for s in stmts if re.search(r"WHERE[\s\S]*kitty_socket\s*=", s, re.I)]
+# A genuine (socket,window) LOOKUP compares kitty_socket to a BOUND param
+# (`kitty_socket = :socket`) to FIND a session row — that is what must carry the
+# liveness JOIN. W2b_placement also contains `kitty_socket =`, but only in its SET
+# list (`= excluded.kitty_socket`, WRITING a value) while it routes by session_id;
+# it is not a window lookup and must not be forced to filter stopped_at. Keying on
+# `= :` distinguishes the two without a false positive.
+lookups = [s for s in stmts if re.search(r"kitty_socket\s*=\s*:", s, re.I)]
 offenders = [" ".join(s.split())[:70] for s in lookups
              if not re.search(r"stopped_at\s+IS\s+NULL", s, re.I)]
 check("44 every (socket,window_id) lookup derives liveness via stopped_at",
@@ -976,6 +982,84 @@ with guard("66 wrapper swap: klawde statusline -> herd, idempotent"):
     check("66 wrapper swap: klawde statusline -> herd, idempotent",
           rep and ".klawde/statusline.sh" not in w1 and _install.STATUSLINE in w1 and w1 == w2,
           "caveman segment kept, klawde statusline replaced, second run is a no-op")
+
+print("\n\033[1m═══ Q. ID DURABILITY + W2b/RECONCILE SEAM (67-71) ═══\033[0m")
+
+# 67. AUTOINCREMENT: a surrogate id is NEVER reused after a delete. Without it a
+# recycled id could reattach to a stale :pk held mid-tick by the TUI/pager once a
+# future prune adds a real DELETE FROM sessions. Plain rowid recycles the highest
+# id on the next insert; AUTOINCREMENT (sqlite_sequence-backed) never does.
+c = fresh()
+i1 = c.execute("INSERT INTO sessions(cwd,started_at,updated_at) VALUES('/a',?,?)",(T0,T0)).lastrowid
+c.execute("DELETE FROM sessions WHERE id=?",(i1,))
+i2 = c.execute("INSERT INTO sessions(cwd,started_at,updated_at) VALUES('/b',?,?)",(T2,T2)).lastrowid
+_seq = c.execute("SELECT seq FROM sqlite_sequence WHERE name='sessions'").fetchone()
+check("67 sessions.id is AUTOINCREMENT — a deleted id is never recycled",
+      i2 > i1 and _seq is not None,
+      f"deleted id={i1}, next id={i2} (must be > {i1}); "
+      f"sqlite_sequence(sessions)={_seq['seq'] if _seq else None}")
+
+# 68. Resume must CLEAR a stale pid. W2b revives (stopped_at=NULL); the old pid
+# died with the old window. If it survives, reconcile's W3d reaps the just-resumed
+# session, or a recycled pid makes the row immortal. 41c inserts with NO pid, so
+# it never exercised this path — the hole this closes.
+c = fresh()
+c.execute("INSERT INTO sessions(session_id,pid,cwd,status,started_at,updated_at)"
+          " VALUES('u9',111,'/code/herd','working',?,?)",(T0,T0))
+c.execute(W["W4_end"], {"session_id":"u9","now":T1})               # die (SessionEnd)
+c.execute(W["W2b_insert"], {"session_id":"u9","cwd":"/code/herd","model":"opus",
+                            "transcript":"/t.jsonl","now":T2})     # claude --resume
+_pid = c.execute("SELECT pid FROM sessions WHERE session_id='u9'").fetchone()["pid"]
+check("68 W2b revive clears the stale pid (reconcile refills it via W3c)",
+      _pid is None,
+      f"pid after revive={_pid} (must be None; the resumed proc has a fresh pid)")
+
+# 69. Every value of the herd_sessions.source CHECK must be WRITTEN by some
+# statement. 'hook' sat in the CHECK (herd.sql:81) with no writer — a reserved
+# plug. Assert no source enum value is orphaned, so this cannot silently recur.
+_src_writers = "\n".join(s for n, s in W.items()
+                         if re.search(r"INSERT\s+INTO\s+herd_sessions", s, re.I))
+_src_code = "\n".join(l.split("--")[0] for l in _src_writers.splitlines())
+_missing = [v for v in ("spawn", "hook", "reconcile") if f"'{v}'" not in _src_code]
+check("69 no herd_sessions.source enum value is orphaned (all are written)",
+      not _missing,
+      f"CHECK allows spawn/hook/reconcile; written by NO statement: {_missing}"
+      if _missing else "spawn, hook, reconcile each have a writer")
+
+# 70. W2b_placement records the hook's window as source='hook', with NULL job_name
+# (herd didn't name it) — the plug for the seam. pk resolved off session_id, so it
+# lands on the row W2b_insert just wrote in the same transaction.
+c = fresh()
+c.execute(W["W2b_insert"], {"session_id":"u1","cwd":"/code/herd","model":"opus",
+                            "transcript":"/t.jsonl","now":T0})
+c.execute(W["W2b_placement"], {"session_id":"u1","socket":SOCK,"win":8,"now":T0})
+_pl = c.execute("SELECT h.source,h.kitty_socket,h.window_id,h.job_name "
+                "FROM herd_sessions h JOIN sessions s ON s.id=h.session_pk "
+                "WHERE s.session_id='u1'").fetchone()
+check("70 W2b_placement records the hook's window (source=hook, no job)",
+      _pl is not None and _pl["source"]=="hook" and _pl["kitty_socket"]==SOCK
+      and _pl["window_id"]==8 and _pl["job_name"] is None,
+      f"placement={dict(_pl) if _pl else None}")
+
+# 71. THE SEAM CLOSED, END TO END. With placement present, reconcile's W3a_discover
+# for the SAME (socket,window) is a no-op (no duplicate half-row), AND W3c_pid —
+# reached via the placement JOIN reconcile actually uses — fills the pid the seam
+# previously stranded. Both failures this plan removes, asserted on one fixture.
+c = fresh()
+c.execute(W["W2b_insert"], {"session_id":"u1","cwd":"/code/herd","model":"opus",
+                            "transcript":"/t.jsonl","now":T0})
+c.execute(W["W2b_placement"], {"session_id":"u1","socket":SOCK,"win":8,"now":T0})
+_before = c.execute("SELECT COUNT(*) FROM sessions WHERE stopped_at IS NULL").fetchone()[0]
+c.execute(W["W3a_discover"], {"pid":2000,"cwd":"/code/herd","socket":SOCK,"win":8,"now":T1})
+_after = c.execute("SELECT COUNT(*) FROM sessions WHERE stopped_at IS NULL").fetchone()[0]
+_pk = c.execute("SELECT h.session_pk FROM herd_sessions h JOIN sessions s ON s.id=h.session_pk "
+                "WHERE h.kitty_socket=? AND h.window_id=8 AND s.stopped_at IS NULL",
+                (SOCK,)).fetchone()["session_pk"]
+c.execute(W["W3c_pid"], {"pk":_pk,"pid":2000,"now":T1})
+_pidfill = c.execute("SELECT pid FROM sessions WHERE id=?",(_pk,)).fetchone()["pid"]
+check("71 placement blocks the duplicate-discover AND lets W3c reach the pid",
+      _before==1 and _after==1 and _pidfill==2000,
+      f"live before={_before} after W3a={_after} (must stay 1); pid via placement-join={_pidfill}")
 
 print("\n" + "═"*72)
 if FAILED:

@@ -34,7 +34,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- discovered by reconcile) with a job name, a placement, and pager state
     -- BEFORE Claude Code has told us its UUID. Adoption is then a plain
     -- UPDATE of session_id — no PK rewrite, no cascade.
-    id                  INTEGER PRIMARY KEY,
+    -- AUTOINCREMENT, not a bare rowid alias: a bare rowid RECYCLES the highest
+    -- id on the next insert after a delete. Sessions are soft-deleted (stopped_at)
+    -- today, so it never bites — but the moment a prune job adds a real DELETE, a
+    -- recycled id could reattach to a stale :pk held mid-tick by the TUI/pager.
+    -- AUTOINCREMENT (sqlite_sequence-backed, like events.id below) makes the
+    -- surrogate strictly monotonic and never-reused. Cost is one sqlite_sequence
+    -- write per insert — immaterial at the session insert rate.
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id          TEXT UNIQUE,   -- Claude's UUID. NULL until adopted.
                                        -- SQLite UNIQUE ignores NULLs, so many
                                        -- unadopted rows coexist.

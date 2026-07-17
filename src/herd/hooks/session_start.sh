@@ -34,14 +34,24 @@ now_pair
 export HERD_P_session_id="$SID" HERD_P_cwd="$CWD" HERD_P_model="$MODEL" \
        HERD_P_transcript="$TRANSCRIPT" HERD_P_now="$NOW_ISO"
 
-ADOPTED=0
+ADOPTED=0; IN_KITTY=0
 if [ -n "${KITTY_WINDOW_ID:-}" ] && [ -n "${KITTY_LISTEN_ON:-}" ]; then
+    IN_KITTY=1
     export HERD_P_socket="$KITTY_LISTEN_ON" HERD_P_win="$KITTY_WINDOW_ID"
     ADOPTED=$(run W2_adopt "SELECT changes();" 2>/dev/null)
 fi
 
+# W2 missed: no herd row for this window. Insert the session (tier 1) and — when
+# we know the window — its placement (tier 2, source='hook') in ONE transaction,
+# so a user-started `claude` is a first-class tracked session (pid-fillable by
+# reconcile, not duplicated). Outside kitty there is no window to record; W2b
+# stands alone (check 49).
 if [ "$ADOPTED" != "1" ]; then
-    run W2b_insert >/dev/null 2>&1
+    if [ "$IN_KITTY" = "1" ]; then
+        run_tx W2b_insert W2b_placement >/dev/null 2>&1
+    else
+        run W2b_insert >/dev/null 2>&1
+    fi
 fi
 
 export HERD_P_etype="start" HERD_P_raw=""
