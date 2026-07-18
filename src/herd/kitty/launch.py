@@ -36,12 +36,11 @@ def _run(argv):
     return subprocess.run(argv, capture_output=True, text=True).stdout
 
 
-def launch(spec, socket, *, run_fn=None):
+def launch(spec, socket):
     """Launch the session; return the new kitty window_id (int), or None on failure.
     kitten prints the id on success — anything non-integer means the launch failed
-    (remote control off, bad socket, …)."""
-    run_fn = run_fn or _run
-    out = (run_fn(build_launch_argv(spec, socket)) or "").strip()
+    (remote control off, bad socket, …). Tests stub one layer up, at spawn(launch_fn=)."""
+    out = (_run(build_launch_argv(spec, socket)) or "").strip()
     try:
         return int(out)
     except (TypeError, ValueError):

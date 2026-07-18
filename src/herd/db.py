@@ -16,12 +16,12 @@ WRITES = SCHEMA_DIR / "writes.sql"      # W1-W6 + R1
 _NAME_RE = re.compile(r"^--\s*:name\s+(\S+)\s*$")
 
 
-def load_statements(src=None):
+def load_statements():
     """Parse `-- :name X` blocks out of writes.sql -> {name: sql}. Every consumer
     loads the SHIPPING statements through here (nothing keeps its own
     transcription — that let write paths rot). Mirrors common.sh stmt(); both cut
     at the first ';' and the test suite asserts they agree. See DESIGN.md#write-paths-schemawritessql."""
-    text = WRITES.read_text() if src is None else src
+    text = WRITES.read_text()
     out, name, buf = {}, None, []
     for line in text.splitlines():
         m = _NAME_RE.match(line)
