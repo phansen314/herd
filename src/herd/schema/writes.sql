@@ -1,7 +1,7 @@
 -- ═══════════════════════════════════════════════════════════════════════════
 -- herd — canonical write paths. The ONLY statements that write.
 -- Loaded by herd.db.load_statements() (python) AND common.sh stmt() (bash);
--- both cut at the first ';', and validate.py asserts they agree char-for-char.
+-- both cut at the first ';', and the test suite asserts they agree char-for-char.
 -- Rationale + a per-statement table: DESIGN.md#write-paths-schemawritessql.
 -- Inline comments inside a statement must not contain ';'.
 -- ═══════════════════════════════════════════════════════════════════════════

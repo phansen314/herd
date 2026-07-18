@@ -11,6 +11,13 @@ dependencies = []
 # Local-only by design: no network, no runtime deps. The hooks are bash + jq +
 # sqlite3 on purpose — a python cold start on SessionStart would be felt.
 
+[project.optional-dependencies]
+# Test-only. The package itself stays dependency-free.
+test = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

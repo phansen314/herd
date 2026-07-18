@@ -3,6 +3,8 @@ __pycache__/
 *.egg-info/
 build/
 dist/
-# validate.py scratch DBs
-f.db*
-g.db*
+# pytest / ad-hoc scratch DBs
+.pytest_cache/
+*.db
+*.db-wal
+*.db-shm

@@ -45,7 +45,7 @@ Two data sources, two directions:
 
 ### Two tiers
 
-The schema is split along a strict boundary (enforced in `validate.py`):
+The schema is split along a strict boundary (enforced by the test suite):
 
 - **Tier 1 — `sessions`, `events`** — facts that would be true whether or not herd
   existed: a Claude process with this pid, cwd, status. Core session data.
@@ -73,7 +73,7 @@ own tooling on the `sessions` table; herd never touches `herd_attention`.
 
 Every write is a named statement in [`schema/writes.sql`](src/herd/schema/writes.sql).
 Both the bash hooks and the Python daemon load statements from that one file — SQL
-is never inlined into a hook or the daemon. `validate.py` proves the bash and Python
+is never inlined into a hook or the daemon. The test suite proves the bash and Python
 extractors return character-for-character identical statements, so a fixed bug can't
 quietly rot in a copy.
 
@@ -181,10 +181,10 @@ gone quiet) shows separately as the `!` in `herd ls` / the jump picker.
 
 ## Development
 
-The whole design is asserted, not narrated, by one suite:
+The whole design is asserted, not narrated, by the `pytest` suite:
 
 ```bash
-python3 validate.py     # 100+ checks, no install needed, ~1s
+python3 -m pytest       # ~160 checks, no install needed, ~1s
 ```
 
 It runs the real bash hooks and the real Python against throwaway databases, and
@@ -193,7 +193,8 @@ the two-clocks attention thesis, the reaper's liveness rules, and that the hooks
 daemon load the same canonical SQL. New behavior is added test-first (red before
 green); the suite is the project's only CI gate.
 
-The schema files carry the deep design rationale in their comments —
+The design rationale lives in [`DESIGN.md`](DESIGN.md); source comments carry a
+one-line summary and point there. Start with the schema —
 [`schema/core.sql`](src/herd/schema/core.sql) (tier 1),
 [`schema/herd.sql`](src/herd/schema/herd.sql) (tier 2), and
 [`schema/writes.sql`](src/herd/schema/writes.sql) (every write path).
@@ -210,7 +211,8 @@ src/herd/
   cli.py         the `herd` CLI (ls, jump, + fzf preview machinery)
   kitty/         focus.py — re-derive a session's window and jump to it
 completions/     bash completion   ·   bin/herd — the CLI wrapper
-validate.py      the validation suite
+tests/           pytest suite (helpers.py + conftest.py + test_*.py per concern)
+DESIGN.md        the design rationale
 ```
 
 ## Roadmap

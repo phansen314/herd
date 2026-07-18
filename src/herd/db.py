@@ -20,7 +20,7 @@ def load_statements(src=None):
     """Parse `-- :name X` blocks out of writes.sql -> {name: sql}. Every consumer
     loads the SHIPPING statements through here (nothing keeps its own
     transcription — that let write paths rot). Mirrors common.sh stmt(); both cut
-    at the first ';' and validate.py asserts they agree. See DESIGN.md#write-paths-schemawritessql."""
+    at the first ';' and the test suite asserts they agree. See DESIGN.md#write-paths-schemawritessql."""
     text = WRITES.read_text() if src is None else src
     out, name, buf = {}, None, []
     for line in text.splitlines():

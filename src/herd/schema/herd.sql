@@ -6,7 +6,7 @@
 -- ── HERD_SESSIONS — merged placement + job, one row per known session.
 -- Liveness is NOT stored here: it lives in sessions.stopped_at, read by JOIN.
 -- A `live` column here once desynced permanently on resume. See DESIGN.md#liveness.
--- Mutability contract (enforced by discipline, validate.py section D):
+-- Mutability contract (enforced by discipline, the test suite section D):
 --   IMMUTABLE (set at spawn): job_name, created_at
 --   MUTABLE  (hook re-fire may overwrite): kitty_socket, window_id, herd_var, source, verified_at
 -- Placement is a CACHE re-derived on the focus path, not a fact. See DESIGN.md#focus--jump-kittyfocuspy-clipy.

@@ -5,7 +5,7 @@ load-bearing line and point here with `DESIGN.md#anchor`. If you're about to
 write an essay in the code, write it here instead.
 
 Source of truth for behaviour is `schema/writes.sql` (the write paths) and
-`validate.py` (the checks). This doc explains *why* those look the way they do.
+`the test suite` (the checks). This doc explains *why* those look the way they do.
 
 ---
 
@@ -17,7 +17,7 @@ The schema splits along a strict, one-way boundary:
 
 - **Tier 1 — `sessions`, `events`** (`schema/core.sql`): facts that would be
   true whether or not herd existed — a Claude process with this pid, cwd,
-  status. `core.sql` may **never** mention `herd_*`. Enforced by `validate.py`
+  status. `core.sql` may **never** mention `herd_*`. Enforced by `the test suite`
   (check A scans comment-stripped DDL; another check applies `core.sql`
   standalone).
 - **Tier 2 — `herd_sessions`, `herd_attention`** (`schema/herd.sql`): herd's
@@ -133,7 +133,7 @@ boot. A `pid_start_time` column would close it properly; deliberately deferred.
 
 These named `-- :name X` blocks are the **only** statements that write. Both
 `herd.db.load_statements()` (python) and `common.sh`'s `stmt()` (awk) extract
-them the same way, terminating at the first `;`; `validate.py` asserts the two
+them the same way, terminating at the first `;`; `the test suite` asserts the two
 agree character-for-character, so bash and python cannot drift. Nothing may keep
 its own transcription of a write path — the predecessor re-typed statements
 inline and four defects survived 40 checks that way.
@@ -161,7 +161,7 @@ Inline comments inside a statement must not contain `;` (both parsers cut there;
 
 **Routing read, not data read:** in an adopt writer (W2, W5b, W2b_placement) a
 `herd_*` reference may appear only *after* `WHERE` (to pick which row), never in
-the SET list. No tier-2 value ever enters a core column. `validate.py` enforces
+the SET list. No tier-2 value ever enters a core column. `the test suite` enforces
 this structurally.
 
 The liveness JOIN inside the adopt subquery (`s.stopped_at IS NULL`) is
@@ -174,7 +174,7 @@ to the stopped row while the live session stays unadopted and invisible.
 `verified_at` may be rewritten by a hook re-fire (e.g. resume in a new window).
 Enforced by discipline — name columns in the UPDATE, never blanket-overwrite.
 `W2b_placement` omits `job_name`/`created_at` and keeps `source='spawn'` so a
-resumed spawned session never loses its job identity (`validate.py` section D).
+resumed spawned session never loses its job identity (`the test suite` section D).
 
 ---
 
@@ -342,14 +342,22 @@ is a separate actuator, deliberately deferred — this layer maintains the signa
 
 ## Testing
 
-`validate.py` is currently the only CI gate: import-linter can't see the tier
-boundary because that boundary is SQL and the hooks are bash. It applies the real
-schema, loads the real statements through `herd.db`, and execs the **real** hooks
-(directly, not via `bash <path>` — a missing `+x` must fail the same way
-production does) against a throwaway DB.
+The `pytest` suite under `tests/` is the only CI gate: import-linter can't see
+the tier boundary because that boundary is SQL and the hooks are bash. It applies
+the real schema, loads the real statements through `herd.db`, and execs the
+**real** hooks (directly, not via `bash <path>` — a missing `+x` must fail the
+same way production does) against a per-test throwaway DB.
 
-*(Pass 2, planned: port to `pytest` under `tests/` — fixtures + parametrize,
-selective/parallel runs.)*
+    python3 -m pytest              # whole suite (~1s)
+    python3 -m pytest tests/test_hooks.py     # one section
+    python3 -m pytest -k pid       # by keyword
+
+Layout: `tests/helpers.py` holds fixed clocks + row builders (`mk_session`,
+`mk_herd`, …); `tests/conftest.py` the `fresh` (temp-DB connection) and
+`hook_env` (real-bash-hook runner) fixtures. Each `test_*.py` maps to one concern
+(tier boundary, two clocks, reaper, attention, focus, …). Autocommit on the setup
+connection is load-bearing: the hook tests read the DB from a separate process,
+and an uncommitted setup would be invisible to them.
 
 ---
 
