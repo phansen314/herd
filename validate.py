@@ -1033,6 +1033,17 @@ with guard("66 wrapper swap: klawde statusline -> herd, idempotent"):
           rep and ".klawde/statusline.sh" not in w1 and _install.STATUSLINE in w1 and w1 == w2,
           "caveman segment kept, klawde statusline replaced, second run is a no-op")
 
+with guard("66b daemon service unit is well-formed and source-based"):
+    u = _install.service_unit_text()
+    ok = ("-m herd.daemon" in u
+          and f"Environment=PYTHONPATH={_install.PKG_SRC}" in u   # runs from the source tree
+          and f"Environment=HERD_DB={_install.DB}" in u
+          and "Restart=on-failure" in u
+          and "WantedBy=default.target" in u                      # starts on login
+          and _install.PKG_SRC.name == "src")
+    check("66b daemon service unit is well-formed (PYTHONPATH, HERD_DB, ExecStart, autostart)",
+          ok, u.replace(chr(10), " ⏎ "))
+
 print("\n\033[1m═══ Q. ID DURABILITY + W2b/RECONCILE SEAM (67-71) ═══\033[0m")
 
 # 67. AUTOINCREMENT: a surrogate id is NEVER reused after a delete. Without it a

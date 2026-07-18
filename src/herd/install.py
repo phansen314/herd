@@ -19,11 +19,14 @@ import tempfile
 from herd.db import connect, apply_schema
 
 HOOKS_DIR = pathlib.Path(__file__).resolve().parent / "hooks"
+PKG_SRC = pathlib.Path(__file__).resolve().parent.parent   # .../src (for PYTHONPATH)
+REPO = PKG_SRC.parent                                       # repo root
 HOME = pathlib.Path.home()
 SETTINGS = HOME / ".claude" / "settings.json"
 WRAPPER = HOME / ".claude" / "custom-status-line.sh"
 HERD_DIR = HOME / ".herd"
 DB = HERD_DIR / "herd.db"
+SERVICE = HOME / ".config" / "systemd" / "user" / "herd.service"
 
 # event -> (hook script, async?). Stop is NEW (klawde has none). SessionStart and
 # SessionEnd are BLOCKING; SessionEnd blocking is the fix for klawde's async bug.
@@ -71,6 +74,70 @@ def bootstrap_db(dry=False):
     apply_schema(conn)          # idempotent: CREATE TABLE IF NOT EXISTS
     conn.close()
     return f"bootstrapped {DB}"
+
+
+# ── daemon service (reaper + attention) ────────────────────────────────────
+# The hooks are bash (run by absolute path); the daemon is python and runs from the
+# source tree with PYTHONPATH — no pip install needed, edits picked up on restart.
+def _service_python():
+    """A ROBUST interpreter for the unit: prefer system python3 over whatever ran
+    the installer (often a pyenv shim that needs PATH/init a systemd unit won't have).
+    herd is stdlib-only, so any 3.9+ works."""
+    for cand in ("/usr/bin/python3", "/usr/local/bin/python3"):
+        if os.access(cand, os.X_OK):
+            return cand
+    return sys.executable
+
+
+def _has_systemd_user():
+    return bool(shutil.which("systemctl") and os.environ.get("XDG_RUNTIME_DIR"))
+
+
+def service_unit_text():
+    """The systemd --user unit. Pure — testable without touching systemd."""
+    return (
+        "[Unit]\n"
+        "Description=herd — Claude Code session tracker (reaper + attention)\n"
+        f"Documentation=file://{REPO}\n"
+        "After=default.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"Environment=PYTHONPATH={PKG_SRC}\n"
+        f"Environment=HERD_DB={DB}\n"
+        f"ExecStart={_service_python()} -m herd.daemon\n"
+        "Restart=on-failure\n"
+        "RestartSec=5\n\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
+def install_service(dry=False):
+    """Write + enable + (re)start the daemon unit. Idempotent. Graceful no-op where
+    systemd --user is unavailable (macOS/headless) — herd still works, just run the
+    daemon yourself."""
+    if not _has_systemd_user():
+        return ("daemon service SKIPPED — no systemctl --user here. Run the daemon "
+                "yourself:  PYTHONPATH=src python3 -m herd.daemon  (or a launchd job)")
+    if dry:
+        return f"would write {SERVICE} and enable + (re)start herd.service"
+    SERVICE.parent.mkdir(parents=True, exist_ok=True)
+    SERVICE.write_text(service_unit_text())
+    for args in (["daemon-reload"], ["enable", "herd.service"], ["restart", "herd.service"]):
+        subprocess.run(["systemctl", "--user", *args], check=False, capture_output=True)
+    active = subprocess.run(["systemctl", "--user", "is-active", "herd.service"],
+                            capture_output=True, text=True).stdout.strip()
+    return f"herd.service written + enabled ({active or 'unknown'})"
+
+
+def uninstall_service():
+    if not _has_systemd_user() or not SERVICE.exists():
+        return "no herd.service to remove"
+    subprocess.run(["systemctl", "--user", "disable", "--now", "herd.service"],
+                   check=False, capture_output=True)
+    SERVICE.unlink(missing_ok=True)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False, capture_output=True)
+    return f"removed {SERVICE}"
 
 
 # ── settings.json surgery ──────────────────────────────────────────────────
@@ -171,6 +238,7 @@ def install(dry=False):
     if dry:
         print(f"  would back up + rewrite {SETTINGS}")
         print(f"  would back up + rewrite {WRAPPER} (statusline -> herd: {wrap_ok})")
+        print("  " + install_service(dry=True))
         print("\n  resulting hooks:")
         for e, blocks in new_settings["hooks"].items():
             cmds = [h.get("command") or f"<{h.get('type','?')}:{h.get('url','')}>"
@@ -188,6 +256,7 @@ def install(dry=False):
 
     ok, row = selftest()
     print(f"\n  self-test (wired hooks -> temp DB): {'PASS' if ok else 'FAIL'}  {row}")
+    print("  " + install_service())
     print("\n  klawde is unwired but NOT deleted — ~/.klawde/sessions.db (history) is kept.")
     print("  view sessions meanwhile:")
     print('    sqlite3 ~/.herd/herd.db "SELECT s.id,h.job_name,s.cwd,s.status FROM sessions s '
@@ -196,7 +265,8 @@ def install(dry=False):
 
 
 def uninstall():
-    """Restore the most recent backup of each edited file."""
+    """Restore the most recent backup of each edited file + remove the service."""
+    print("  " + uninstall_service())
     for path in (SETTINGS, WRAPPER):
         baks = sorted(path.parent.glob(path.name + ".herd-bak.*"))
         if baks:
