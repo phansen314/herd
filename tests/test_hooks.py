@@ -175,3 +175,47 @@ def test_bail_rolls_back_committed_prefix(hook_env):
                             HERD_ERRLOG=f"{hook_env.runtime}/err.log"))
     assert c.execute("SELECT last_event_at FROM sessions WHERE session_id='s1'").fetchone()[0] == T0
     assert c.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+# ── session_start.sh: the third branch, and the pid capture ──────────────────
+def test_session_start_in_kitty_without_a_placeholder_records_placement(hook_env):
+    """W2 misses (no herd-spawned row for this window) but we ARE in kitty, so the
+    W2b_insert + W2b_placement pair must run in one txn — a user-started `claude`
+    becomes a first-class tracked session. This branch (session_start.sh:41) was
+    never driven through bash; only the adopt and non-kitty paths were."""
+    c = hook_env.conn()
+    hook_env.run("session_start.sh",
+                 {"session_id": "fresh-uuid", "cwd": "/code/herd", "model": "opus",
+                  "transcript_path": "/t.jsonl"},
+                 {"KITTY_WINDOW_ID": "77", "KITTY_LISTEN_ON": SOCK})
+    r = c.execute("SELECT s.id, s.cwd, h.kitty_socket, h.window_id, h.source "
+                  "FROM sessions s JOIN herd_sessions h ON h.session_pk = s.id "
+                  "WHERE s.session_id='fresh-uuid'").fetchone()
+    assert r is not None, "no placement row — the W2b pair did not run"
+    assert (r["kitty_socket"], r["window_id"]) == (SOCK, 77)
+    assert r["source"] == "hook"          # 'hook', not 'spawn' — herd didn't launch it
+
+
+def test_session_start_captures_the_claude_pid(hook_env):
+    """claude_pid() walks ancestors for a process named `claude`. In the suite the
+    ancestor is pytest/bash, so HERD_P_pid was always empty and the pid-writing
+    branch of the real bash never executed. HERD_CLAUDE_NAME retargets the walk."""
+    c = hook_env.conn()
+    hook_env.run("session_start.sh",
+                 {"session_id": "pid-uuid", "cwd": "/code/herd", "model": "opus",
+                  "transcript_path": "/t.jsonl"},
+                 {"HERD_CLAUDE_NAME": "bash"})
+    pid = c.execute("SELECT pid FROM sessions WHERE session_id='pid-uuid'").fetchone()[0]
+    assert pid is not None and pid > 0
+
+
+def test_session_start_leaves_pid_null_when_no_claude_ancestor(hook_env):
+    """No match -> NULL, not 0 or a bogus pid: the reaper treats NULL as 'skip',
+    and a wrong pid would let it reap a live session."""
+    c = hook_env.conn()
+    hook_env.run("session_start.sh",
+                 {"session_id": "nopid-uuid", "cwd": "/code/herd", "model": "opus",
+                  "transcript_path": "/t.jsonl"},
+                 {"HERD_CLAUDE_NAME": "definitely-not-a-real-process-name"})
+    pid = c.execute("SELECT pid FROM sessions WHERE session_id='nopid-uuid'").fetchone()[0]
+    assert pid is None

@@ -333,3 +333,73 @@ def test_watch_machinery_is_readonly_except_watch():
     """watch focuses windows (a write, via W6c_ack); its helpers only read."""
     assert {"rows", "poke"} <= cli._READONLY
     assert "watch" not in cli._READONLY
+
+
+# ── cmd_jump: the four branches, none of which had a test ────────────────────
+def _jump_env(monkeypatch, fresh, *, has_fzf=True, pick=None):
+    """A live session + stubbed fzf/focus, so cmd_jump's control flow is what is
+    under test rather than kitty or the picker."""
+    c = fresh()
+    pk = mk_session(c, session_id="uuid-aaaa", cwd="/code/herd", status="waiting")
+    mk_herd(c, pk, job_name="api", created_at=T0, window_id=7)
+    focused = []
+    monkeypatch.setattr(cli, "_has_fzf", lambda: has_fzf)
+    monkeypatch.setattr(cli, "_fzf_pick", lambda rows, q: pick(rows, q) if pick else None)
+    monkeypatch.setattr(cli, "_do_focus",
+                        lambda conn, row: (focused.append(row["id"]), 0)[1])
+    return c, pk, focused
+
+
+def test_jump_with_no_live_sessions_returns_1(monkeypatch, fresh):
+    c = fresh()
+    monkeypatch.setattr(cli, "_has_fzf", lambda: True)
+    assert cli.cmd_jump(c, []) == 1
+
+
+def test_jump_unique_match_focuses_without_the_picker(monkeypatch, fresh):
+    """The scriptable path: `herd jump api` must not open fzf."""
+    opened = []
+    c, pk, focused = _jump_env(monkeypatch, fresh,
+                               pick=lambda rows, q: opened.append(q))
+    assert cli.cmd_jump(c, ["api"]) == 0
+    assert focused == [pk] and opened == []
+
+
+def test_jump_no_match_seeds_the_picker_over_all_sessions(monkeypatch, fresh):
+    """0 matches is not an error — it opens the picker seeded with the query, so a
+    typo is recoverable rather than fatal."""
+    seen = {}
+    def pick(rows, q):
+        seen["rows"], seen["q"] = rows, q
+        return None
+    c, pk, focused = _jump_env(monkeypatch, fresh, pick=pick)
+    cli.cmd_jump(c, ["nope-no-such"])
+    assert seen["q"] == "nope-no-such"
+    assert [r["id"] for r in seen["rows"]] == [pk]      # seeded over ALL live rows
+
+
+def test_jump_cancelled_picker_is_quiet_130(monkeypatch, fresh):
+    """fzf's cancel convention; must not be reported as an error."""
+    c, pk, focused = _jump_env(monkeypatch, fresh, pick=lambda rows, q: None)
+    assert cli.cmd_jump(c, []) == 130
+    assert focused == []
+
+
+def test_jump_picked_row_is_focused(monkeypatch, fresh):
+    c, pk, focused = _jump_env(monkeypatch, fresh, pick=lambda rows, q: rows[0])
+    assert cli.cmd_jump(c, []) == 0
+    assert focused == [pk]
+
+
+def test_jump_without_fzf_prints_instead_of_focusing(monkeypatch, fresh, capsys):
+    c, pk, focused = _jump_env(monkeypatch, fresh, has_fzf=False)
+    assert cli.cmd_jump(c, []) == 0
+    assert focused == []
+    assert "api" in capsys.readouterr().out
+
+
+def test_jump_without_fzf_reports_an_unmatched_query(monkeypatch, fresh, capsys):
+    c, pk, focused = _jump_env(monkeypatch, fresh, has_fzf=False)
+    cli.cmd_jump(c, ["nope-no-such"])
+    out = capsys.readouterr().out
+    assert "no live session matches" in out and "api" in out   # explains, then lists

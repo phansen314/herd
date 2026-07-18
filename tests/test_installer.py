@@ -74,3 +74,39 @@ def test_cli_paths_resolve_and_completion_ships():
 ])
 def test_bell_decision(current, answer, expect):
     assert inst._bell_decision(current, answer) == expect
+
+
+# ── selftest(): the installer's own proof that the wiring works ──────────────
+def test_selftest_passes_against_the_real_hooks():
+    """It direct-execs the shipped scripts (not `bash <path>`), so this also covers
+    the +x bit the way production hits it."""
+    from herd import install as I
+    ok, detail = I.selftest()
+    assert ok, detail
+    assert detail["status"] == "working" and detail["context_percent"] == 10
+
+
+def test_selftest_reports_a_missing_executable_bit(monkeypatch, tmp_path):
+    """The failure it exists to catch: a hook without +x is a silent no-op under
+    settings.json, which is how a blank statusline once shipped."""
+    from herd import install as I
+    fake = tmp_path / "hooks"
+    fake.mkdir()
+    for name in ("session_start.sh", "statusline.sh"):
+        p = fake / name
+        p.write_text("#!/usr/bin/env bash\nexit 0\n")
+        p.chmod(0o644)                      # readable, NOT executable
+    monkeypatch.setattr(I, "HOOKS_DIR", fake)
+    ok, detail = I.selftest()
+    assert not ok
+    assert sorted(detail["not_executable"]) == ["session_start.sh", "statusline.sh"]
+
+
+def test_selftest_leaves_the_real_db_alone(tmp_path, monkeypatch):
+    """It must use a throwaway DB — a selftest that wrote to ~/.herd/herd.db would
+    inject a fake session into the user's live list on every install."""
+    from herd import install as I
+    real = tmp_path / "herd.db"
+    monkeypatch.setattr(I, "DB", real)
+    I.selftest()
+    assert not real.exists()
