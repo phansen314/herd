@@ -1044,6 +1044,19 @@ with guard("66b daemon service unit is well-formed and source-based"):
     check("66b daemon service unit is well-formed (PYTHONPATH, HERD_DB, ExecStart, autostart)",
           ok, u.replace(chr(10), " ⏎ "))
 
+with guard("66c CLI install paths resolve + completion ships"):
+    check("66c herd CLI + completion paths resolve (bin/herd, completions/herd.bash)",
+          _install.CLI_SRC.name == "herd" and _install.CLI_SRC.parent.name == "bin"
+          and _install.CLI_SRC.exists()
+          and _install.CLI_LINK == pathlib.Path.home()/".local"/"bin"/"herd"
+          and _install.COMPLETION_SRC.exists(),
+          f"src={_install.CLI_SRC} link={_install.CLI_LINK}")
+    # the wrapper MUST resolve through the PATH symlink (readlink) or PYTHONPATH
+    # points at ~/.local/src and `herd` can't import itself. Regression guard.
+    check("66c wrapper resolves its symlink before setting PYTHONPATH",
+          "readlink" in _install.CLI_SRC.read_text(),
+          "bin/herd must dereference ${BASH_SOURCE} so ~/.local/bin/herd finds src/")
+
 print("\n\033[1m═══ Q. ID DURABILITY + W2b/RECONCILE SEAM (67-71) ═══\033[0m")
 
 # 67. AUTOINCREMENT: a surrogate id is NEVER reused after a delete. Without it a
@@ -1415,6 +1428,12 @@ _pv = _cli._preview_text({"id": 3, "session_id": "abc12345", "status": "waiting"
 check("cli._preview_text renders the session detail block (incl. live attention)",
       all(s in _pv for s in ("abc12345", "waiting", "/x/api", "42%", "$1.50", "needs attention")),
       _pv.replace(chr(10), " ⏎ "))
+_ctoks = _cli._complete_tokens([
+    {"session_id": "aaa11111-x", "job_name": "api", "cwd": "/x/api/"},   # job==basename -> dedup
+    {"session_id": "bbb22222-y", "job_name": None,  "cwd": "/y/web"},
+    {"session_id": None,          "job_name": None,  "cwd": "/"}])         # nothing usable
+check("cli._complete_tokens yields uuid8 / job / cwd-basename, deduped+sorted",
+      _ctoks == ["aaa11111", "api", "bbb22222", "web"], _ctoks)
 
 print("\n" + "═"*72)
 if FAILED:

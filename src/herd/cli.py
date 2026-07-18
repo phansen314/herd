@@ -153,6 +153,26 @@ def cmd_jump(conn, args):
     return 0 if candidates else 1
 
 
+def _complete_tokens(rows):
+    """Completion candidates for `herd jump` — the things resolve() matches on:
+    each live session's 8-char uuid, its job name, and its cwd basename."""
+    toks = set()
+    for r in rows:
+        if r["session_id"]:
+            toks.add(r["session_id"][:8])
+        if r["job_name"]:
+            toks.add(r["job_name"])
+        cwd = (r["cwd"] or "").rstrip("/")
+        if cwd:
+            toks.add(cwd.rsplit("/", 1)[-1] or cwd)
+    return sorted(toks)
+
+
+def cmd_complete(conn, args):
+    print("\n".join(_complete_tokens(_live(conn))))
+    return 0
+
+
 def cmd_preview(conn, args):
     if not args or not args[0].strip().isdigit():
         return 1
@@ -168,8 +188,8 @@ def cmd_preview(conn, args):
     return 0
 
 
-COMMANDS = {"ls": cmd_ls, "jump": cmd_jump, "preview": cmd_preview}
-_READONLY = {"ls", "preview"}
+COMMANDS = {"ls": cmd_ls, "jump": cmd_jump, "preview": cmd_preview, "complete": cmd_complete}
+_READONLY = {"ls", "preview", "complete"}
 
 
 def main(argv=None):

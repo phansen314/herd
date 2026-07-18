@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
 # herd CLI wrapper — runs from the source tree, no pip install needed.
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolve through a possible PATH symlink (~/.local/bin/herd) to the real bin/herd.
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+HERE="$(cd "$(dirname "$SELF")/.." && pwd)"
 PYTHONPATH="$HERE/src${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m herd.cli "$@"

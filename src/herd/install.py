@@ -27,6 +27,10 @@ WRAPPER = HOME / ".claude" / "custom-status-line.sh"
 HERD_DIR = HOME / ".herd"
 DB = HERD_DIR / "herd.db"
 SERVICE = HOME / ".config" / "systemd" / "user" / "herd.service"
+CLI_SRC = REPO / "bin" / "herd"
+CLI_LINK = HOME / ".local" / "bin" / "herd"
+COMPLETION_SRC = REPO / "completions" / "herd.bash"
+COMPLETION_LINK = HOME / ".local" / "share" / "bash-completion" / "completions" / "herd"
 
 # event -> (hook script, async?). Stop is NEW (klawde has none). SessionStart and
 # SessionEnd are BLOCKING; SessionEnd blocking is the fix for klawde's async bug.
@@ -140,6 +144,40 @@ def uninstall_service():
     return f"removed {SERVICE}"
 
 
+# ── CLI on PATH + bash completion ──────────────────────────────────────────
+def _relink(link, target):
+    """Idempotently point `link` at `target` (symlink). mkdir parents."""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(target)
+
+
+def _on_path(d):
+    return str(d) in os.environ.get("PATH", "").split(os.pathsep)
+
+
+def install_cli(dry=False):
+    """Put `herd` on PATH (~/.local/bin) + install bash completion. Idempotent."""
+    if dry:
+        return f"would symlink {CLI_LINK} -> {CLI_SRC} + bash completion"
+    _relink(CLI_LINK, CLI_SRC)
+    _relink(COMPLETION_LINK, COMPLETION_SRC)
+    note = f"herd -> {CLI_LINK} + completion"
+    if not _on_path(CLI_LINK.parent):
+        note += f"  (WARN: {CLI_LINK.parent} not on PATH — add it)"
+    return note + ".  Open shells: `hash -r` or a new shell to pick up `herd`."
+
+
+def uninstall_cli():
+    removed = []
+    for link, target in ((CLI_LINK, CLI_SRC), (COMPLETION_LINK, COMPLETION_SRC)):
+        if link.is_symlink() and link.resolve() == target.resolve():
+            link.unlink()
+            removed.append(link.name)
+    return f"removed CLI links: {removed}" if removed else "no herd CLI links to remove"
+
+
 # ── settings.json surgery ──────────────────────────────────────────────────
 def rewire_settings(data):
     """Return a NEW settings dict with herd wired and klawde unwired. Pure —
@@ -239,6 +277,7 @@ def install(dry=False):
         print(f"  would back up + rewrite {SETTINGS}")
         print(f"  would back up + rewrite {WRAPPER} (statusline -> herd: {wrap_ok})")
         print("  " + install_service(dry=True))
+        print("  " + install_cli(dry=True))
         print("\n  resulting hooks:")
         for e, blocks in new_settings["hooks"].items():
             cmds = [h.get("command") or f"<{h.get('type','?')}:{h.get('url','')}>"
@@ -257,6 +296,7 @@ def install(dry=False):
     ok, row = selftest()
     print(f"\n  self-test (wired hooks -> temp DB): {'PASS' if ok else 'FAIL'}  {row}")
     print("  " + install_service())
+    print("  " + install_cli())
     print("\n  klawde is unwired but NOT deleted — ~/.klawde/sessions.db (history) is kept.")
     print("  view sessions meanwhile:")
     print('    sqlite3 ~/.herd/herd.db "SELECT s.id,h.job_name,s.cwd,s.status FROM sessions s '
@@ -265,8 +305,9 @@ def install(dry=False):
 
 
 def uninstall():
-    """Restore the most recent backup of each edited file + remove the service."""
+    """Restore the most recent backup of each edited file + remove service & CLI."""
     print("  " + uninstall_service())
+    print("  " + uninstall_cli())
     for path in (SETTINGS, WRAPPER):
         baks = sorted(path.parent.glob(path.name + ".herd-bak.*"))
         if baks:
