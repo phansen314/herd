@@ -73,10 +73,21 @@ def _parse_proc_table(text):
 
 
 def read_proc_table():
-    """ONE ps fork per tick. Portable Linux+macOS (no /proc dependency)."""
-    out = subprocess.run(["ps", "-eo", "pid=,stat=,comm="],
-                         capture_output=True, text=True).stdout
-    return _parse_proc_table(out)
+    """ONE ps fork per tick. Portable Linux+macOS (no /proc dependency). Returns
+    None — NOT {} — when the table can't be trusted: a nonzero ps, an exec failure,
+    or an empty parse. _dead() reads "absent from the table" as dead, so handing a
+    caller {} on a broken ps reaps every live session at once. A real `ps -eo`
+    always lists this process, so no rows means the probe failed, not that the
+    machine is idle. Callers must skip the tick on None."""
+    try:
+        p = subprocess.run(["ps", "-eo", "pid=,stat=,comm="],
+                           capture_output=True, text=True)
+    except OSError:                              # ps missing from PATH, fork limit
+        return None
+    if p.returncode != 0:
+        return None
+    procs = _parse_proc_table(p.stdout)
+    return procs or None
 
 
 def boot_time_iso():
@@ -190,7 +201,9 @@ def run(interval=2.0, db_path=None, once=False, attend=None):
     boot_sweep(conn, _now_iso(), boot_time_iso())
     while True:
         now = _now_iso()
-        reap_once(conn, read_proc_table(), now)       # tier 1 — always
+        procs = read_proc_table()
+        if procs is not None:                         # tier 1 — always, unless ps
+            reap_once(conn, procs, now)               # is untrustworthy this tick
         if attend:
             attention_tick(conn, now)                 # tier 2 — herd's opinion
         if once:
