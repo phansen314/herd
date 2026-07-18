@@ -1,6 +1,7 @@
 """T — jump / focus (kitty/focus.py + cli.py): pid->window resolution, the focus
 path (re-derive, ack, self-heal), and cli display/resolve/completion."""
 import inspect
+import re
 import socket
 import time
 
@@ -305,15 +306,20 @@ def test_only_watch_expects_keys(fresh):
     assert "--expect" not in src and "_parse_expect" not in src
 
 
+MACHINERY = ("preview", "complete", "rows", "poke")
+
+
 def test_cli_hides_machinery():
+    """The property, not the literal: every user verb is offered by tab-completion
+    and no machinery verb is. Pinning the exact tuple (and the exact compgen line)
+    meant adding a verb failed here twice, in two places, for no defect."""
     from herd import install as inst
     completion = inst.COMPLETION_SRC.read_text()
-    assert cli.USER_COMMANDS == ("ls", "jump", "spawn", "watch")
-    assert {"preview", "complete", "rows", "poke"} <= set(cli.COMMANDS)
-    for m in ("preview", "complete", "rows", "poke"):
-        assert m not in cli.USER_COMMANDS
-    assert 'compgen -W "ls jump spawn watch"' in completion
-    assert "preview" not in completion and "poke" not in completion
+    offered = re.search(r'compgen -W "([^"]*)"', completion).group(1).split()
+    assert set(offered) == set(cli.USER_COMMANDS)
+    assert set(MACHINERY) <= set(cli.COMMANDS)          # callable ...
+    assert not set(MACHINERY) & set(cli.USER_COMMANDS)  # ... but not advertised
+    assert not set(MACHINERY) & set(offered)
 
 
 def test_cli_reads_live_sessions_only_through_r1_list():

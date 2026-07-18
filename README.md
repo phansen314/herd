@@ -88,6 +88,7 @@ herd spawn <job>        # launch claude in a new kitty tab, tracked from the sta
 herd jump               # fuzzy-pick a session (fzf) with a live preview, and focus it
 herd jump <query>       # herd id, name (/rename), job, uuid, or cwd; unique match jumps
 herd watch              # the picker as a permanent dashboard, for a dedicated tab
+herd doctor             # why isn't herd recording anything? (see Troubleshooting)
 ```
 
 Sessions show by their recognizable name — Claude's `/rename` name, else herd's job,
@@ -315,9 +316,30 @@ rejected: [DECISIONS.md#pager](DECISIONS.md#pager).
 
 ## Troubleshooting
 
-Hooks **never** print to Claude — that's the contract, so they fail silently by
-design. Errors go to `~/.herd/hook-errors.log` (`HERD_ERRLOG`); the daemon's go to
-`journalctl --user -u herd`. Check those first.
+**Start here:**
+
+```bash
+herd doctor
+```
+
+It checks dependencies, the database, whether the hooks and statusline are really
+wired (and still point at files that exist and are executable), whether exactly one
+daemon is running, malformed `HERD_*` values, and recent hook errors. Exits nonzero
+if anything is broken:
+
+```
+  wiring
+    ✔ SessionStart  —  …/src/herd/hooks/session_start.sh
+    ✔ statusLine (via wrapper)  —  ~/.claude/custom-status-line.sh
+  daemon
+    ✘ daemon not running  —  sessions will never leave `herd ls`
+```
+
+Everything herd does at runtime is designed to fail *silently* — hooks **never**
+print to Claude, a missing dependency exits 0, the daemon logs to a journal. That
+is deliberate, and it is why the diagnosis lives in one command instead of in your
+terminal. Raw sources, if you want them: `~/.herd/hook-errors.log` (`HERD_ERRLOG`)
+and `journalctl --user -u herd`.
 
 | symptom | cause |
 |---|---|

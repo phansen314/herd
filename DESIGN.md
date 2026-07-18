@@ -363,10 +363,13 @@ picker, `rows` and the preview pane all go through it — `preview` filters it b
 id in Python rather than issuing a second query
 ([DECISIONS.md#transcription](DECISIONS.md#transcription)).
 
-`cli` surface: `ls`, `jump` and `watch` are the user verbs; `preview` (fzf's
-per-highlight pane), `complete` (tab-completion feed), `rows` (fzf's reload
-source) and `poke` (watch's refresh child) are machinery — callable, hidden from
-help/completion. `jump` focuses immediately on a unique match (scriptable), else
+`cli` surface: `ls`, `jump`, `spawn`, `watch` and `doctor` are the user verbs;
+`preview` (fzf's per-highlight pane), `complete` / `tcomplete` (tab-completion
+feeds), `rows` (fzf's reload source) and `poke` (watch's refresh child) are
+machinery — callable, hidden from help/completion. `doctor` is the one verb that
+does NOT take the shared connection: a missing or corrupt DB is something it
+reports, so opening one up front would break it on exactly the machines it exists
+to diagnose. `jump` focuses immediately on a unique match (scriptable), else
 opens an fzf picker with a live preview; without fzf/tty it prints the list. A
 jump *is* an ack (`W6c_ack`).
 

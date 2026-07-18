@@ -471,12 +471,24 @@ _READONLY = {"ls", "preview", "complete", "tcomplete", "rows", "poke"}
 # / `tcomplete` (tab-completion feeds), `rows` (fzf's reload source) and `poke`
 # (watch's refresh child) are machinery — callable, but not advertised in help or
 # tab-completion.
-USER_COMMANDS = ("ls", "jump", "spawn", "watch")
+USER_COMMANDS = ("ls", "jump", "spawn", "watch", "doctor")
+
+# doctor opens nothing up front: a missing or corrupt DB is something it REPORTS,
+# and the shared connect below would traceback on exactly the machines it exists
+# to diagnose.
+_NO_DB = {"doctor"}
+
+
+def cmd_doctor(argv):
+    from herd import doctor                       # local: only this verb needs it
+    return doctor.main(argv)
 
 
 def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
     cmd = argv[0] if argv else "ls"
+    if cmd in _NO_DB:
+        return cmd_doctor(argv[1:])
     if cmd not in COMMANDS:
         print(f"herd: unknown command {cmd!r} (try: {', '.join(USER_COMMANDS)})")
         return 2
