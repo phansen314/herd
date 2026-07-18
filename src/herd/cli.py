@@ -98,10 +98,12 @@ def _has_fzf():
     return bool(shutil.which("fzf")) and sys.stdin.isatty()
 
 
-def _fzf_pick(rows, query, extra=()):
-    """Interactive fuzzy pick with a live preview pane. Returns a row or None.
+def _fzf_run(rows, query, extra=()):
+    """Run the picker, return its raw stdout. watch needs the raw text: with
+    --expect the pressed key is the first line, and that is its only way to tell
+    quit from cancel.
 
-    `extra` appends watch-mode flags (--listen, the poker, extra binds) without
+    `extra` appends watch-mode flags (--listen, --expect, extra binds) without
     forking a second copy of the flag list — jump and watch must not drift apart on
     --delimiter/--with-nth/--preview, which _parse_pick depends on.
 
@@ -115,7 +117,12 @@ def _fzf_pick(rows, query, extra=()):
          "--preview", preview, "--preview-window", "right,55%,wrap", *extra],
         input="\n".join(_row_line(r) for r in rows),
         stdout=subprocess.PIPE, text=True)   # stderr stays on the terminal (fzf's UI)
-    return _parse_pick(rows, p.stdout)
+    return p.stdout
+
+
+def _fzf_pick(rows, query, extra=()):
+    """Interactive fuzzy pick with a live preview pane. Returns a row or None."""
+    return _parse_pick(rows, _fzf_run(rows, query, extra))
 
 
 # ── preview (its own process, spawned by fzf per highlight — reads live) ──────
@@ -261,12 +268,23 @@ def _free_port():
         return s.getsockname()[1]
 
 
+_QUIT_KEYS = ("ctrl-q", "ctrl-c")
+
+
 def _watch_flags(port):
     return [f"--listen={port}",
             f"--bind=ctrl-r:reload({_ROWS_CMD})",
-            "--bind=ctrl-q:abort",
+            f"--expect={','.join(_QUIT_KEYS)}",
             "--prompt", "herd ▸ ",
             "--header", "enter jump · ctrl-r refresh · ctrl-q quit"]
+
+
+def _parse_expect(stdout):
+    """--expect puts the pressed key on line 1, the selection on line 2. Returns
+    (key, selection); key is "" for a plain enter, and both are "" when fzf was
+    cancelled (Esc prints nothing at all)."""
+    key, _, rest = stdout.partition("\n")
+    return key.strip(), rest
 
 
 def _spawn_poker(port):
@@ -295,11 +313,18 @@ def cmd_watch(conn, args):
         port = _free_port()
         poker = _spawn_poker(port)
         try:
-            picked = _fzf_pick(rows, "", _watch_flags(port))
+            out = _fzf_run(rows, "", _watch_flags(port))
         except KeyboardInterrupt:
-            return 130
+            return 130                      # only reachable from the sleep above:
+                                            # fzf's raw mode disables ISIG, so while
+                                            # the picker is up ctrl-c is a KEY, never
+                                            # a signal — hence _QUIT_KEYS.
         finally:
             poker.terminate()               # one poker per picker, always reaped
+        key, sel = _parse_expect(out)
+        if key in _QUIT_KEYS:
+            return 0
+        picked = _parse_pick(rows, sel)
         if picked is not None:
             _do_focus(conn, picked)         # pick or cancel: either way, back in
 

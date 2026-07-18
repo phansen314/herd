@@ -1,5 +1,7 @@
 """T — jump / focus (kitty/focus.py + cli.py): pid->window resolution, the focus
 path (re-derive, ack, self-heal), and cli display/resolve/completion."""
+import inspect
+
 import pytest
 
 from herd.kitty.focus import window_for_pid, flatten_windows, focus_session
@@ -189,7 +191,7 @@ def test_poke_that_reached_fzf_once_dies_on_the_next_failure(fresh):
 def test_watch_flags_listen_on_the_port_we_chose():
     flags = " ".join(cli._watch_flags(4321))
     assert "--listen=4321" in flags
-    assert "ctrl-q:abort" in flags and "ctrl-r:reload" in flags
+    assert "ctrl-r:reload" in flags     # quit keys are --expect now, not a bind
 
 
 def test_watch_does_not_rely_on_fzfs_start_event():
@@ -222,17 +224,79 @@ def test_watch_and_jump_share_one_fzf_flag_list(monkeypatch, fresh):
     assert seen["cmd"].index("--listen=4321") > seen["cmd"].index("--with-nth")
 
 
+def _watch_driver(monkeypatch, outs):
+    """Drive cmd_watch with canned fzf stdout, one per loop pass. Patches _fzf_run —
+    NOT _fzf_pick: cmd_watch calls _fzf_run, and patching the wrong one lets the real
+    fzf spawn and the loop spin forever (it did, and hung the suite)."""
+    killed, seen = [], []
+    monkeypatch.setattr(cli, "_has_fzf", lambda: True)
+    monkeypatch.setattr(cli, "_spawn_poker",
+                        lambda port: type("P", (), {"terminate": lambda s: killed.append(port)})())
+
+    def fake_run(rows, query, extra=()):
+        seen.append(extra)
+        if not outs:
+            raise AssertionError("cmd_watch looped past its canned input")
+        out = outs.pop(0)
+        if isinstance(out, BaseException):
+            raise out
+        return out
+
+    monkeypatch.setattr(cli, "_fzf_run", fake_run)
+    return killed, seen
+
+
+@pytest.mark.parametrize("key", ["ctrl-q", "ctrl-c"])
+def test_watch_quits_on_either_quit_key(monkeypatch, fresh, key):
+    """The regression that shipped: both keys used to read as Esc (fzf exits 130 with
+    empty stdout for abort), so watch looped and the tab could not be left at all.
+    ctrl-c cannot fall back on a signal — fzf's raw mode disables ISIG."""
+    c, pk = _watch_fixture(fresh)
+    killed, _ = _watch_driver(monkeypatch, [f"{key}\n{pk}\t! #{pk}  api\n"])
+    assert cli.cmd_watch(c, []) == 0        # returns, does not loop
+    assert len(killed) == 1                 # and still reaps its poker
+
+
+def test_watch_focuses_on_enter(monkeypatch, fresh):
+    """Enter under --expect leaves the key line EMPTY, then the row."""
+    c, pk = _watch_fixture(fresh)
+    _watch_driver(monkeypatch, [f"\n{pk}\t! #{pk}  api\n", "ctrl-q\n"])
+    focused = []
+    monkeypatch.setattr(cli, "_do_focus", lambda conn, row: focused.append(row["id"]))
+    assert cli.cmd_watch(c, []) == 0
+    assert focused == [pk]                  # focused, then looped, then quit
+
+
+def test_watch_reenters_the_picker_on_esc(monkeypatch, fresh):
+    """Esc prints nothing at all — that must keep looping, not quit."""
+    c, _ = _watch_fixture(fresh)
+    killed, _ = _watch_driver(monkeypatch, ["", "", "ctrl-q\n"])
+    assert cli.cmd_watch(c, []) == 0
+    assert len(killed) == 3                 # three pickers, three pokers reaped
+
+
 def test_watch_reaps_its_poker_even_when_the_picker_raises(monkeypatch, fresh):
     """One poker per picker. A pick, a cancel, or a crash must not leave one behind."""
     c, _ = _watch_fixture(fresh)
-    killed = []
-    monkeypatch.setattr(cli, "_spawn_poker",
-                        lambda port: type("P", (), {"terminate": lambda s: killed.append(port)})())
-    monkeypatch.setattr(cli, "_has_fzf", lambda: True)
-    monkeypatch.setattr(cli, "_fzf_pick",
-                        lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
+    killed, _ = _watch_driver(monkeypatch, [KeyboardInterrupt()])
     assert cli.cmd_watch(c, []) == 130
     assert len(killed) == 1
+
+
+def test_parse_expect_matches_measured_fzf_output():
+    """Byte-for-byte what fzf 0.44.1 writes, captured by injecting keys via a pty."""
+    assert cli._parse_expect("ctrl-q\n1\tAAA\n") == ("ctrl-q", "1\tAAA\n")
+    assert cli._parse_expect("ctrl-c\n1\tAAA\n") == ("ctrl-c", "1\tAAA\n")
+    assert cli._parse_expect("\n1\tAAA\n") == ("", "1\tAAA\n")      # plain enter
+    assert cli._parse_expect("") == ("", "")                        # esc: no output
+
+
+def test_only_watch_expects_keys(fresh):
+    """jump must NOT carry --expect: _parse_pick would read the key line as a row id."""
+    assert "--expect=ctrl-q,ctrl-c" in cli._watch_flags(4321)
+    assert not any("ctrl-q:abort" in f for f in cli._watch_flags(4321))
+    src = inspect.getsource(cli.cmd_jump)
+    assert "--expect" not in src and "_parse_expect" not in src
 
 
 def test_cli_hides_machinery():

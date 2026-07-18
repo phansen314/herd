@@ -328,7 +328,18 @@ Two things turn a picker into a dashboard:
 
 *The loop.* fzf exits on every pick and every cancel, so `watch` re-enters it.
 Esc therefore re-opens the picker rather than dropping you to a prompt — the tab
-is something you cannot accidentally fall out of. `ctrl-q` is the way out.
+is something you cannot accidentally fall out of. `ctrl-q` and `ctrl-c` are the
+way out.
+
+Both quit keys go through `--expect`, which prints the pressed key as stdout's
+first line, because **every other exit collapses into Esc's outcome**: `abort`
+exits 130 with empty stdout, so a `ctrl-q:abort` bind is indistinguishable from a
+cancel and `watch` just loops. That shipped broken. ctrl-c is worse than it looks
+— fzf puts the terminal in raw mode, which disables ISIG, so ctrl-c never becomes
+a SIGINT; fzf reads the raw `0x03` itself. `cmd_watch` still catches
+`KeyboardInterrupt`, but that only covers the "no live sessions" sleep, where no
+fzf is running and the terminal is in normal mode. `--expect` is the only route
+for ctrl-c here — 0.44.1 has no `print(...)` action.
 
 *The poker.* Only the row list needs refreshing, and fzf cannot refresh it on a
 timer, so `cmd_poke` runs alongside and POSTs `reload` to fzf's `--listen` port.
