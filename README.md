@@ -228,6 +228,14 @@ PYTHONPATH=src python3 -m herd.daemon --once    # a single tick
 HERD_ATTENTION=0 PYTHONPATH=src python3 -m herd.daemon   # core-only
 ```
 
+**Exactly one daemon runs at a time**, enforced by an advisory lock on
+`$HERD_RUNTIME/herd-daemon.lock`. A second one exits 1 and names the holder rather
+than starting — two daemons tick attention against different clocks, so a session
+can arm and disarm on alternating ticks and the mark flickers. If you started one
+by hand and then installed the service, the loser is whichever came second; stop it
+and let the other run. The lock is released by the kernel however the holder dies,
+so a `kill -9` never leaves it stuck.
+
 It runs two layers on one loop, mirroring the tier boundary:
 
 | layer | writes | when |

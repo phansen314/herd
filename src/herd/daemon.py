@@ -15,6 +15,7 @@ injected inputs.
     HERD_ATTENTION=0 python -m herd.daemon   # core-only: reaper, no attention
 """
 import datetime
+import fcntl
 import os
 import pathlib
 import subprocess
@@ -265,6 +266,48 @@ def attention_tick(conn, now):
 
 
 # ── driver ───────────────────────────────────────────────────────────────────
+# ── single instance ──────────────────────────────────────────────────────────
+# Exactly one daemon, no way around it. Two are easy to end up with — the systemd
+# unit plus the manual `python3 -m herd.daemon` the README tells macOS/headless
+# users to run — and the damage is quiet: both tick attention against different
+# `now` values, so a session can arm and disarm on alternating ticks and the mark
+# flickers. Neither process is wrong; they just disagree.
+#
+# flock, not a pidfile: the kernel releases it on death however the process dies,
+# so a -9 or a crash cannot leave a stale lock that blocks every future start.
+# The handle is deliberately kept alive for the process lifetime — closing it,
+# including by letting it be garbage collected, drops the lock.
+_LOCK_FH = None
+
+
+def lock_path():
+    return os.path.join(os.environ.get("HERD_RUNTIME",
+                        os.environ.get("XDG_RUNTIME_DIR", "/tmp")), "herd-daemon.lock")
+
+
+def acquire_single_instance(path=None):
+    """Take the daemon lock. True if we now hold it, False if another daemon does."""
+    global _LOCK_FH
+    path = path or lock_path()
+    try:
+        fh = open(path, "a+")
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    fh.seek(0); fh.truncate(); fh.write(f"{os.getpid()}\n"); fh.flush()
+    _LOCK_FH = fh                        # MUST outlive this function — see above
+    return True
+
+
+def holder_pid(path=None):
+    """The pid recorded by whoever holds the lock, for a useful refusal message."""
+    try:
+        with open(path or lock_path()) as fh:
+            return int(fh.read().strip() or 0) or None
+    except (OSError, ValueError):
+        return None
+
+
 def _drop(conn):
     """Close a connection we no longer trust, and return None so the next tick
     reopens. Never raises — this runs on the failure path."""
@@ -327,8 +370,14 @@ def run(interval=2.0, db_path=None, once=False, attend=None):
 
 def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
+    if not acquire_single_instance():
+        other = holder_pid()
+        _log(f"another herd daemon is already running{f' (pid {other})' if other else ''}"
+             " — refusing to start a second one")
+        return 1
     run(once="--once" in argv)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

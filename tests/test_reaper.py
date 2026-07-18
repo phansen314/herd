@@ -1,12 +1,17 @@
 """R — the liveness reaper (daemon.py): ps-driven death, boot sweep, and the
 pure proc-table / _dead helpers."""
+import os
+import pathlib
 import sqlite3
 import subprocess
+import sys
 
 import herd.daemon as daemon
 from herd.daemon import reap_once, boot_sweep, _parse_proc_table, _dead, read_proc_table
 
 from helpers import T0, T1, T2, mk_session, stopped_at
+
+SRC = pathlib.Path(__file__).resolve().parent.parent / "src"
 
 
 def _live(c, sid, pid, started=T0, le=T0):
@@ -204,3 +209,44 @@ def test_a_tick_failure_still_reaps_once_the_fault_clears(fresh, tmp_path, monke
 
     c = sqlite3.connect(db); c.row_factory = sqlite3.Row
     assert c.execute("SELECT stopped_at FROM sessions WHERE id=?", (dead,)).fetchone()[0]
+
+
+# ── exactly one daemon ──────────────────────────────────────────────────────
+def test_a_second_daemon_cannot_take_the_lock(tmp_path, monkeypatch):
+    """Two daemons are easy to end up with — the systemd unit plus the manual
+    `python3 -m herd.daemon` the README gives macOS/headless users — and they
+    disagree quietly: both tick attention against different `now` values, so a
+    session arms and disarms on alternating ticks and the mark flickers."""
+    monkeypatch.setenv("HERD_RUNTIME", str(tmp_path))
+    monkeypatch.setattr(daemon, "_LOCK_FH", None)
+    assert daemon.acquire_single_instance() is True
+    assert daemon.holder_pid() == os.getpid()
+    assert daemon.acquire_single_instance() is False      # no second holder
+
+
+def test_main_refuses_to_start_a_second_daemon(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERD_RUNTIME", str(tmp_path))
+    monkeypatch.setattr(daemon, "_LOCK_FH", None)
+    daemon.acquire_single_instance()
+    assert daemon.main([]) == 1                            # nonzero, not a silent no-op
+    assert "already running" in capsys.readouterr().err
+
+
+def test_the_lock_dies_with_its_holder(tmp_path):
+    """flock, not a pidfile: the kernel drops it however the process dies, so a -9
+    or a crash can never leave a stale lock that blocks every future start."""
+    lock = tmp_path / "herd-daemon.lock"
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys,time; sys.path.insert(0, %r);"
+         "import herd.daemon as d;"
+         "assert d.acquire_single_instance(%r); print('held', flush=True); time.sleep(60)"
+         % (str(SRC), str(lock))],
+        stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        assert daemon.acquire_single_instance(str(lock)) is False   # taken
+    finally:
+        holder.kill()
+        holder.wait()
+    assert daemon.acquire_single_instance(str(lock)) is True        # released by -9
