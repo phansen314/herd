@@ -183,14 +183,23 @@ export HERD_P_session_id="$SID" HERD_P_model="$MODEL" HERD_P_sname="$SNAME" \
        HERD_P_ver="$VER" HERD_P_gwt="$GWT" \
        HERD_P_exc200="$EXC200" HERD_P_ostyle="$OSTYLE" HERD_P_apims="$API_MS"
 
-CH=$(run W5_statusline "SELECT changes();" 2>/dev/null)
+CH=$(run W5_statusline "SELECT changes();" 2>/dev/null); RC=$?
 
 # ── Path C: statusline adopts a reconciled-but-unadopted row in this window,
 # when W5 matched nothing AND we are in kitty (env inherited from claude).
-if [ "$CH" != "1" ] && [ -n "${KITTY_WINDOW_ID:-}" ] && [ -n "${KITTY_LISTEN_ON:-}" ]; then
+#
+# GATE ON RC, NOT ON $CH ALONE. run prints "0" when the statement succeeded and
+# matched no row, but "" when it FAILED — and a locked DB is the common failure
+# (busy_timeout is 3s, statusline fires ~1/sec per session, the fingerprint moves
+# every tick so the cache can't absorb it). Treating an error as "not adopted"
+# spent the timeout, then an adopt, then a retry: 9s of stall per render, exactly
+# when the DB is already contended. An error means we learned nothing about
+# adoption, so the only correct move is to skip and render from the payload.
+if [ "$RC" -eq 0 ] && [ "$CH" = "0" ] &&
+   [ -n "${KITTY_WINDOW_ID:-}" ] && [ -n "${KITTY_LISTEN_ON:-}" ]; then
     export HERD_P_socket="$KITTY_LISTEN_ON" HERD_P_win="$KITTY_WINDOW_ID"
     run W5b_adopt >/dev/null 2>&1
-    CH=$(run W5_statusline "SELECT changes();" 2>/dev/null)
+    CH=$(run W5_statusline "SELECT changes();" 2>/dev/null) || CH=""
 fi
 
 # ── render input (burn rate) — one read on the miss path. R_statusline feeds

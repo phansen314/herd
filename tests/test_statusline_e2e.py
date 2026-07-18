@@ -1,5 +1,7 @@
 """O (59-63) — statusline.sh end to end: the sink + render + fingerprint cache +
 Path C adoption, driven through the real bash script."""
+import os
+import pathlib
 import subprocess
 
 from helpers import T0, T1, SOCK, mk_session, mk_herd
@@ -158,3 +160,38 @@ def test_never_moves_last_event_at(hook_env):
     mk_session(c, session_id="s1", cwd="/code/herd", last_event_at=T0, last_event_type="tool")
     _statusline(hook_env, SL_PAY)
     assert c.execute("SELECT last_event_at FROM sessions WHERE session_id='s1'").fetchone()[0] == T0
+
+
+# ── DB failure must not be read as "row not adopted" ────────────────────────
+def _errlog(hook_env):
+    p = pathlib.Path(hook_env.runtime) / "err.log"
+    return p.read_text().splitlines() if p.exists() else []
+
+
+def test_a_failing_db_is_not_retried_as_an_adoption_miss(hook_env):
+    """run prints "0" when W5 matched no row but "" when it FAILED. Treating the
+    failure as a miss ran an adopt + a retry, and with the 3s busy_timeout that was
+    ~9s of stall per render — on a hook that fires ~1/sec per session, precisely
+    when the DB is already contended.
+
+    Asserted as the DB-error COUNT rather than wall-clock: a corrupt DB fails
+    instantly through the same branch a locked one reaches slowly, so this stays
+    deterministic and costs no runtime. One attempt, not three."""
+    pathlib.Path(hook_env.path).write_bytes(os.urandom(4096))     # not a database
+    r = _statusline(hook_env, SL_PAY, env={"KITTY_WINDOW_ID": "3",
+                                           "KITTY_LISTEN_ON": "unix:/tmp/kitty-1"})
+    assert r.returncode == 0 and r.stdout.strip()          # still renders, still exits 0
+    assert len(_errlog(hook_env)) == 1                     # W5 only — no adopt, no retry
+
+
+def test_a_genuine_adoption_miss_still_adopts(hook_env):
+    """The other side of the gate: a HEALTHY db reporting 0 changes must still take
+    path C, or a reconciled-but-unadopted row never gets claimed."""
+    c = hook_env.conn()
+    pk = mk_session(c, cwd="/x")                            # no session_id yet
+    mk_herd(c, pk, job_name="api", kitty_socket=SOCK, window_id=3)
+    _statusline(hook_env, SL_PAY, env={"KITTY_WINDOW_ID": "3", "KITTY_LISTEN_ON": SOCK})
+    row = c.execute("SELECT session_id, context_percent FROM sessions WHERE id=?", (pk,)).fetchone()
+    assert row["session_id"] == SL_PAY["session_id"]        # adopted
+    assert row["context_percent"] is not None              # and the retry wrote metrics
+    assert _errlog(hook_env) == []

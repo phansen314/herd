@@ -76,6 +76,36 @@ has passed *since the ack*. Ack is a snooze, not a dismissal.
 **Protects:** the third branch in `attention_tick`, and the fact that acked rows are
 not deleted. Deleting them is the flap.
 
+## 2026-07-18 — A failed write must not read as an adoption miss {#w5-rc}
+
+`statusline.sh` gated Path C on `[ "$CH" != "1" ]`, where `CH` is the output of
+`run W5_statusline "SELECT changes();"`. That output is `0` when the statement
+**succeeded and matched no row**, but empty when it **failed** — and `!= "1"` reads
+both as "not adopted". So a locked DB spent the 3s `busy_timeout`, then ran an
+adopt, then retried W5, for three serial timeouts:
+
+```
+before:  9.046s, 3× "database is locked (5)" in the errlog
+after:   3.023s, 1×
+```
+
+Measured with a competing `BEGIN IMMEDIATE` held across the render. This is the
+hot path — the statusline fires ~1/sec per session, and the fingerprint cache
+cannot absorb it because cost and context move every tick — so the amplification
+landed hardest exactly when the DB was already contended.
+
+**Decided:** capture `run`'s exit status separately and require `rc == 0 && CH == 0`
+before attempting adoption. A failure means we learned *nothing* about whether the
+row is adopted; the only correct response is to skip the DB work and render from
+the payload, which the hook can always do.
+
+**Protects:** the `RC` capture in `statusline.sh`. Collapsing it back to a test on
+`$CH` alone restores the 3× stall. `test_a_failing_db_is_not_retried_as_an_adoption_miss`
+asserts the DB-error *count*, not wall-clock, so it stays deterministic and free —
+a corrupt DB reaches the same branch instantly that a locked one reaches slowly.
+`test_a_genuine_adoption_miss_still_adopts` holds the other side: a healthy DB
+reporting 0 changes must still adopt.
+
 ## 2026-07-18 — A failed `ps` must not read as an empty machine {#ps-floor}
 
 `read_proc_table` ignored `ps`'s exit status. `_dead()` treats absence from the
