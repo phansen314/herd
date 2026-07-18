@@ -322,17 +322,15 @@ DELETE FROM herd_attention
 WHERE session_pk = (SELECT id FROM sessions WHERE session_id = :session_id);
 
 
--- ── R_statusline. RENDER INPUTS (core/statusline.sh) ──────────────────────
--- The herd status line shows the job name (tier 2) and a burn rate (from the
--- prev_cost pair W5 maintains) — neither is in the payload. One read per
--- fingerprint MISS feeds the render; unchanged ticks print the cached line and
--- never run this. LEFT JOIN so an unadopted/untracked session still returns a
--- row (empty job). `|`-joined for a single-field bash read.
+-- ── R_statusline. RENDER INPUT (core/statusline.sh) ───────────────────────
+-- Feeds ONLY the burn rate (the prev_cost pair W5 maintains) — pure TIER-1, no
+-- herd_sessions. The ⬢ name on the line is Claude's session_name, taken straight
+-- from the payload, so the render reads no tier-2 data. One read per fingerprint
+-- MISS; unchanged ticks print the cached line and never run this. `|`-joined for a
+-- single-field bash read.
 -- :name R_statusline
-SELECT COALESCE(h.job_name,'') || '|' || COALESCE(s.prev_cost_usd,'')
-       || '|' || COALESCE(s.prev_cost_sampled_at,'')
-FROM sessions s LEFT JOIN herd_sessions h ON h.session_pk = s.id
-WHERE s.session_id = :session_id;
+SELECT COALESCE(s.prev_cost_usd,'') || '|' || COALESCE(s.prev_cost_sampled_at,'')
+FROM sessions s WHERE s.session_id = :session_id;
 
 
 -- ── R_job_live. RECYCLABLE-HANDLE CHECK (herd/kitty spawn) ─────────────────

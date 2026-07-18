@@ -5,10 +5,12 @@
 # emoji line (this replaces klawde's slot in a chained statusline wrapper).
 #
 # The render is deliberately klawde's look:
-#   L1: ⬢ job | 🧠 ctx | 📁 cwd | 🌿 branch | 🤖 model | 💰 cost | 🔥 burn | ⌛ api
+#   L1: ⬢ name | 🧠 ctx | 📁 cwd | 🌿 branch | 🤖 model | 💰 cost | 🔥 burn | ⌛ api
 #   L2: ⏱️ 5h N% resets T | 7d N% resets M/D T
-# Segments hide when their data is missing; L2 collapses when empty. `⬢ job` and
-# `🔥 burn` are herd's own additions (klawde has no jobs and no burn rate).
+# Segments hide when their data is missing; L2 collapses when empty. `⬢ name` shows
+# CLAUDE's own session name (session_name, /rename) — a TIER-1 fact straight from the
+# payload, deliberately NOT herd's tier-2 job_name, so the render stays tier-1 pure.
+# `🔥 burn` is herd's own addition (klawde has no burn rate).
 #
 # NOTE some fields are parsed for the RENDER only and deliberately not stored:
 # the sink is scoped to essentials + rate limits (api_duration_ms is rendered,
@@ -76,11 +78,12 @@ git_branch_of() {
 # Sets L1S / L2S (the joined lines). Bash 3.2-safe: indexed arrays + printf -v.
 L1S=""; L2S=""
 render() {
-    local job="$1" burn="$2"
+    local name="$1" burn="$2"
     local L1=() L2=() seg t n rest family ver mins hrs rmin apifmt
 
-    # ⬢ job — herd's own handle (absent for sessions herd didn't spawn).
-    [ -n "$job" ] && L1+=("⬢ $job")
+    # ⬢ name — Claude's session name (session_name, /rename). TIER-1, from the
+    # payload; absent when the session is unnamed. NOT herd's job_name.
+    [ -n "$name" ] && L1+=("⬢ $name")
 
     # 🧠 context — always renders, defaults to 0 (klawde's behaviour).
     n=0
@@ -179,7 +182,7 @@ fi
 
 # A statusline for a session we cannot key on: render payload-only, no DB.
 if [ -z "$CACHE" ]; then
-    render "" ""; emit "$L1S" "$L2S"
+    render "$SNAME" ""; emit "$L1S" "$L2S"
     exit 0
 fi
 
@@ -200,11 +203,13 @@ if [ "$CH" != "1" ] && [ -n "${KITTY_WINDOW_ID:-}" ] && [ -n "${KITTY_LISTEN_ON:
     CH=$(run W5_statusline "SELECT changes();" 2>/dev/null)
 fi
 
-# ── render inputs (job name + burn) — one read on the miss path ───────────
-JOB=""; BURN=""
+# ── render input (burn rate) — one read on the miss path ──────────────────
+# The ⬢ name comes from the payload (SNAME), not the DB. R_statusline feeds only
+# the burn rate now (prev_cost pair) — pure tier-1, no herd_sessions.
+BURN=""
 if [ "$CH" = "1" ]; then
-    RB=$(run R_statusline 2>/dev/null)          # job|prev_cost|prev_sampled
-    IFS='|' read -r JOB PREV_COST PREV_AT <<< "$RB"
+    RB=$(run R_statusline 2>/dev/null)          # prev_cost|prev_sampled
+    IFS='|' read -r PREV_COST PREV_AT <<< "$RB"
     # burn = (cost - prev_cost) / hours since prev sample. awk: one fork, miss-only.
     if [ -n "$COST" ] && [ -n "$PREV_COST" ] && [ -n "$PREV_AT" ]; then
         # mktime() returns -1 on an unparseable stamp; without the a<=0/b<=0 guard
@@ -223,7 +228,7 @@ if [ "$CH" = "1" ]; then
     fi
 fi
 
-render "$JOB" "$BURN"
+render "$SNAME" "$BURN"
 
 # ── cache atomically (tmp + rename — a torn write must not feed a false hit) ─
 { printf '%s\n%s\n%s\n' "$FP" "$L1S" "$L2S"; } > "$CACHE.tmp.$$" 2>/dev/null &&

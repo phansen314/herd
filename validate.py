@@ -909,11 +909,13 @@ with guard("59 statusline sinks metrics + renders the herd line"):
     c = sqlite3.connect(DBPATH); c.row_factory = sqlite3.Row
     row = c.execute("SELECT context_percent,total_cost_usd,rate_limit_5h_percent,rate_limit_5h_resets_at,model"
                     " FROM sessions WHERE session_id='s1'").fetchone()
-    check("59 statusline sinks metrics + renders the herd line",
+    # the ⬢ segment shows Claude's session_name (payload "sess"), NOT the tier-2
+    # job_name — the fixture HAS a job ('api-refactor') and it must NOT appear.
+    check("59 statusline sinks metrics + renders the Claude name (not the herd job)",
           row["context_percent"]==42 and isinstance(row["context_percent"],int)
           and row["total_cost_usd"]==1.5
           and row["rate_limit_5h_percent"]==73.5 and row["rate_limit_5h_resets_at"]=="2026-07-16T03:32:54Z"
-          and "api-refactor" in r.stdout,
+          and "⬢ sess" in r.stdout and "api-refactor" not in r.stdout,
           f"row={dict(row)} render={r.stdout.strip()!r}")
     c.close()
 
