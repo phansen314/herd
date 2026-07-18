@@ -79,8 +79,8 @@ def test_resolve_refuses_empty_query(fresh):
     assert cli.resolve(c, "") == [] and cli.resolve(c, "   ") == []
 
 
-_NAMED = {"id": 3, "session_id": "abc12345", "session_name": "my-refactor",
-          "status": "waiting", "job_name": "api", "total_cost_usd": 1.5, "cwd": "/x/api", "attn": 1}
+_NAMED = {"id": 3, "session_id": "abc12345", "session_name": "my-refactor", "status": "waiting",
+          "job_name": "api", "total_cost_usd": 1.5, "cwd": "/x/api", "attention_at": T0}
 
 
 def test_row_line_shows_name_keeps_hidden_id():
@@ -119,10 +119,153 @@ def test_complete_tokens_dedup_sorted():
     assert toks == ["aaa11111", "api", "bbb22222", "refactor-api", "web"]
 
 
+def _watch_fixture(fresh):
+    c = fresh()
+    pk = mk_session(c, session_id="w1", cwd="/x/api", status="working")
+    mk_herd(c, pk, job_name="api", kitty_socket=SOCK, window_id=1)
+    return c, pk
+
+
+def test_rows_round_trip_through_parse_pick(fresh):
+    """What `herd rows` emits must survive the trip fzf makes it take."""
+    c, pk = _watch_fixture(fresh)
+    rows = cli._live(c)
+    text = cli._rows_text(c)
+    assert cli._parse_pick(rows, text.splitlines()[0])["id"] == pk
+
+
+def test_poke_never_reloads_while_rows_unchanged(fresh):
+    """An unchanged list must not redraw the pane — only liveness GETs (data=None)."""
+    c, _ = _watch_fixture(fresh)
+    sent = []
+    why = cli._poke_loop(c, "1234", lambda u, d: sent.append(d), lambda s: None, rounds=3)
+    assert why == "done"
+    assert sent == [None, None, None]               # pinged 3x, reloaded 0x
+
+
+def test_poke_reloads_once_per_change(fresh):
+    c, pk = _watch_fixture(fresh)
+    sent = []
+
+    def sleep(_):
+        if not sent:                      # mutate between the 1st and 2nd poll
+            c.execute("UPDATE sessions SET status='waiting' WHERE id=?", (pk,))
+
+    why = cli._poke_loop(c, "1234", lambda u, d: sent.append(d), sleep, rounds=3)
+    reloads = [d for d in sent if d is not None]
+    assert why == "done" and len(reloads) == 1      # changed once -> reloaded once
+    assert reloads[0].startswith(b"reload(") and b"rows" in reloads[0]
+
+
+def test_poke_survives_fzf_still_binding_then_reaps_on_a_quiet_herd(fresh):
+    """Measured: watch spawns the poker before fzf binds, so early failures are
+    startup, not death — exiting on them killed auto-refresh outright. Past the
+    grace it must still reap itself, even with nothing changing."""
+    c, _ = _watch_fixture(fresh)            # note: no mutation — a quiet dashboard
+    tries = []
+
+    def boom(u, d):
+        tries.append(u)
+        raise OSError("connection refused")
+
+    assert cli._poke_loop(c, "1234", boom, lambda s: None, rounds=99) == "gone"
+    assert len(tries) == cli._POKE_GRACE     # kept trying through the grace window
+
+
+def test_poke_that_reached_fzf_once_dies_on_the_next_failure(fresh):
+    """After first contact, a failure is a closed port — reap immediately."""
+    c, _ = _watch_fixture(fresh)
+    n = []
+
+    def flaky(u, d):
+        n.append(u)
+        if len(n) > 1:                       # first call succeeds, then the port closes
+            raise OSError("connection refused")
+
+    assert cli._poke_loop(c, "1234", flaky, lambda s: None, rounds=99) == "gone"
+    assert len(n) == 2                       # no grace once it has seen fzf alive
+
+
+def test_watch_flags_listen_on_the_port_we_chose():
+    flags = " ".join(cli._watch_flags(4321))
+    assert "--listen=4321" in flags
+    assert "ctrl-q:abort" in flags and "ctrl-r:reload" in flags
+
+
+def test_watch_does_not_rely_on_fzfs_start_event():
+    """--listen=0 + `start:execute-silent` was measured to spawn the poker on one
+    picker and not the next ($FZF_PORT unset when start fires). watch owns the port."""
+    flags = " ".join(cli._watch_flags(cli._free_port()))
+    assert "start:" not in flags and "--listen=0" not in flags
+
+
+def test_free_port_is_usable_and_distinct():
+    import socket
+    a, b = cli._free_port(), cli._free_port()
+    assert a != b
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", a))            # actually bindable, i.e. really free
+
+
+def test_watch_and_jump_share_one_fzf_flag_list(monkeypatch, fresh):
+    """watch must reuse _fzf_pick, or --delimiter/--with-nth drift breaks _parse_pick."""
+    c, _ = _watch_fixture(fresh)
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return type("P", (), {"stdout": ""})()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    cli._fzf_pick(cli._live(c), "", cli._watch_flags(4321))
+    assert "--delimiter" in seen["cmd"] and "--with-nth" in seen["cmd"]
+    assert seen["cmd"].index("--listen=4321") > seen["cmd"].index("--with-nth")
+
+
+def test_watch_reaps_its_poker_even_when_the_picker_raises(monkeypatch, fresh):
+    """One poker per picker. A pick, a cancel, or a crash must not leave one behind."""
+    c, _ = _watch_fixture(fresh)
+    killed = []
+    monkeypatch.setattr(cli, "_spawn_poker",
+                        lambda port: type("P", (), {"terminate": lambda s: killed.append(port)})())
+    monkeypatch.setattr(cli, "_has_fzf", lambda: True)
+    monkeypatch.setattr(cli, "_fzf_pick",
+                        lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
+    assert cli.cmd_watch(c, []) == 130
+    assert len(killed) == 1
+
+
 def test_cli_hides_machinery():
     from herd import install as inst
     completion = inst.COMPLETION_SRC.read_text()
-    assert cli.USER_COMMANDS == ("ls", "jump")
-    assert {"preview", "complete"} <= set(cli.COMMANDS)
-    assert "preview" not in cli.USER_COMMANDS
-    assert 'compgen -W "ls jump"' in completion and "preview" not in completion
+    assert cli.USER_COMMANDS == ("ls", "jump", "watch")
+    assert {"preview", "complete", "rows", "poke"} <= set(cli.COMMANDS)
+    for m in ("preview", "complete", "rows", "poke"):
+        assert m not in cli.USER_COMMANDS
+    assert 'compgen -W "ls jump watch"' in completion
+    assert "preview" not in completion and "poke" not in completion
+
+
+def test_cli_reads_live_sessions_only_through_r1_list():
+    """cli must not re-transcribe the live read — that is what let write paths rot.
+    _live() IS R1_list; ls, the picker and the preview pane all go through it."""
+    import inspect
+    src = inspect.getsource(cli)
+    assert 'load_statements()' in src and '_STMT["R1_list"]' in src
+    assert "FROM sessions" not in src, "cli transcribed SQL instead of using writes.sql"
+
+
+def test_preview_serves_every_field_it_renders(fresh):
+    """R1_list must carry the preview's columns (status_source was missing once)."""
+    c, pk = _watch_fixture(fresh)
+    row = next(r for r in cli._live(c) if r["id"] == pk)
+    for col in ("status_source", "model", "git_branch", "context_percent",
+                "started_at", "last_event_at", "last_event_type", "paged_level"):
+        assert col in row.keys(), f"R1_list lacks {col}"
+    assert "#" in cli._preview_text(row)
+
+
+def test_watch_machinery_is_readonly_except_watch():
+    """watch focuses windows (a write, via W6c_ack); its helpers only read."""
+    assert {"rows", "poke"} <= cli._READONLY
+    assert "watch" not in cli._READONLY

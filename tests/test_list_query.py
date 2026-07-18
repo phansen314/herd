@@ -1,5 +1,5 @@
-"""L — R1_list: the TUI main read uses the live index, hits tier-2 PKs directly,
-and orders attention-first."""
+"""L — R1_list: the dashboard's main read (cli._live, so `ls` / the picker / the
+preview pane) uses the live index, hits tier-2 PKs directly, orders attention-first."""
 from helpers import W, T0, T1, T2, mk_session, mk_herd, mk_attention
 
 

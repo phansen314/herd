@@ -231,7 +231,7 @@ WHERE h.job_name = :job AND s.stopped_at IS NULL;
 
 -- ── R1. The TUI's main read: all four tables, attention-first ordering.
 -- :name R1_list
-SELECT s.id, s.session_id, s.pid, s.cwd, s.status, s.model, s.session_name,
+SELECT s.id, s.session_id, s.pid, s.cwd, s.status, s.status_source, s.model, s.session_name,
        s.context_percent, s.total_cost_usd, s.git_branch,
        s.last_event_at, s.last_event_type, s.started_at, s.updated_at,
        h.job_name, h.kitty_socket, h.window_id,

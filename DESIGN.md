@@ -301,11 +301,54 @@ values are unanchored regex — anchor them or `job` matches `job-2`.
 IO (`_ls`/`_focus`, `list_fn`/`focus_fn`) is injected so logic is testable
 without a live kitty — the same discipline as `daemon.py` and `common.sh`.
 
-`cli` surface: `ls` and `jump` are the user verbs; `preview` (fzf's per-highlight
-pane) and `complete` (tab-completion feed) are machinery — callable, hidden from
+There is exactly one live-session read: `R1_list`, loaded from `writes.sql` like
+every other shipping statement. `cli._live()` *is* that statement, and `ls`, the
+picker, `rows` and the preview pane all go through it — `preview` filters it by
+id in Python rather than issuing a second query. It was briefly two hand-written
+transcriptions instead, which is precisely the rot `load_statements()` exists to
+prevent: `R1_list` sat unused while the CLI's private copy missed the
+`idx_sessions_live` plan the query test had been guarding all along.
+
+`cli` surface: `ls`, `jump` and `watch` are the user verbs; `preview` (fzf's
+per-highlight pane), `complete` (tab-completion feed), `rows` (fzf's reload
+source) and `poke` (watch's refresh child) are machinery — callable, hidden from
 help/completion. `jump` focuses immediately on a unique match (scriptable), else
 opens an fzf picker with a live preview; without fzf/tty it prints the list. A
 jump *is* an ack (`W6c_ack`).
+
+### `watch` — fzf *is* the TUI {#watch}
+
+`herd watch` is the dashboard: one kitty tab running the jump picker forever.
+There is deliberately **no curses layer**. fzf already renders the list,
+navigates it, and — because it spawns `preview` as a fresh process per highlight
+— shows per-session detail that reads live from SQLite for free. A TUI would only
+be a second rendering path to keep in sync with `ls`.
+
+Two things turn a picker into a dashboard:
+
+*The loop.* fzf exits on every pick and every cancel, so `watch` re-enters it.
+Esc therefore re-opens the picker rather than dropping you to a prompt — the tab
+is something you cannot accidentally fall out of. `ctrl-q` is the way out.
+
+*The poker.* Only the row list needs refreshing, and fzf cannot refresh it on a
+timer, so `cmd_poke` runs alongside and POSTs `reload` to fzf's `--listen` port.
+It is stdlib `urllib`, not `curl` — herd ships no runtime deps, and the poker is
+long-lived so there is no cold start to pay.
+
+Three things about the poker were measured, not assumed:
+
+- **`--listen=0` is not usable here.** fzf's `start` event does not reliably see
+  `$FZF_PORT`, so a `start:execute-silent(… poke &)` bind spawned the poker on one
+  picker and not the next — auto-refresh worked intermittently. `watch` picks the
+  port itself (`_free_port`), which also makes it the poker's parent, so it can
+  reap it in a `finally` instead of orphaning one per jump.
+- **Reload only on change.** An unconditional 2s reload redraws the pane for
+  nothing; the poker diffs the row text first.
+- **But contact fzf every tick anyway** (`data=None` → a liveness GET). A poker
+  that only spoke on change could not notice its fzf had exited while the herd was
+  quiet. The first failures are tolerated (`_POKE_GRACE`): `watch` spawns the poker
+  before fzf has bound the port, and treating that startup window as death killed
+  auto-refresh outright.
 
 ---
 
@@ -365,5 +408,4 @@ and an uncommitted setup would be invisible to them.
 
 - `herd new` spawn verb (SQL: `W1_spawn_*`, `R_job_live` — written, unwired).
 - The notifier/pager actuator (`W6b_paged`, `paged_level` escalation).
-- The TUI (`R1_list` is its read).
 - A `pid_start_time` column to close the reboot pid-reuse caveat properly.

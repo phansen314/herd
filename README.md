@@ -112,11 +112,31 @@ PYTHONPATH=src python3 -m herd.install --uninstall
 herd ls                 # live sessions, attention-first, by name
 herd jump               # fuzzy-pick a session (fzf) with a live preview, and focus it
 herd jump <query>       # herd id, name (/rename), job, uuid, or cwd; unique match jumps
+herd watch              # the picker as a permanent dashboard, for a dedicated tab
 ```
 
 Sessions show by their recognizable name — Claude's `/rename` name, else herd's job,
 else the uuid. `jump` opens an fzf picker (with a detail preview) unless the query is
 a unique match, in which case it focuses immediately.
+
+**`herd watch`** is the dashboard: the same picker, looping, refreshing itself as
+sessions change. Give it a dedicated kitty tab and a key to reach it:
+
+```conf
+# ~/.config/kitty/kitty.conf — focus the herd tab, launching it once if needed
+map ctrl+space>c launch --type=background ~/.config/kitty/focus-herd.sh
+```
+
+```sh
+#!/bin/sh
+# ~/.config/kitty/focus-herd.sh
+kitten @ focus-tab --match title:herd 2>/dev/null && exit 0
+kitten @ launch --type=tab --tab-title herd herd watch
+```
+
+Enter jumps to a session, `ctrl-r` forces a refresh, `ctrl-q` quits. Esc re-opens the
+picker rather than exiting — it's a tab you can't accidentally fall out of, so after
+jumping away, the same key brings you back to a live list.
 
 **Or read the DB directly** — everything the CLI shows, and more:
 
@@ -217,10 +237,11 @@ DESIGN.md        the design rationale
 
 ## Roadmap
 
-Navigation is the CLI (`herd jump` fuzzy-picks and focuses), and ambient attention
-is Claude's terminal bell + kitty's tab flag (see [Notifications](#notifications-kitty-tab-bell))
-— so a dedicated TUI and a herd-owned notifier are **not planned**; each is handled
-more cheaply outside herd. What's left:
+Navigation is the CLI (`herd jump` fuzzy-picks and focuses, `herd watch` keeps that
+picker up as a dashboard), and ambient attention is Claude's terminal bell + kitty's
+tab flag (see [Notifications](#notifications-kitty-tab-bell)) — so a dedicated TUI and
+a herd-owned notifier are **not planned**; each is handled more cheaply outside herd.
+fzf *is* the TUI: it already lists, navigates, and previews live. What's left:
 
 - **`herd new <job>`** — launch a named kitty tab/pane running Claude, tracked from
   the start (the one spot that still needs kitty on a write path: `kitten @ launch`).
