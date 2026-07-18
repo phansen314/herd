@@ -157,25 +157,35 @@ def _epoch(iso):
     return None
 
 
+def _silent_for(status, since, now):
+    """Seconds of silence past the status threshold, or None when the status isn't
+    page-worthy / a stamp won't parse. Shared by the arm rule and the re-notify
+    rule so both measure the same way against the same knobs."""
+    secs = ATTENTION_SECS.get(status)
+    if secs is None:
+        return None
+    a, b = _epoch(since), _epoch(now)
+    if a is None or b is None:
+        return None
+    return (b - a) - secs
+
+
 def needs_attention(status, last_event_at, now):
     """True when a session has been in a page-worthy status longer than its
     threshold. Unlisted statuses / unparseable stamps -> False."""
-    secs = ATTENTION_SECS.get(status)
-    if secs is None:
-        return False
-    a, b = _epoch(last_event_at), _epoch(now)
-    if a is None or b is None:
-        return False
-    return (b - a) >= secs
+    over = _silent_for(status, last_event_at, now)
+    return over is not None and over >= 0
 
 
 def attention_tick(conn, now):
     """Keep herd_attention in sync with the derived silence rule: arm what newly
-    needs attention (W6a, edge-preserving), disarm what no longer does (W6d).
+    needs attention (W6a, edge-preserving), disarm what no longer does (W6d), and
+    let an acked row's timer run out so a session you looked at but never answered
+    speaks up again (W6d, then a fresh W6a next tick).
     Returns (armed, disarmed). See DESIGN.md#attention."""
     armed = disarmed = 0
     rows = conn.execute(
-        "SELECT s.id, s.status, s.last_event_at, "
+        "SELECT s.id, s.status, s.last_event_at, a.ack_at, "
         "       (a.session_pk IS NOT NULL) AS is_armed "
         "FROM sessions s LEFT JOIN herd_attention a ON a.session_pk = s.id "
         "WHERE s.stopped_at IS NULL"
@@ -188,6 +198,21 @@ def attention_tick(conn, now):
         elif not na and r["is_armed"]:
             conn.execute(W["W6d_rearm"], {"pk": r["id"]})
             disarmed += 1
+        elif na and r["is_armed"] and r["ack_at"]:
+            # RE-NOTIFY. A jump acks the silence and the CLI stops rendering '!',
+            # but the session is still silent and still unanswered. ack_at restarts
+            # the same per-status timer: once THAT much silence has passed since the
+            # ack, drop the row. The next tick's W6a re-arms with a fresh
+            # attention_at and ack_at NULL, and the '!' comes back.
+            #
+            # Dropping the row is also why the ack can't simply be "disarm on jump":
+            # W6d is a whole-row DELETE, so it takes ack_at with it. Deleting on the
+            # ack itself would leave the next tick measuring from last_event_at,
+            # which is still old — it would re-arm immediately and flap every tick.
+            over = _silent_for(r["status"], r["ack_at"], now)
+            if over is not None and over >= 0:
+                conn.execute(W["W6d_rearm"], {"pk": r["id"]})
+                disarmed += 1
     return armed, disarmed
 
 

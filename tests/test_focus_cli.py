@@ -82,7 +82,8 @@ def test_resolve_refuses_empty_query(fresh):
 
 
 _NAMED = {"id": 3, "session_id": "abc12345", "session_name": "my-refactor", "status": "waiting",
-          "job_name": "api", "total_cost_usd": 1.5, "cwd": "/x/api", "attention_at": T0}
+          "job_name": "api", "total_cost_usd": 1.5, "cwd": "/x/api", "attention_at": T0,
+          "ack_at": None}
 
 
 def test_row_line_shows_name_keeps_hidden_id():

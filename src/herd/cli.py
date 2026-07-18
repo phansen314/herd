@@ -50,12 +50,19 @@ def _short_cwd(cwd):
     return "~" + cwd[len(_HOME):] if cwd.startswith(_HOME) else cwd
 
 
+def _unacked(r):
+    """Show '!' only for attention nobody has looked at yet. A jump acks the row
+    (W6c) without deleting it, so an acked row stays armed and stays quiet; the
+    daemon re-arms it from ack_at once that silence runs long again."""
+    return bool(r["attention_at"]) and not r["ack_at"]
+
+
 def _line(r):
     """The display half of a session row (no id prefix)."""
     name = _name(r)
     name = name[:25] + "…" if len(name) > 26 else name
     cost = f"${r['total_cost_usd']:.2f}" if r["total_cost_usd"] is not None else "—"
-    return (f"{'!' if r['attention_at'] else ' '} #{r['id']:<3} {name:26} {r['status']:14} "
+    return (f"{'!' if _unacked(r) else ' '} #{r['id']:<3} {name:26} {r['status']:14} "
             f"{cost:>8}  {_short_cwd(r['cwd'])}")
 
 
@@ -155,7 +162,7 @@ def _preview_text(row):
         f"started   {g('started_at')}",
         f"last      {g('last_event_at')}  ({g('last_event_type')})",
     ]
-    if d.get("attention_at"):
+    if d.get("attention_at") and not d.get("ack_at"):      # acked -> armed but quiet
         lines.append(f"⚠ needs attention since {d['attention_at']}  (rung {d.get('paged_level') or 0})")
     return "\n".join(lines)
 

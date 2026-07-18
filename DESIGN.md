@@ -457,6 +457,36 @@ Statuses not listed (`stopped`, `unknown`) are never page-worthy.
   because it's the only thing written on every tick, and isolating that write
   keeps contention off the read-mostly rows.
 
+### Ack is a timer restart, not a delete {#ack}
+
+A jump acks the row. The CLI hides `!` while `ack_at` is set, but the row **stays
+armed** — and that is deliberate, because `ack_at` is the only stamp that can
+restart the silence timer.
+
+Jumping cannot simply advance `last_event_at`: that is Claude's activity clock, and
+a jump is not Claude activity (see [Two clocks](#two-clocks)). Nor can the jump just
+delete the row: `W6d` is a whole-row `DELETE`, so it discards `ack_at`, and the next
+tick measures from the unchanged `last_event_at` — already past threshold — and
+re-arms immediately. That flaps every tick, forever.
+
+So the tick has three branches, all reusing `W6a`/`W6d`:
+
+| State | Action |
+|---|---|
+| silent past threshold, not armed | `W6a_arm` |
+| no longer silent, armed | `W6d_rearm` — real activity wins |
+| silent, armed, **acked**, and that much silence has passed *since the ack* | `W6d_rearm`; the next tick's `W6a` re-arms fresh with `ack_at` NULL |
+
+The third branch is the re-notification: look at a session, answer nothing, and it
+speaks up again one threshold later. Same per-status knobs, no new statement, no new
+column.
+
+One known gap: reaching a session **without** `herd jump` — clicking the tab, kitty
+keyboard nav — writes no ack, so `!` persists until real activity. Closing it would
+mean the daemon polling `kitten @ ls` for the focused window, which breaks
+[liveness comes from ps, never kitty](#liveness). Left open on purpose; revisit with
+the notifier.
+
 Actually *notifying* you (notify-send / TUI badge / escalation via `paged_level`)
 is a separate actuator, deliberately deferred — this layer maintains the signal.
 

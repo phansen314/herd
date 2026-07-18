@@ -56,8 +56,14 @@ CREATE TABLE IF NOT EXISTS herd_attention (
     attention_at TEXT,    -- the EDGE: when the silence rule first tripped (not last_event_at's age).
     paged_at     TEXT,    -- when we last actually notified you
     paged_level  INTEGER NOT NULL DEFAULT 0,   -- escalation rung
-    ack_at       TEXT     -- implicit (focus) or explicit (dismiss). Ack means "seen THIS silence";
-                          -- the next semantic event clears the row (W6d) so the rule may trip fresh.
+    ack_at       TEXT     -- implicit (focus) or explicit (dismiss). Ack means "seen THIS silence":
+                          -- the CLI stops rendering '!' while it is set, and the row STAYS armed.
+                          -- It is also the timer restart: the daemon re-notifies once the status
+                          -- threshold of silence has passed since the ack (W6d, then a fresh W6a).
+                          -- A jump can't just delete the row instead — W6d is a whole-row DELETE,
+                          -- so it takes ack_at with it and the next tick re-arms off the still-old
+                          -- last_event_at, flapping every tick. Real activity clears the row too,
+                          -- via a hook (W6d_rearm_sid) or the daemon's disarm branch.
 );
 
 CREATE INDEX IF NOT EXISTS idx_herd_attention_active

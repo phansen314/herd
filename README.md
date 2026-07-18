@@ -220,7 +220,14 @@ It runs two layers on one loop, mirroring the tier boundary:
 | **herd** (tier 2) | `herd_attention` — the silence rule | gated by `HERD_ATTENTION` |
 
 Run herd purely for **core data collection** with `HERD_ATTENTION=0` and build your
-own tooling on the `sessions` table; herd never touches `herd_attention`.
+own tooling on the `sessions` table; the *daemon* then never touches
+`herd_attention`. (`herd jump` still acks — that write comes from the CLI and is
+outside the gate.)
+
+**`herd jump` acks the `!`.** Jumping to a session clears its `!` without touching
+Claude's activity clock. If you look and then answer nothing, the same timer runs
+again from the moment you jumped and it speaks up once more — so an ack is a snooze,
+not a dismissal. See [DESIGN.md#ack](DESIGN.md#ack).
 
 **Tuning the attention rule** (env vars, defaults shown):
 
