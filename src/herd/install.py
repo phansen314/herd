@@ -69,6 +69,56 @@ def backup(path, ts):
     return None
 
 
+ORIGINAL_SUFFIX = ".herd-bak.original"
+
+
+def _is_wired(path, text):
+    """Does this file already point at herd? Cheap and textual on purpose — it only
+    has to distinguish 'pristine' from 'a previous herd install'."""
+    return str(HOOKS_DIR) in text if text else False
+
+
+def backup_original(path, text):
+    """Snapshot the PRE-HERD file, exactly once, under a fixed name.
+
+    The timestamped backups are per-install safety nets and are useless for
+    uninstall: the second install backs up the already-wired file, so restoring the
+    newest one reinstates herd and reports success. This is the copy uninstall wants
+    and it is never overwritten — an already-wired file is not an original."""
+    b = path.with_name(path.name + ORIGINAL_SUFFIX)
+    if b.exists() or not path.exists() or _is_wired(path, text):
+        return None
+    shutil.copy2(path, b)
+    return b
+
+
+def _restore_source(path):
+    """The backup uninstall should restore: the pristine original when we have one,
+    else the OLDEST timestamped backup — on a pre-ORIGINAL_SUFFIX install that is
+    the one install #1 took, i.e. the last copy that predates herd. Returns None
+    when nothing usable exists."""
+    orig = path.with_name(path.name + ORIGINAL_SUFFIX)
+    if orig.exists():
+        return orig
+    baks = sorted(path.parent.glob(path.name + ".herd-bak.*"))
+    baks = [b for b in baks if b.name != orig.name]
+    return baks[0] if baks else None
+
+
+def _atomic_write(path, text):
+    """Write via tmp + rename in the same directory. settings.json is the one file
+    whose truncation stops Claude Code from starting, and write_text() truncates in
+    place — a crash or ENOSPC mid-write leaves unparseable JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".herd-tmp.{os.getpid()}")
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 # ── DB bootstrap ───────────────────────────────────────────────────────────
 def bootstrap_db(dry=False):
     if dry:
@@ -320,18 +370,38 @@ def install(dry=False):
             print(f"    {e}: {cmds}")
         return
 
-    bell_note = _offer_bell(new_settings)   # interactive opt-in; may set the key before we write
-    backup(SETTINGS, ts)
-    SETTINGS.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS.write_text(json.dumps(new_settings, indent=2) + "\n")
-    print(f"  rewired {SETTINGS} (backup: *.herd-bak.{ts})")
-    if WRAPPER.exists():
-        backup(WRAPPER, ts)
-        WRAPPER.write_text(wrapper_text)
-        print(f"  rewired {WRAPPER} statusline -> herd")
-
+    # GATE THE WRITE. selftest execs the hooks on disk against a throwaway DB — it
+    # depends on nothing we are about to write, so it can run first. Running it
+    # afterwards (as this used to) meant a provably broken set of hooks was already
+    # wired into the user's global config by the time we found out.
     ok, row = selftest()
     print(f"\n  self-test (wired hooks -> temp DB): {'PASS' if ok else 'FAIL'}  {row}")
+    if not ok:
+        print("\n  ABORTED — nothing was rewired. The hooks do not work as installed;")
+        print("  wiring them would have broken every Claude session silently.")
+        return 1
+
+    bell_note = _offer_bell(new_settings)   # interactive opt-in; may set the key before we write
+    # Re-read: _offer_bell blocks on input(), and Claude Code writes settings.json
+    # (permission grants) while we wait. Merging onto the on-disk copy at write time
+    # keeps a grant made during the prompt from being clobbered by our stale read.
+    if SETTINGS.exists():
+        try:
+            fresh = json.loads(SETTINGS.read_text())
+            fresh.update(new_settings)
+            new_settings = fresh
+        except (OSError, json.JSONDecodeError):
+            pass                                # unreadable now — go with what we built
+    backup_original(SETTINGS, SETTINGS.read_text() if SETTINGS.exists() else "")
+    backup(SETTINGS, ts)
+    _atomic_write(SETTINGS, json.dumps(new_settings, indent=2) + "\n")
+    print(f"  rewired {SETTINGS} (backup: *.herd-bak.{ts})")
+    if WRAPPER.exists():
+        backup_original(WRAPPER, WRAPPER.read_text())
+        backup(WRAPPER, ts)
+        _atomic_write(WRAPPER, wrapper_text)
+        print(f"  rewired {WRAPPER} statusline -> herd")
+
     print("  " + install_service())
     print("  " + install_cli())
     print("  " + bell_note)
@@ -340,28 +410,33 @@ def install(dry=False):
     print("    herd jump      # fuzzy-pick (fzf) a session and focus its window")
     print("\n  klawde is unwired but NOT deleted — ~/.klawde/sessions.db (history) is kept.")
     print(f"  restore:  python3 -m herd.install --uninstall")
+    return 0
 
 
 def uninstall():
-    """Restore the most recent backup of each edited file + remove service & CLI."""
+    """Restore each edited file to its PRE-HERD state + remove service & CLI."""
     print("  " + uninstall_service())
     print("  " + uninstall_cli())
+    rc = 0
     for path in (SETTINGS, WRAPPER):
-        baks = sorted(path.parent.glob(path.name + ".herd-bak.*"))
-        if baks:
-            shutil.copy2(baks[-1], path)
-            print(f"  restored {path} from {baks[-1].name}")
+        src = _restore_source(path)
+        if src:
+            _atomic_write(path, src.read_text())
+            print(f"  restored {path} from {src.name}")
+        elif path.exists():
+            rc = 1
+            print(f"  NO PRE-HERD BACKUP for {path} — left as-is, edit it by hand")
         else:
             print(f"  no backup found for {path}")
+    return rc
 
 
 def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
     if "--uninstall" in argv:
-        uninstall()
-    else:
-        install(dry="--dry-run" in argv)
+        return uninstall()
+    return install(dry="--dry-run" in argv)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

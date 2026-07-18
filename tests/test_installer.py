@@ -1,5 +1,6 @@
 """P (64-66d) — installer surgery on settings.json / the statusline wrapper, the
 systemd unit, CLI paths, and the terminal-bell opt-in. Pure functions."""
+import json
 import pathlib
 
 import pytest
@@ -110,3 +111,108 @@ def test_selftest_leaves_the_real_db_alone(tmp_path, monkeypatch):
     monkeypatch.setattr(I, "DB", real)
     I.selftest()
     assert not real.exists()
+
+
+# ── the side-effecting half: install()/uninstall() against a temp HOME ──────
+# These were 0%-covered, which is how the double-install uninstall trap survived.
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    """Point every path install() writes at a temp dir, and stub the side effects
+    that reach outside it (systemd, PATH symlinks, the interactive bell prompt)."""
+    monkeypatch.setattr(inst, "SETTINGS", tmp_path / "settings.json")
+    monkeypatch.setattr(inst, "WRAPPER", tmp_path / "custom-status-line.sh")
+    monkeypatch.setattr(inst, "HERD_DIR", tmp_path)
+    monkeypatch.setattr(inst, "DB", tmp_path / "herd.db")
+    monkeypatch.setattr(inst, "install_service", lambda dry=False: "service stubbed")
+    monkeypatch.setattr(inst, "uninstall_service", lambda: "service stubbed")
+    monkeypatch.setattr(inst, "install_cli", lambda dry=False: "cli stubbed")
+    monkeypatch.setattr(inst, "uninstall_cli", lambda: "cli stubbed")
+    monkeypatch.setattr(inst, "_offer_bell", lambda s: "bell stubbed")
+    ts = ["20260101-000000", "20260202-000000", "20260303-000000"]
+    monkeypatch.setattr(inst, "_ts", lambda: ts.pop(0))
+    return tmp_path
+
+
+PRISTINE = {"model": "opus", "hooks": {"PreToolUse": [
+    {"matcher": "Bash", "hooks": [{"type": "command", "command": "/opt/audit.sh"}]}]}}
+
+
+def _wired(d):
+    return any(str(inst.HOOKS_DIR) in h.get("command", "")
+               for bs in d["hooks"].values() for b in bs for h in b["hooks"])
+
+
+def test_uninstall_reverses_a_repeated_install(home, capsys):
+    """The trap: install #2 backs up the ALREADY-WIRED file, so restoring the newest
+    backup reinstates herd and reports success. README calls re-installing the fix
+    for two troubleshooting entries, so the second install is the common path."""
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+    inst.install(); inst.install()
+    assert _wired(json.loads(inst.SETTINGS.read_text()))     # precondition
+    inst.uninstall()
+    assert json.loads(inst.SETTINGS.read_text()) == PRISTINE
+    assert not _wired(json.loads(inst.SETTINGS.read_text()))
+
+
+def test_the_original_backup_is_never_overwritten(home):
+    """Every later install must leave the pre-herd snapshot alone — it is the only
+    copy that predates herd, and uninstall restores from it."""
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+    inst.install()
+    orig = inst.SETTINGS.with_name(inst.SETTINGS.name + inst.ORIGINAL_SUFFIX)
+    assert json.loads(orig.read_text()) == PRISTINE
+    inst.install(); inst.install()
+    assert json.loads(orig.read_text()) == PRISTINE
+
+
+def test_uninstall_migrates_a_legacy_double_install(home):
+    """An install predating ORIGINAL_SUFFIX has no pristine snapshot — only
+    timestamped backups. The OLDEST is the one install #1 took, i.e. pre-herd."""
+    wired = {"hooks": {"Stop": [{"hooks": [
+        {"type": "command", "command": str(inst.HOOKS_DIR / "stop.sh")}]}]}}
+    (home / "settings.json.herd-bak.20250101-000000").write_text(json.dumps(PRISTINE))
+    (home / "settings.json.herd-bak.20250202-000000").write_text(json.dumps(wired))
+    inst.SETTINGS.write_text(json.dumps(wired))
+    inst.uninstall()
+    assert json.loads(inst.SETTINGS.read_text()) == PRISTINE
+
+
+def test_a_failed_selftest_aborts_before_touching_settings(home, monkeypatch):
+    """The self-test exists to catch hooks that are wired but silently no-op. Running
+    it after the write meant reporting FAIL on a config already pointed at herd."""
+    monkeypatch.setattr(inst, "selftest", lambda: (False, {"not_executable": ["stop.sh"]}))
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+    assert inst.install() == 1
+    assert json.loads(inst.SETTINGS.read_text()) == PRISTINE
+    assert not list(home.glob("settings.json.herd-bak.*"))
+    assert inst.main([]) == 1                      # and the exit status carries it
+
+
+def test_install_absorbs_a_write_that_lands_during_the_bell_prompt(home, monkeypatch):
+    """_offer_bell blocks on input(); Claude Code writes settings.json (permission
+    grants) meanwhile. A stale in-memory copy would clobber them."""
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+
+    def racing_prompt(settings):
+        d = json.loads(inst.SETTINGS.read_text())
+        d["permissions"] = {"allow": ["Bash(ls:*)"]}       # granted during the prompt
+        inst.SETTINGS.write_text(json.dumps(d) + "\n")
+        return "bell stubbed"
+
+    monkeypatch.setattr(inst, "_offer_bell", racing_prompt)
+    inst.install()
+    out = json.loads(inst.SETTINGS.read_text())
+    assert out["permissions"] == {"allow": ["Bash(ls:*)"]}  # survived
+    assert _wired(out)                                      # and herd still wired
+
+
+def test_settings_are_written_atomically(home, monkeypatch):
+    """A torn settings.json stops Claude Code from starting at all."""
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+    real = inst.os.replace
+    monkeypatch.setattr(inst.os, "replace", lambda *a: (_ for _ in ()).throw(OSError("ENOSPC")))
+    with pytest.raises(OSError):
+        inst.install()
+    assert json.loads(inst.SETTINGS.read_text()) == PRISTINE   # intact, not truncated
+    monkeypatch.setattr(inst.os, "replace", real)
+    assert not list(home.glob("*.herd-tmp.*"))                 # and no debris
