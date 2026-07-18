@@ -1,5 +1,7 @@
 """herd spawn — build the launch argv, and record the W1 placeholder (guards run
 before any launch). IO injected exactly like test_focus_cli.py."""
+import sqlite3
+
 import pytest
 
 from herd import cli
@@ -84,6 +86,32 @@ def test_spawn_rejects_bad_job_before_launch(fresh):
     ok, _, _ = spawn(c, _spec(job="bad name"), SOCK, T0,
                      launch_fn=lambda s, k: (launched.append(1) or 1))
     assert not ok and launched == []
+
+
+def test_spawn_degrades_when_the_write_lock_is_held(tmp_path, fresh):
+    """BEGIN IMMEDIATE is the statement most likely to fail — a concurrent writer
+    holds the lock past busy_timeout. The handler must not ROLLBACK a transaction
+    that never opened: that raises out of spawn() and crashes the CLI it protects."""
+    c = fresh(name="lock.db")
+    c.execute("PRAGMA busy_timeout=50")          # fail fast instead of waiting 3s
+    other = sqlite3.connect(str(tmp_path / "lock.db"), isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")             # hold the write lock
+    launched = []
+    try:
+        ok, msg, pk = spawn(c, _spec(job="api"), SOCK, T0,
+                            launch_fn=lambda s, k: (launched.append(1) or 99))
+    finally:
+        other.execute("ROLLBACK")
+        other.close()
+    assert (ok, pk) == (False, None) and "could not reserve" in msg
+    assert launched == []                        # never launched on the reserve path
+
+
+def test_spawn_still_works_after_a_contended_failure(fresh):
+    """The degraded path must leave the connection usable, not wedged mid-txn."""
+    c = fresh(name="lock2.db")
+    ok, _, pk = spawn(c, _spec(job="api"), SOCK, T0, launch_fn=lambda s, k: 99)
+    assert ok and pk is not None and not c.in_transaction
 
 
 @pytest.mark.parametrize("job,ok", [

@@ -88,7 +88,16 @@ def spawn(conn, spec, socket, now, *, launch_fn=None):
                      {"pk": pk, "job": spec.job, "now": now, "socket": socket})
         conn.execute("COMMIT")
     except Exception as e:                       # noqa: BLE001 — degrade, never crash the CLI
-        conn.execute("ROLLBACK")
+        # BEGIN IMMEDIATE is INSIDE the try (it is the statement most likely to fail:
+        # busy_timeout expiry under a concurrent writer). An unconditional ROLLBACK
+        # would then raise "cannot rollback - no transaction is active" out of the
+        # handler and crash the CLI it exists to protect. in_transaction is the only
+        # honest test of whether there is anything to roll back.
+        if conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:                    # noqa: BLE001 — the reserve already failed
+                pass
         return False, f"could not reserve the job {spec.job!r}: {e}", None
 
     # ── phase 2: launch, then stamp the placement onto the reservation ──
