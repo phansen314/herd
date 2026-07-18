@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from helpers import CORE, HERD, WRITES, HOOKS, W
+from helpers import CORE, HERD, WRITES, HOOKS, ROOT, W
 
 
 # ── statement integrity ──────────────────────────────────────────────────────
@@ -30,6 +30,48 @@ def test_pager_actuator_stays_deleted():
     assert not re.search(r"\bpaged_(at|level)\b", _code(HERD)), "paged_* back in the schema"
     assert not re.search(r"\bpaged_(at|level)\b",
                          "\n".join(_code(s) for s in W.values())), "paged_* back in a statement"
+
+
+# ── doc cross-references resolve ─────────────────────────────────────────────
+DOCS = ("DESIGN.md", "DECISIONS.md", "README.md")
+SCANNED = {".md", ".py", ".sh", ".sql"}
+
+
+def _anchors(md):
+    """The anchors a GitHub-rendered heading exposes: an explicit `{#slug}` when the
+    heading carries one, else the auto-slug — lowercased, backticks and punctuation
+    dropped, spaces to hyphens."""
+    out = set()
+    for line in md.splitlines():
+        if not line.startswith("#"):
+            continue
+        head = line.lstrip("#").strip()
+        explicit = re.search(r"\{#([\w-]+)\}", head)
+        if explicit:
+            out.add(explicit.group(1))
+            continue
+        slug = re.sub(r"[^\w\s-]", "", head.replace("`", "")).strip().lower()
+        out.add(re.sub(r"\s", "-", slug))
+    return out
+
+
+def test_doc_cross_references_resolve():
+    """A source comment pointing at an anchor that 404s is worse than no pointer: it
+    reads as authoritative and silently isn't. Nothing checked these, so a dead
+    anchor once shipped in a green commit.
+
+    (Write doc refs in this file's own prose without the '#' — the scan reads its
+    own source too, and a literal example would trip it.)"""
+    anchors = {d: _anchors((ROOT / d).read_text()) for d in DOCS}
+    broken = []
+    for p in sorted(ROOT.rglob("*")):
+        if not p.is_file() or p.suffix not in SCANNED or ".git" in p.parts:
+            continue
+        for i, line in enumerate(p.read_text().splitlines(), 1):
+            for doc, anchor in re.findall(r"\b(DESIGN|DECISIONS|README)\.md#([\w-]+)", line):
+                if anchor not in anchors[f"{doc}.md"]:
+                    broken.append(f"{p.relative_to(ROOT)}:{i} -> {doc}.md#{anchor}")
+    assert not broken, "dead doc anchors:\n  " + "\n  ".join(broken)
 
 
 # ── A. tier boundary (text) ──────────────────────────────────────────────────

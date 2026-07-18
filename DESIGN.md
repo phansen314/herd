@@ -1,7 +1,7 @@
 # herd — design
 
 How herd works and which invariants hold. Source comments carry one load-bearing
-line and point here with `DESIGN.md#anchor`; if you're about to write an essay in
+line and point here with `<doc>.md#<anchor>`; if you're about to write an essay in
 the code, write it here instead.
 
 Source of truth for behaviour is `schema/writes.sql` (the write paths) and the

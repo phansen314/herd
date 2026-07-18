@@ -1,10 +1,10 @@
 """The hook contract: NOTHING MAY BLOCK CLAUDE. Every hook exits 0 under every
 degradation we can induce — malformed payload, empty stdin, unreachable DB, broken
-jq, broken sqlite3. DESIGN.md#hooks states this as the loudest invariant in the
+jq, broken sqlite3. DESIGN.md#the-hooks-hookssh states this as the loudest invariant in the
 project; before this file nothing enforced it.
 
 Also covers the two guards whose documented rationale had no test: bind()'s quote
-escaping (DESIGN.md#write-paths justifies the hand-rolled binder with an o'brien
+escaping (DESIGN.md#write-paths-schemawritessql justifies the hand-rolled binder with an o'brien
 example) and valid_sid()'s path-escape rejection.
 """
 import json
