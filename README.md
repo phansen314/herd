@@ -46,9 +46,14 @@ PYTHONPATH=src python3 -m herd.install --dry-run  # preview, touch nothing
 The installer:
 
 1. **bootstraps** `~/.herd/herd.db` and `~/.herd/templates/`;
-2. **wires the hooks + statusline** into `~/.claude/settings.json` and the statusline
-   wrapper — backing up each file first (`*.herd-bak.<ts>`) and preserving any hooks
-   it doesn't own (e.g. an existing PreToolUse hook);
+2. **wires the hooks + statusline** into `~/.claude/settings.json` — backing up each
+   file first (`*.herd-bak.<ts>`, plus a one-time `*.herd-bak.original`) and preserving
+   anything it doesn't own (e.g. an existing PreToolUse hook). The `statusLine` key is
+   pointed at herd's `statusline.sh`, except where a `~/.claude/custom-status-line.sh`
+   wrapper already fronts it — that wrapper is rewired instead, so it keeps whatever
+   else it does. A `statusLine` running a script herd doesn't recognise is **left
+   alone and reported**: point it at `src/herd/hooks/statusline.sh` yourself, or herd
+   records no cost/context/branch (that hook is the only writer of those columns);
 3. **installs the daemon** as a `systemd --user` service (`herd.service`), enabled on
    login with auto-restart. Where `systemctl --user` is unavailable (macOS/headless)
    this step is a graceful no-op — run the daemon yourself.
@@ -67,9 +72,12 @@ Undo it — hooks, statusline, service, and the CLI symlinks — with:
 PYTHONPATH=src python3 -m herd.install --uninstall
 ```
 
-This works by **restoring the most recent `*.herd-bak.<ts>` backup** of each file it
-edited, not by reversing the edits — if those backups are gone it says so and leaves
-the file wired, and you unwire `~/.claude/settings.json` by hand. Your data survives
+This works by **restoring the pre-herd `*.herd-bak.original` snapshot** of each file it
+edited, not by reversing the edits — that snapshot is taken once, on the first install,
+and never overwritten, so re-installing any number of times doesn't affect what you get
+back. (Installs predating that snapshot fall back to the oldest `*.herd-bak.<ts>`.) If
+no pre-herd copy survives it says so, exits nonzero, and leaves the file wired for you
+to unwire by hand. Your data survives
 either way: `~/.herd/herd.db` is never deleted.
 
 ## Using it
@@ -306,7 +314,8 @@ design. Errors go to `~/.herd/hook-errors.log` (`HERD_ERRLOG`); the daemon's go 
 | symptom | cause |
 |---|---|
 | `herd: command not found` | `~/.local/bin` not on PATH (the installer WARNs about this), or an open shell that hasn't rehashed — `hash -r` |
-| statusline blank or missing | the hook scripts lost `+x`. `python3 -m herd.install` re-runs the selftest, which reports exactly this |
+| statusline blank or missing | the hook scripts lost `+x` — `python3 -m herd.install` self-tests for exactly this and now aborts rather than wiring broken hooks. If it passes, check `statusLine` in `~/.claude/settings.json`: the installer leaves a statusline it doesn't own alone (and says so at install time) |
+| cost / context / branch always empty, but sessions appear | the hooks are wired and `statusLine` isn't. Only `statusline.sh` writes those columns — see the `statusLine` note under Install |
 | no sessions ever appear | `~/.claude/settings.json` wasn't rewired — re-run the installer. Rows come from the hooks and `herd spawn`, never from the daemon, so this is not a daemon problem |
 | sessions appear but never go away | the daemon is down; only it reaps silent deaths. Live rows are `stopped_at IS NULL` |
 | `herd spawn` → "needs to run inside kitty" | `KITTY_LISTEN_ON` is unset. kitty needs `allow_remote_control yes` **and** `listen_on unix:/tmp/kitty` |

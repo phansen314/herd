@@ -216,3 +216,62 @@ def test_settings_are_written_atomically(home, monkeypatch):
     assert json.loads(inst.SETTINGS.read_text()) == PRISTINE   # intact, not truncated
     monkeypatch.setattr(inst.os, "replace", real)
     assert not list(home.glob("*.herd-tmp.*"))                 # and no debris
+
+
+# ── statusLine wiring ───────────────────────────────────────────────────────
+# statusline.sh is the ONLY writer of every metric column, and it used to be wired
+# solely by rewriting an existing custom-status-line.sh — so a machine without one
+# got no statusline at all, while install still printed PASS.
+def _sl(d):
+    return d.get("statusLine", {}).get("command")
+
+
+def test_fresh_machine_gets_the_statusline_wired_directly():
+    out = inst.rewire_settings({}, wrapper_exists=False)
+    assert _sl(out) == inst.STATUSLINE
+
+
+def test_an_existing_wrapper_stays_in_front():
+    """The wrapper is rewired to call herd, so the key should keep pointing at it
+    rather than reaching around it."""
+    cfg = {"statusLine": {"type": "command", "command": str(inst.WRAPPER)}}
+    out = inst.rewire_settings(cfg, wrapper_exists=True)
+    assert _sl(out) == str(inst.WRAPPER)
+
+
+def test_a_dangling_wrapper_pointer_is_repointed_at_herd():
+    cfg = {"statusLine": {"type": "command", "command": str(inst.WRAPPER)}}
+    out = inst.rewire_settings(cfg, wrapper_exists=False)
+    assert _sl(out) == inst.STATUSLINE
+
+
+def test_klawdes_statusline_is_replaced_but_a_foreign_one_is_not():
+    klawde = {"statusLine": {"type": "command", "command": "/h/.klawde/statusline.sh"}}
+    assert _sl(inst.rewire_settings(klawde, wrapper_exists=False)) == inst.STATUSLINE
+    mine = {"statusLine": {"type": "command", "command": "/opt/my-statusline.sh"}}
+    assert _sl(inst.rewire_settings(mine, wrapper_exists=False)) == "/opt/my-statusline.sh"
+
+
+def test_statusline_wiring_preserves_sibling_keys_and_is_idempotent():
+    cfg = {"statusLine": {"type": "command", "command": "/h/.klawde/statusline.sh",
+                          "padding": 0}}
+    once = inst.rewire_settings(cfg, wrapper_exists=False)
+    assert once["statusLine"]["padding"] == 0
+    assert inst.rewire_settings(once, wrapper_exists=False) == once
+
+
+def test_install_warns_instead_of_clobbering_a_foreign_statusline(home, capsys):
+    cfg = dict(PRISTINE, statusLine={"type": "command", "command": "/opt/mine.sh"})
+    inst.SETTINGS.write_text(json.dumps(cfg) + "\n")
+    inst.install()
+    out = json.loads(inst.SETTINGS.read_text())
+    assert _sl(out) == "/opt/mine.sh"                     # untouched
+    assert "LEFT ALONE" in capsys.readouterr().out        # and it said so
+
+
+def test_install_wires_the_statusline_on_a_machine_with_no_wrapper(home, capsys):
+    """The end-to-end bug: no custom-status-line.sh anywhere."""
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+    assert not inst.WRAPPER.exists()
+    inst.install()
+    assert _sl(json.loads(inst.SETTINGS.read_text())) == inst.STATUSLINE

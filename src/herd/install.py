@@ -1,11 +1,13 @@
 """herd installer — cut over from klawde (capture only).
 
     python3 -m herd.install            # wire herd, unwire klawde (backs up first)
-    python3 -m herd.install --uninstall  # restore the most recent backups
+    python3 -m herd.install --uninstall  # restore the pre-herd state
     python3 -m herd.install --dry-run    # show what would change, touch nothing
 
 Idempotent. Every edited file is backed up as <file>.herd-bak.<ts> before the
-first change. Reuses herd.db for the DB bootstrap. Leaves klawde's repo and
+first change, and once as <file>.herd-bak.original — the pre-herd copy uninstall
+restores. Nothing is written until the self-test passes; a FAIL aborts and exits
+nonzero. Reuses herd.db for the DB bootstrap. Leaves klawde's repo and
 ~/.klawde/sessions.db (history) in place — only unwires it from settings.json.
 """
 import json
@@ -260,7 +262,33 @@ def _offer_bell(new_settings):
 
 
 # ── settings.json surgery ──────────────────────────────────────────────────
-def rewire_settings(data):
+def _statusline_cmd(data):
+    sl = data.get("statusLine")
+    return sl.get("command", "") if isinstance(sl, dict) else ""
+
+
+def statusline_plan(data, wrapper_exists):
+    """What settings.statusLine needs, as one of:
+
+    'wrapper' — an existing custom-status-line.sh already sits in front of it, and
+                rewire_wrapper points that at herd. Leave the key alone.
+    'set'     — absent, klawde's, or already ours: wire herd's statusline directly.
+    'foreign' — someone else's statusline. Never clobber it; say so instead.
+
+    Pure, so install() can report it without re-deriving the decision. The 'set'
+    case is the one that used to be missing entirely: statusline wiring happened
+    ONLY through the wrapper, so a machine without one (anybody who wasn't already
+    a klawde user) got no statusline at all while install still printed PASS —
+    and statusline.sh is the only writer of every metric column."""
+    cmd = _statusline_cmd(data)
+    if not cmd or cmd == STATUSLINE or "/.klawde/" in cmd:
+        return "set"
+    if cmd == str(WRAPPER):
+        return "wrapper" if wrapper_exists else "set"     # dangling pointer -> ours
+    return "foreign"
+
+
+def rewire_settings(data, wrapper_exists=False):
     """Return a NEW settings dict with herd wired and klawde unwired. Pure —
     caller decides whether to write it."""
     data = json.loads(json.dumps(data))          # deep copy
@@ -286,6 +314,13 @@ def rewire_settings(data):
         if is_async:
             entry["async"] = True
         hooks.setdefault(event, []).insert(0, {"hooks": [entry]})
+
+    # 3. the statusline. Preserve any sibling keys (padding etc.) — only the
+    #    command is ours to set.
+    if statusline_plan(data, wrapper_exists) == "set":
+        sl = dict(data["statusLine"]) if isinstance(data.get("statusLine"), dict) else {}
+        sl.update({"type": "command", "command": STATUSLINE})
+        data["statusLine"] = sl
 
     return data
 
@@ -354,12 +389,21 @@ def install(dry=False):
     # rather than a traceback. rewire_settings() setdefaults "hooks", backup()
     # no-ops on a missing file, so the absent case needs no other special-casing.
     settings = json.loads(SETTINGS.read_text()) if SETTINGS.exists() else {}
-    new_settings = rewire_settings(settings)
+    plan = statusline_plan(settings, WRAPPER.exists())
+    new_settings = rewire_settings(settings, wrapper_exists=WRAPPER.exists())
     wrapper_text, wrap_ok = rewire_wrapper(WRAPPER.read_text()) if WRAPPER.exists() else ("", False)
+    sl_note = {
+        "set":     f"statusLine -> {STATUSLINE}",
+        "wrapper": f"statusLine -> {WRAPPER} (rewired to herd below)",
+        "foreign": (f"statusLine LEFT ALONE — it runs {_statusline_cmd(settings)!r}, "
+                    "which herd does not own. Point it at\n      "
+                    f"{STATUSLINE} yourself, or herd records no cost/context/branch."),
+    }[plan]
 
     if dry:
         print(f"  would back up + rewrite {SETTINGS}")
         print(f"  would back up + rewrite {WRAPPER} (statusline -> herd: {wrap_ok})")
+        print(f"  {sl_note}")
         print("  " + install_service(dry=True))
         print("  " + install_cli(dry=True))
         print("  would offer (interactive, opt-in) to enable terminal_bell notifications")
@@ -396,6 +440,7 @@ def install(dry=False):
     backup(SETTINGS, ts)
     _atomic_write(SETTINGS, json.dumps(new_settings, indent=2) + "\n")
     print(f"  rewired {SETTINGS} (backup: *.herd-bak.{ts})")
+    print(f"  {sl_note}")
     if WRAPPER.exists():
         backup_original(WRAPPER, WRAPPER.read_text())
         backup(WRAPPER, ts)
