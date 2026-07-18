@@ -22,67 +22,12 @@ Every Claude Code session writes into `~/.herd/herd.db` as it lives:
   `working`, `waiting` (turn ended, wants input), `needs_approval` (permission
   prompt), `stopped`.
 - **Placement** — the kitty socket + window it's running in (the jump target).
-- **Metrics** — context %, cost, burn rate, rate-limit windows (from the statusline).
+- **Metrics** — context %, cost, burn rate, token counts, lines changed, rate-limit
+  windows (from the statusline).
 - **Liveness** — a background daemon reaps sessions whose process died *silently*
   (kill -9, crash, closed terminal) where no hook could fire.
 - **Attention** — the daemon derives which sessions need you (waiting too long,
   a permission prompt sitting, a working session gone silent) and records it.
-
-## How it works
-
-Two data sources, two directions:
-
-- **Hooks (push).** Claude Code fires lifecycle hooks — `SessionStart`, `Stop`,
-  `Notification`, `PostToolUse`, `SessionEnd` — plus the statusline (~1/sec). They
-  record what Claude *reports*: identity, status, metrics, and (from the kitty
-  environment) placement. `SessionStart` also walks the process tree to capture
-  Claude's own pid.
-- **Daemon (pull).** A background process reads the **process table** each tick to
-  catch what hooks structurally cannot: a session that died without firing
-  `SessionEnd`. Liveness comes from `ps`, never from kitty — absence from a kitty
-  listing is evidence about *placement*, and reaping on it would nuke every live
-  row on a socket blip.
-
-### Two tiers
-
-The schema is split along a strict boundary (enforced by the test suite):
-
-- **Tier 1 — `sessions`, `events`** — facts that would be true whether or not herd
-  existed: a Claude process with this pid, cwd, status. Core session data.
-- **Tier 2 — `herd_sessions`, `herd_attention`** — herd's *relationship* to a
-  session: the job name it was spawned with, its kitty placement, and whether
-  herd has decided it needs your attention.
-
-The identity spine is a surrogate integer `id`; Claude's UUID is a nullable column
-adopted later — which is what lets a session have a placement and a job *before*
-Claude has reported its UUID.
-
-### The daemon's two layers
-
-`herd.daemon` runs both on one loop, mirroring the tier boundary:
-
-| layer | writes | when |
-|---|---|---|
-| **core** (tier 1) | `sessions.stopped_at` via `ps` liveness — the reaper | always |
-| **herd** (tier 2) | `herd_attention` — the silence rule | gated by `HERD_ATTENTION` |
-
-Run herd purely for **core data collection** with `HERD_ATTENTION=0` and build your
-own tooling on the `sessions` table; herd never touches `herd_attention`.
-
-If you do read the DB from your own tool, treat `sessions.status` as an **open set**:
-render any value you don't recognize as `unknown` rather than switching exhaustively.
-The current values are `working`, `waiting`, `needs_approval`, `stopped`, `unknown`,
-and the `CHECK` constraint that enforces them will gain members as Claude Code adds
-lifecycle hooks. Growing that set is additive for readers that degrade gracefully and
-breaking for ones that don't. Same rule for `last_event_type` and `status_source`.
-
-### Canonical SQL
-
-Every write is a named statement in [`schema/writes.sql`](src/herd/schema/writes.sql).
-Both the bash hooks and the Python daemon load statements from that one file — SQL
-is never inlined into a hook or the daemon. The test suite proves the bash and Python
-extractors return character-for-character identical statements, so a fixed bug can't
-quietly rot in a copy.
 
 ## Install
 
@@ -99,7 +44,7 @@ PYTHONPATH=src python3 -m herd.install --dry-run  # preview, touch nothing
 
 The installer:
 
-1. **bootstraps** `~/.herd/herd.db`;
+1. **bootstraps** `~/.herd/herd.db` and `~/.herd/templates/`;
 2. **wires the hooks + statusline** into `~/.claude/settings.json` and the statusline
    wrapper — backing up each file first (`*.herd-bak.<ts>`) and preserving any hooks
    it doesn't own (e.g. an existing PreToolUse hook);
@@ -128,8 +73,6 @@ either way: `~/.herd/herd.db` is never deleted.
 
 ## Using it
 
-**The `herd` CLI** (installed on your PATH):
-
 ```bash
 herd ls                 # live sessions, attention-first, by name
 herd spawn <job>        # launch claude in a new kitty tab, tracked from the start
@@ -138,8 +81,13 @@ herd jump <query>       # herd id, name (/rename), job, uuid, or cwd; unique mat
 herd watch              # the picker as a permanent dashboard, for a dedicated tab
 ```
 
-**`herd spawn`** names a session up front, so it has a handle before Claude has even
-reported a UUID:
+Sessions show by their recognizable name — Claude's `/rename` name, else herd's job,
+else the uuid. `jump` opens an fzf picker (with a detail preview) unless the query is
+a unique match, in which case it focuses immediately.
+
+### `herd spawn` — name a session up front
+
+So it has a handle before Claude has even reported a UUID:
 
 ```bash
 herd spawn api                              # a new tab, cwd here
@@ -181,12 +129,10 @@ A multiline `prompt` is the reason the format is TOML. Templates need **Python 3
 (stdlib `tomllib`); the rest of herd still runs on 3.9. Unknown keys are rejected
 rather than ignored, so a typo tells you instead of silently doing nothing.
 
-Sessions show by their recognizable name — Claude's `/rename` name, else herd's job,
-else the uuid. `jump` opens an fzf picker (with a detail preview) unless the query is
-a unique match, in which case it focuses immediately.
+### `herd watch` — the dashboard
 
-**`herd watch`** is the dashboard: the same picker, looping, refreshing itself as
-sessions change. Give it a dedicated kitty tab and a key to reach it:
+The same picker, looping, refreshing itself as sessions change. Give it a dedicated
+kitty tab and a key to reach it:
 
 ```conf
 # ~/.config/kitty/kitty.conf — focus the herd tab, launching it once if needed.
@@ -222,7 +168,11 @@ Enter jumps to a session, `ctrl-r` forces a refresh, `ctrl-q` / `ctrl-c` quit. E
 re-opens the picker rather than exiting — it's a tab you can't accidentally fall out
 of, so after jumping away, the same key brings you back to a live list.
 
-**Or read the DB directly** — everything the CLI shows, and more:
+### Reading the database directly
+
+Everything the CLI shows, and more. The DB lives at `~/.herd/herd.db` (WAL mode, so
+`-wal` / `-shm` siblings exist — copy all three, or use `sqlite3 .backup`, if you
+back it up):
 
 ```bash
 sqlite3 -header -column ~/.herd/herd.db "
@@ -237,7 +187,19 @@ WHERE s.stopped_at IS NULL
 ORDER BY a.attention_at IS NULL, a.attention_at, s.started_at DESC;"
 ```
 
-**The daemon:**
+The schema is split in two tiers — `sessions`/`events` are facts that would be true
+whether or not herd existed; `herd_sessions`/`herd_attention` are herd's own
+relationship to a session. Read tier 1 and you can ignore that herd exists at all.
+(Rationale: [DESIGN.md](DESIGN.md#tiers).)
+
+If you build a tool on this, treat `sessions.status` as an **open set**: render any
+value you don't recognize as `unknown` rather than switching exhaustively. The current
+values are `working`, `waiting`, `needs_approval`, `stopped`, `unknown`, and the
+`CHECK` constraint that enforces them will gain members as Claude Code adds lifecycle
+hooks. Growing that set is additive for readers that degrade gracefully and breaking
+for ones that don't. Same rule for `last_event_type` and `status_source`.
+
+### The daemon
 
 ```bash
 systemctl --user status herd            # is it running
@@ -249,6 +211,16 @@ PYTHONPATH=src python3 -m herd.daemon           # reaper + attention
 PYTHONPATH=src python3 -m herd.daemon --once    # a single tick
 HERD_ATTENTION=0 PYTHONPATH=src python3 -m herd.daemon   # core-only
 ```
+
+It runs two layers on one loop, mirroring the tier boundary:
+
+| layer | writes | when |
+|---|---|---|
+| **core** (tier 1) | `sessions.stopped_at` via `ps` liveness — the reaper | always |
+| **herd** (tier 2) | `herd_attention` — the silence rule | gated by `HERD_ATTENTION` |
+
+Run herd purely for **core data collection** with `HERD_ATTENTION=0` and build your
+own tooling on the `sessions` table; herd never touches `herd_attention`.
 
 **Tuning the attention rule** (env vars, defaults shown):
 
@@ -267,6 +239,7 @@ Read by the hooks and CLI rather than the daemon:
 | `HERD_TEMPLATES` | `~/.herd/templates` | where `herd spawn -t` looks for `<name>.toml` |
 | `HERD_TOOL_THROTTLE` | `2` | seconds to coalesce `PostToolUse` writes on the hot path |
 | `HERD_CLAUDE_NAME` | `claude` | process name the pid ancestry walk looks for (node-based installs) |
+| `HERD_ERRLOG` | `~/.herd/hook-errors.log` | where hooks log failures (they never print to Claude) |
 
 ## Notifications (kitty tab bell)
 
@@ -291,6 +264,48 @@ This is deliberately outside herd — the daemon stays kitty-free and you keep c
 of your own Claude notification preference. herd's silence-rule signal (a session
 gone quiet) shows separately as the `!` in `herd ls` / the jump picker.
 
+## Troubleshooting
+
+Hooks **never** print to Claude — that's the contract, so they fail silently by
+design. Errors go to `~/.herd/hook-errors.log` (`HERD_ERRLOG`); the daemon's go to
+`journalctl --user -u herd`. Check those first.
+
+| symptom | cause |
+|---|---|
+| `herd: command not found` | `~/.local/bin` not on PATH (the installer WARNs about this), or an open shell that hasn't rehashed — `hash -r` |
+| statusline blank or missing | the hook scripts lost `+x`. `python3 -m herd.install` re-runs the selftest, which reports exactly this |
+| no sessions ever appear | the daemon isn't running (`systemctl --user status herd`), or `~/.claude/settings.json` wasn't rewired — re-run the installer |
+| sessions appear but never go away | the daemon is down; only it reaps silent deaths. Live rows are `stopped_at IS NULL` |
+| `herd spawn` → "needs to run inside kitty" | `KITTY_LISTEN_ON` is unset. kitty needs `allow_remote_control yes` **and** `listen_on unix:/tmp/kitty` |
+| `herd spawn -t` → "templates need Python 3.11+" | `tomllib` is 3.11+. Only templates need it; the rest of herd runs on 3.9 |
+| `herd watch` → "needs fzf and a tty" | `fzf` isn't installed, or you're not on a terminal |
+| `herd jump` prints a list instead of jumping | same — no `fzf`, so it degrades to printing rather than failing |
+| a key bound to `launch --type=background` does nothing | that process gets no `KITTY_LISTEN_ON`; add `--allow-remote-control` (see [watch](#herd-watch--the-dashboard)) |
+| no `systemctl --user` (macOS/headless) | expected — the service step no-ops. Run `python3 -m herd.daemon` yourself |
+
+Start fresh: stop the daemon, delete `~/.herd/herd.db*` (the DB plus its `-wal` and
+`-shm` siblings), and re-run the installer. You lose history; nothing else depends
+on it.
+
+## How it works
+
+Two data sources, two directions:
+
+- **Hooks (push).** Claude Code fires lifecycle hooks — `SessionStart`, `Stop`,
+  `Notification`, `PostToolUse`, `SessionEnd` — plus the statusline (~1/sec). They
+  record what Claude *reports*: identity, status, metrics, and (from the kitty
+  environment) placement. `SessionStart` also walks the process tree to capture
+  Claude's own pid.
+- **Daemon (pull).** A background process reads the **process table** each tick to
+  catch what hooks structurally cannot: a session that died without firing
+  `SessionEnd`. Liveness comes from `ps`, never from kitty — absence from a kitty
+  listing is evidence about *placement*, and reaping on it would nuke every live
+  row on a socket blip.
+
+Everything else — the tier boundary, the identity spine, the two clocks behind the
+attention signal, and why every write is a named statement in one canonical SQL file
+— is in [DESIGN.md](DESIGN.md).
+
 ## Development
 
 The whole design is asserted, not narrated, by the `pytest` suite:
@@ -301,9 +316,10 @@ python3 -m pytest       # whole suite, no install needed, a few seconds
 
 It runs the real bash hooks and the real Python against throwaway databases, and
 proves the invariants the design rests on — the tier boundary, the identity model,
-the two-clocks attention thesis, the reaper's liveness rules, and that the hooks and
-daemon load the same canonical SQL. New behavior is added test-first (red before
-green); the suite is the project's only CI gate.
+the two-clocks attention thesis, the reaper's liveness rules, that every hook exits 0
+under every degradation, and that the hooks and daemon load the same canonical SQL.
+New behavior is added test-first (red before green); the suite is the project's only
+CI gate.
 
 The design rationale lives in [`DESIGN.md`](DESIGN.md); source comments carry a
 one-line summary and point there. Start with the schema —
