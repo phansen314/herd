@@ -297,11 +297,14 @@ def install(dry=False):
     print(f"\n  self-test (wired hooks -> temp DB): {'PASS' if ok else 'FAIL'}  {row}")
     print("  " + install_service())
     print("  " + install_cli())
+    print("\n  use it (new shell picks up `herd` + completion):")
+    print("    herd ls        # live sessions, attention-first, by name")
+    print("    herd jump      # fuzzy-pick (fzf) a session and focus its window")
+    print("\n  optional — kitty tab bell when a session wants you (herd sends nothing;")
+    print("  Claude rings it, kitty flags the tab). In ~/.claude/settings.json:")
+    print('    "preferredNotifChannel": "terminal_bell"      # see README, Notifications')
     print("\n  klawde is unwired but NOT deleted — ~/.klawde/sessions.db (history) is kept.")
-    print("  view sessions meanwhile:")
-    print('    sqlite3 ~/.herd/herd.db "SELECT s.id,h.job_name,s.cwd,s.status FROM sessions s '
-          'LEFT JOIN herd_sessions h ON h.session_pk=s.id WHERE s.stopped_at IS NULL"')
-    print(f"\n  restore:  python3 -m herd.install --uninstall")
+    print(f"  restore:  python3 -m herd.install --uninstall")
 
 
 def uninstall():

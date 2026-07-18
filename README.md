@@ -156,6 +156,26 @@ HERD_ATTENTION=0 PYTHONPATH=src python3 -m herd.daemon   # core-only
 | `HERD_STUCK_SECS` | `300` | silence before a `working` session reads as stuck |
 | `HERD_DB` | `~/.herd/herd.db` | database path |
 
+## Notifications (kitty tab bell)
+
+herd sends no notifications itself — **Claude Code rings the bell, kitty flags the
+tab.** For an ambient "this session wants you" marker, set Claude's notification
+channel to the terminal bell in `~/.claude/settings.json`:
+
+```json
+"preferredNotifChannel": "terminal_bell"
+```
+
+Claude rings it when a turn ends waiting for input or a permission prompt appears
+(it's the only process with the window's tty — herd's hooks run detached, so they
+can't). kitty then marks that tab and flags the window via `bell_on_tab` and
+`window_alert_on_bell` (both on by default; add `enable_audio_bell no` for a silent,
+visual-only bell), clearing when you focus the tab.
+
+This is deliberately outside herd — the daemon stays kitty-free and you keep control
+of your own Claude notification preference. herd's silence-rule signal (a session
+gone quiet) shows separately as the `!` in `herd ls` / the jump picker.
+
 ## Development
 
 The whole design is asserted, not narrated, by one suite:
@@ -192,17 +212,18 @@ validate.py      the validation suite
 
 ## Roadmap
 
-Navigation is covered by the CLI (`herd jump` fuzzy-picks and focuses), so a
-dedicated TUI is **not planned** — fzf + CLI verbs do that job more cheaply. What's
-left is the *ambient* side and spawning:
+Navigation is the CLI (`herd jump` fuzzy-picks and focuses), and ambient attention
+is Claude's terminal bell + kitty's tab flag (see [Notifications](#notifications-kitty-tab-bell))
+— so a dedicated TUI and a herd-owned notifier are **not planned**; each is handled
+more cheaply outside herd. What's left:
 
 - **`herd new <job>`** — launch a named kitty tab/pane running Claude, tracked from
   the start (the one spot that still needs kitty on a write path: `kitten @ launch`).
-- **A lightweight notifier** — surface the attention signal the daemon already
-  computes (`herd_attention`) *proactively*: e.g. a kitty tab-urgency flag, or a
-  `herd watch` that pings when a session goes quiet — not an always-open dashboard.
 - **More CLI verbs** as needed (`herd kill`, `herd dismiss`), each composing with
   `herd jump`'s fzf picker.
+- *(maybe)* a daemon tab-poke for the one case Claude's bell can't cover — a session
+  gone **silently stuck** in `working` (it isn't "done", so it never bells). This is
+  the only thing that would put kitty back on the daemon's path, so it stays opt-in.
 
 ## Prior art
 
