@@ -216,13 +216,17 @@ def cmd_preview(conn, args):
 
 COMMANDS = {"ls": cmd_ls, "jump": cmd_jump, "preview": cmd_preview, "complete": cmd_complete}
 _READONLY = {"ls", "preview", "complete"}
+# The verbs a user actually types. `preview` (fzf's per-highlight pane) and
+# `complete` (tab-completion feed) are machinery — callable, but not advertised in
+# help or tab-completion.
+USER_COMMANDS = ("ls", "jump")
 
 
 def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
     cmd = argv[0] if argv else "ls"
     if cmd not in COMMANDS:
-        print(f"herd: unknown command {cmd!r} (try: ls, jump, preview)")
+        print(f"herd: unknown command {cmd!r} (try: {', '.join(USER_COMMANDS)})")
         return 2
     conn = connect(DEFAULT_DB, readonly=cmd in _READONLY)
     return COMMANDS[cmd](conn, argv[1:])

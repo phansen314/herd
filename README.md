@@ -9,10 +9,10 @@ herd is **local-only**: no network, no telemetry, no runtime dependencies. Hooks
 are bash + `jq` + `sqlite3` on purpose (a Python cold start on every `SessionStart`
 would be felt); the background daemon is stdlib Python.
 
-> **Status: early.** The data model, the lifecycle hooks, the statusline, and the
-> liveness/attention daemon are built, tested, and installable. The consumers that
-> make it *visible* — a TUI, `herd new`/jump-to-session, and a notification
-> actuator — are next (see [Roadmap](#roadmap)). Today you read the DB directly.
+> **Status: early but usable.** The data model, lifecycle hooks, statusline, the
+> liveness/attention daemon, and the `herd` CLI (`ls` + fzf-powered `jump`) are
+> built, tested, and installed. Still ahead (see [Roadmap](#roadmap)): spawning
+> named sessions (`herd new`) and a lightweight notifier for ambient attention.
 
 ## What it does
 
@@ -106,7 +106,19 @@ PYTHONPATH=src python3 -m herd.install --uninstall
 
 ## Using it
 
-**See live sessions** (the query the future TUI will render):
+**The `herd` CLI** (installed on your PATH):
+
+```bash
+herd ls                 # live sessions, attention-first, by name
+herd jump               # fuzzy-pick a session (fzf) with a live preview, and focus it
+herd jump <query>       # herd id, name (/rename), job, uuid, or cwd; unique match jumps
+```
+
+Sessions show by their recognizable name — Claude's `/rename` name, else herd's job,
+else the uuid. `jump` opens an fzf picker (with a detail preview) unless the query is
+a unique match, in which case it focuses immediately.
+
+**Or read the DB directly** — everything the CLI shows, and more:
 
 ```bash
 sqlite3 -header -column ~/.herd/herd.db "
@@ -171,18 +183,26 @@ src/herd/
   hooks/         *.sh (bash 3.2 + jq + sqlite3)      — lifecycle capture + statusline
   db.py          statement loader + connection policy
   daemon.py      the reaper + attention tick
-  install.py     hooks/statusline/service wiring
-  kitty/  tui/   reserved for spawn-focus and the viewer (not yet built)
+  install.py     hooks/statusline/service/CLI wiring
+  cli.py         the `herd` CLI (ls, jump, + fzf preview machinery)
+  kitty/         focus.py — re-derive a session's window and jump to it
+completions/     bash completion   ·   bin/herd — the CLI wrapper
 validate.py      the validation suite
 ```
 
 ## Roadmap
 
-- **TUI** — a read-only viewer over `sessions` with attention-first ordering.
-- **Spawn & jump** — `herd new <job>` launches a named kitty tab; jump to any
-  session by re-deriving its placement from kitty and focusing the window.
-- **Notification actuator** — surface the attention signal the daemon already
-  computes (a TUI badge, or something less lose-able than a desktop popup).
+Navigation is covered by the CLI (`herd jump` fuzzy-picks and focuses), so a
+dedicated TUI is **not planned** — fzf + CLI verbs do that job more cheaply. What's
+left is the *ambient* side and spawning:
+
+- **`herd new <job>`** — launch a named kitty tab/pane running Claude, tracked from
+  the start (the one spot that still needs kitty on a write path: `kitten @ launch`).
+- **A lightweight notifier** — surface the attention signal the daemon already
+  computes (`herd_attention`) *proactively*: e.g. a kitty tab-urgency flag, or a
+  `herd watch` that pings when a session goes quiet — not an always-open dashboard.
+- **More CLI verbs** as needed (`herd kill`, `herd dismiss`), each composing with
+  `herd jump`'s fzf picker.
 
 ## Prior art
 

@@ -1443,6 +1443,14 @@ _ctoks = _cli._complete_tokens([
     {"session_name": None, "session_id": None, "job_name": None, "cwd": "/"}])   # nothing usable
 check("cli._complete_tokens yields name / job / uuid8 / cwd-basename, deduped+sorted",
       _ctoks == ["aaa11111", "api", "bbb22222", "refactor-api", "web"], _ctoks)
+# preview/complete are machinery (fzf pane, tab-completion feed): callable, but not
+# advertised to users in help or tab-completion.
+_comp = _install.COMPLETION_SRC.read_text()
+check("cli hides machinery (preview/complete) from the user surface",
+      _cli.USER_COMMANDS == ("ls", "jump")
+      and {"preview", "complete"} <= set(_cli.COMMANDS)           # still callable
+      and "preview" not in _cli.USER_COMMANDS
+      and 'compgen -W "ls jump"' in _comp and "preview" not in _comp)
 
 print("\n" + "═"*72)
 if FAILED:
