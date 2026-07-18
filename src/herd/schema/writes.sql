@@ -278,12 +278,16 @@ WHERE h.job_name = :job AND s.stopped_at IS NULL;
 
 -- ── R1. The ONE live-session read: sessions + herd_sessions + herd_attention,
 -- attention-first ordering. ls, the picker, rows and preview all go through it.
+-- SELECT ONLY WHAT A RENDERER CONSUMES. h.herd_var, h.source and h.verified_at
+-- were selected here and read by nothing — paid for on every `herd ls` and every
+-- `watch` refresh. They are still WRITTEN, and the mutability contract in
+-- DESIGN.md#write-paths-schemawritessql still governs them; this read just stopped
+-- carrying them. Add a column back when a caller actually reads it.
 -- :name R1_list
 SELECT s.id, s.session_id, s.pid, s.cwd, s.status, s.status_source, s.model, s.session_name,
        s.context_percent, s.total_cost_usd, s.git_branch,
        s.last_event_at, s.last_event_type, s.started_at, s.updated_at,
        h.job_name, h.kitty_socket, h.window_id,
-       h.herd_var, h.source, h.verified_at,
        a.attention_at, a.ack_at
 FROM sessions s
 LEFT JOIN herd_sessions  h ON h.session_pk = s.id

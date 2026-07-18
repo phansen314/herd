@@ -151,13 +151,43 @@ via `sqlite3.complete_statement()`).
 | `W5_statusline` | The sink for **every** field the statusLine payload carries — metrics, plus `claude_code_version`, `output_style`, `git_worktree`, `original_cwd` — and `git_branch`, which the hook derives from its own `.git` walk. Nothing else writes these; a field absent from this statement is a column that stays NULL forever. UPDATE only (never creates a row — would resurrect stopped sessions / invent empty cwd). Never touches `last_event_*`. Resets_at arrives as unix epoch, converted to ISO in SQLite (zero date forks); `COALESCE` keeps prior value on NULL. The `prev_cost` pair (burn-rate delta, resampled >300s) is correct as written: an UPDATE's RHS sees the OLD row, so `prev_cost_usd` captures the previous total before this statement overwrites it. |
 | `W5b_adopt` | Statusline adoption ("Path C"): statusline is a child of claude, inherits `KITTY_*` like a hook, so a reconciled session picks up metrics with no hooks wired. Same liveness JOIN as W2. |
 | `W6a_arm` / `W6c_ack` / `W6d_rearm` / `W6d_rearm_sid` | Attention (see [attention](#attention)). `W6d_rearm_sid` is the UUID-keyed variant a hook needs (hooks lack the surrogate pk) — same keyed-two-ways pattern as W2 vs W2b. |
-| `R1_list` | The **one** live-session read: `sessions` + `herd_sessions` + `herd_attention`, attention-first ordering. `ls`, the picker, `rows` and the preview all go through it. |
+| `R1_list` | The **one** live-session read: `sessions` + `herd_sessions` + `herd_attention`, attention-first ordering. `ls`, the picker, `rows` and the preview all go through it. Selects **only what a renderer consumes** — see [banked columns](#banked-columns). |
+| `W3f_sweep_stranded` | Reclaims a phase-1 spawn reservation whose claude never reached SessionStart (the launcher raised, claude died before its first hook, or the W5b adoption lost the `session_id` race). Such a row is `pid` NULL + `session_id` NULL, which `W3d_reap` skips by design while `R_job_live` still counts it live — so the job name stayed burned until the next boot sweep. Age-gated on `HERD_STRANDED_SECS` (a reservation is legitimately pid-NULL across the launch round trip). DELETE, not `stopped_at`, for `W1_spawn_abort`'s reason: this session never existed. |
 | `R_job_live` | Spawn-time recyclable-handle check: does a *live* session already hold this job name? By JOIN, no unique index. Dead rows keep their `job_name` — reuse is by design, and resolution searches live sessions only. Run **inside** `spawn()`'s `BEGIN IMMEDIATE`, not before it: the check must be atomic with the reservation, or two concurrent spawns both pass it across the kitty launch and both insert. See [spawn](#spawn). |
 | `R_statusline` | Render input: feeds only the burn rate (the `prev_cost` pair). One read per fingerprint miss. |
 
 **Routing read, not data read:** in an adopt writer (W2, W5b, W2b_placement) a
 `herd_*` reference may appear only *after* `WHERE` (to pick which row), never in
 the SET list. No tier-2 value ever enters a core column.
+
+### Banked columns — written, deliberately unread {#banked-columns}
+
+Some columns have **no reader today**, and that is a decision rather than an
+oversight. Two groups:
+
+**Rendered from the payload, banked in the DB.** The rate-limit pair, `model`,
+`api_duration_ms` and `git_branch` are on screen every tick — but the statusline
+renders them from the payload it just parsed, not from the row. The stored copy is
+history, not display state.
+
+**Never surfaced at all.** `total_input_tokens`, `total_output_tokens`,
+`context_window_size`, `lines_added`, `lines_removed`, `exceeds_200k_tokens`,
+`claude_code_version`, `output_style`, `original_cwd`, `git_worktree`. Nothing
+reads these. They are banked because **the payload is the only source and it is
+gone the moment the tick ends** — a question you think of next month ("what did
+context growth look like before that refactor?") is unanswerable unless the data
+was captured now.
+
+This is not in tension with [the events table](DECISIONS.md#events), which was
+removed for being write-only. A write-only *table* cost a second write path, its
+own transaction and its own drift risk. A write-only *column* on a row `W5` is
+already updating costs one more assignment in an UPDATE that was happening anyway.
+The events table was a second thing to keep in sync; these are not.
+
+What is **not** acceptable is paying for unread data on the *read* path. `R1_list`
+runs on every `ls` and every `watch` refresh, so it selects only what a renderer
+consumes; `herd_var`, `source` and `verified_at` were dropped from it for that
+reason, while remaining written and governed by the mutability contract above.
 `test_source_invariants.py::test_core_writers_take_no_tier2_value` enforces this
 structurally: it splits each `sessions` writer at the first `WHERE` and greps only
 the value region.
