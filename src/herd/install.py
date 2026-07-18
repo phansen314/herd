@@ -299,7 +299,10 @@ def install(dry=False):
     print(f"herd install  (ts={ts})\n")
     print("  " + bootstrap_db(dry))
 
-    settings = json.loads(SETTINGS.read_text())
+    # A first-time machine may have no settings.json at all — treat that as empty
+    # rather than a traceback. rewire_settings() setdefaults "hooks", backup()
+    # no-ops on a missing file, so the absent case needs no other special-casing.
+    settings = json.loads(SETTINGS.read_text()) if SETTINGS.exists() else {}
     new_settings = rewire_settings(settings)
     wrapper_text, wrap_ok = rewire_wrapper(WRAPPER.read_text()) if WRAPPER.exists() else ("", False)
 
@@ -318,6 +321,7 @@ def install(dry=False):
 
     bell_note = _offer_bell(new_settings)   # interactive opt-in; may set the key before we write
     backup(SETTINGS, ts)
+    SETTINGS.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS.write_text(json.dumps(new_settings, indent=2) + "\n")
     print(f"  rewired {SETTINGS} (backup: *.herd-bak.{ts})")
     if WRAPPER.exists():
