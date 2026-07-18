@@ -12,6 +12,7 @@ need the KEEP branch therefore build stamps relative to the real clock.
 """
 import datetime as dt
 import json
+import re
 import subprocess
 import os
 
@@ -104,11 +105,20 @@ def _seed_for_burn(hook_env, prev_cost, prev_at, total):
 
 
 def test_burn_renders_with_the_expected_rate(hook_env):
-    """$1 more spent over 60s == $60/h."""
+    """$1 more spent over 60s == $60/h.
+
+    Asserted as a RANGE, not `$60.`: prev_at is stamped against the real clock (see
+    the module docstring), so the elapsed term keeps growing until the hook actually
+    runs. A second of scheduling latency between the seed and the run renders
+    $59.02/h — which flaked in full-suite runs and never once in isolation. The
+    window tolerates ~5s of latency while still pinning the rate to the right order.
+    """
     _seed_for_burn(hook_env, prev_cost=1.0, prev_at=_iso(-60), total=1.0)
     r = _sl(hook_env, _pay(2.0))
     assert r.returncode == 0
-    assert "🔥 $60." in r.stdout, r.stdout
+    m = re.search(r"🔥 \$([\d.]+)/h", r.stdout)
+    assert m, r.stdout
+    assert 55.0 <= float(m.group(1)) <= 60.0, r.stdout
 
 
 def test_burn_hidden_when_cost_did_not_increase(hook_env):
