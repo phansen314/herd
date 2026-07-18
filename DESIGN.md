@@ -150,7 +150,7 @@ via `sqlite3.complete_statement()`).
 | `W4_end` | The only hook-driven death (`status_source='hook'` — it *knows*, vs W3d's inference). |
 | `W5_statusline` | The sink for **every** field the statusLine payload carries — metrics, plus `claude_code_version`, `output_style`, `git_worktree`, `original_cwd` — and `git_branch`, which the hook derives from its own `.git` walk. Nothing else writes these; a field absent from this statement is a column that stays NULL forever. UPDATE only (never creates a row — would resurrect stopped sessions / invent empty cwd). Never touches `last_event_*`. Resets_at arrives as unix epoch, converted to ISO in SQLite (zero date forks); `COALESCE` keeps prior value on NULL. The `prev_cost` pair (burn-rate delta, resampled >300s) is correct as written: an UPDATE's RHS sees the OLD row, so `prev_cost_usd` captures the previous total before this statement overwrites it. |
 | `W5b_adopt` | Statusline adoption ("Path C"): statusline is a child of claude, inherits `KITTY_*` like a hook, so a reconciled session picks up metrics with no hooks wired. Same liveness JOIN as W2. |
-| `W6a_arm` / `W6b_paged` / `W6c_ack` / `W6d_rearm` / `W6d_rearm_sid` | Attention (see [attention](#attention)). `W6d_rearm_sid` is the UUID-keyed variant a hook needs (hooks lack the surrogate pk) — same keyed-two-ways pattern as W2 vs W2b. |
+| `W6a_arm` / `W6c_ack` / `W6d_rearm` / `W6d_rearm_sid` | Attention (see [attention](#attention)). `W6d_rearm_sid` is the UUID-keyed variant a hook needs (hooks lack the surrogate pk) — same keyed-two-ways pattern as W2 vs W2b. |
 | `R1_list` | The **one** live-session read: `sessions` + `herd_sessions` + `herd_attention`, attention-first ordering. `ls`, the picker, `rows` and the preview all go through it. |
 | `R_job_live` | Spawn-time recyclable-handle check: does a *live* session already hold this job name? By JOIN, no unique index. Dead rows keep their `job_name` — reuse is by design, and resolution searches live sessions only. Run **inside** `spawn()`'s `BEGIN IMMEDIATE`, not before it: the check must be atomic with the reservation, or two concurrent spawns both pass it across the kitty launch and both insert. See [spawn](#spawn). |
 | `R_statusline` | Render input: feeds only the burn rate (the `prev_cost` pair). One read per fingerprint miss. |
@@ -459,10 +459,14 @@ mean the daemon polling `kitten @ ls` for the focused window, which breaks
 [liveness comes from ps, never kitty](#liveness). Left open on purpose; revisit with
 the notifier.
 
-Actually *notifying* you (notify-send, a kitty tab poke, escalation via
-`paged_level`) is a separate actuator, deliberately deferred — this layer maintains
-the signal. Ambient attention is currently Claude's terminal bell plus kitty's tab
-flag, which is outside herd entirely.
+Actually *notifying* you (notify-send, a kitty tab poke, escalation rungs) is a
+separate actuator, deliberately deferred — this layer maintains the signal, which is
+binary: armed or acked. Ambient attention is currently Claude's terminal bell plus
+kitty's tab flag, which is outside herd entirely.
+
+A Claude-invoked pager was considered as the actuator and rejected: a signal Claude
+emits only sometimes destroys the meaning of its own absence, which is exactly what
+the derived rule above is for. See [DECISIONS.md#pager](DECISIONS.md#pager).
 
 ---
 
@@ -490,12 +494,5 @@ and an uncommitted setup would be invisible to them.
 
 ## Deferred / not yet built
 
-- **The pager actuator.** `W6b_paged`, `herd_attention.paged_at` and `paged_level`
-  are schema and SQL with **no production caller** — only `tests/test_pager.py`
-  executes them, so `paged_level` is structurally always `0` and the `(rung N)` in
-  the preview can only ever print `0`. A herd-owned notifier is *not planned*
-  (ambient attention is Claude's bell + kitty's tab flag), so this surface is
-  currently unbuilt machinery for a feature with no owner — either it gets a caller
-  or it gets deleted.
 - A `pid_start_time` column to close the reboot pid-reuse caveat properly.
 - Reaching a session without `herd jump` writes no ack — see [ack](#ack).

@@ -95,7 +95,7 @@ def test_post_tool_use_throttle_keeps_first_write(hook_env):
 def test_stop_sets_waiting_and_rearms(hook_env):
     c = hook_env.conn()
     pk = mk_session(c, session_id="s1", last_event_at=T0, last_event_type="tool")
-    mk_attention(c, pk, attention_at=T0, paged_at=T0, paged_level=2, ack_at=T0)
+    mk_attention(c, pk, attention_at=T0, ack_at=T0)
     hook_env.run("stop.sh", {"session_id": "s1", "stop_hook_active": False,
                              "last_assistant_message": "done", "hook_event_name": "Stop"})
     r = c.execute("SELECT status,last_event_type FROM sessions WHERE session_id='s1'").fetchone()
@@ -149,7 +149,7 @@ def test_bind_does_not_rescan_substituted_values():
 def test_stop_rearm_uses_canonical_statement(hook_env):
     c = hook_env.conn()
     pk = mk_session(c, session_id="s9")
-    mk_attention(c, pk, attention_at=T0, paged_level=3)
+    mk_attention(c, pk, attention_at=T0)
     hook_env.run("stop.sh", {"session_id": "s9", "stop_hook_active": False, "hook_event_name": "Stop"})
     assert c.execute("SELECT COUNT(*) FROM herd_attention WHERE session_pk=?", (pk,)).fetchone()[0] == 0
 

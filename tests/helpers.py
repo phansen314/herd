@@ -70,10 +70,10 @@ def mk_herd(c, pk, job_name=None, created_at=None, kitty_socket=SOCK, window_id=
         (pk, job_name, created_at, kitty_socket, window_id, herd_var, source, verified_at))
 
 
-def mk_attention(c, pk, attention_at=None, paged_at=None, paged_level=0, ack_at=None):
+def mk_attention(c, pk, attention_at=None, ack_at=None):
     return c.execute(
-        "INSERT INTO herd_attention(session_pk,attention_at,paged_at,paged_level,ack_at) "
-        "VALUES(?,?,?,?,?)", (pk, attention_at, paged_at, paged_level, ack_at))
+        "INSERT INTO herd_attention(session_pk,attention_at,ack_at) "
+        "VALUES(?,?,?)", (pk, attention_at, ack_at))
 
 
 # ── read helpers ─────────────────────────────────────────────────────────────

@@ -325,7 +325,7 @@ def test_preview_serves_every_field_it_renders(fresh):
     c, pk = _watch_fixture(fresh)
     row = next(r for r in cli._live(c) if r["id"] == pk)
     for col in ("status_source", "model", "git_branch", "context_percent",
-                "started_at", "last_event_at", "last_event_type", "paged_level"):
+                "started_at", "last_event_at", "last_event_type", "attention_at"):
         assert col in row.keys(), f"R1_list lacks {col}"
     assert "#" in cli._preview_text(row)
 

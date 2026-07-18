@@ -163,7 +163,7 @@ def _preview_text(row):
         f"last      {g('last_event_at')}  ({g('last_event_type')})",
     ]
     if d.get("attention_at") and not d.get("ack_at"):      # acked -> armed but quiet
-        lines.append(f"⚠ needs attention since {d['attention_at']}  (rung {d.get('paged_level') or 0})")
+        lines.append(f"⚠ needs attention since {d['attention_at']}")
     return "\n".join(lines)
 
 

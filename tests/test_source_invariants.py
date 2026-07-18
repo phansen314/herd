@@ -22,6 +22,16 @@ def test_dead_kitty_reconcile_statements_gone(dead):
     assert dead not in W
 
 
+def test_pager_actuator_stays_deleted():
+    """herd owns no actuator, so attention is binary: armed or acked. The escalation
+    surface (W6b_paged, paged_at, paged_level) was schema and SQL with no caller for
+    a feature with no owner — it must not creep back. See DECISIONS.md."""
+    assert "W6b_paged" not in W
+    assert not re.search(r"\bpaged_(at|level)\b", _code(HERD)), "paged_* back in the schema"
+    assert not re.search(r"\bpaged_(at|level)\b",
+                         "\n".join(_code(s) for s in W.values())), "paged_* back in a statement"
+
+
 # ── A. tier boundary (text) ──────────────────────────────────────────────────
 def _code(text):
     return "\n".join(l.split("--")[0] for l in text.splitlines()).lower()

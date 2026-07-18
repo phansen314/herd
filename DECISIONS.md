@@ -8,13 +8,51 @@ Read this when you're about to "simplify" something and want to know whether
 someone already did and reverted it. Each entry ends with **Protects:** — the
 current behaviour that would break if the decision were undone.
 
-**By topic:** [attention/ack](#ack) · [reaper robustness](#ps-floor) ·
+**By topic:** [the pager](#pager) · [attention/ack](#ack) · [reaper robustness](#ps-floor) ·
 [spawn TOCTOU](#toctou) · [the events table](#events) · [statement
 transcription](#transcription) · [ctrl-q](#expect) · [the poker](#poker) ·
 [pid ancestry](#spike1) · [the `live` column](#live-column) · [two clocks](#clocks) ·
 [HERD_RUNTIME](#runtime) · [awk vs bash](#awk) · [kitty match semantics](#kitty-match)
 
 ---
+
+## 2026-07-18 — No Claude-invoked pager; the escalation stub is deleted {#pager}
+
+Considered giving herd a pager Claude could invoke — a CLI verb plus a skill, so a
+session could raise itself deliberately instead of waiting for the derived `!`.
+Rejected, along with the softer `herd say "<reason>"` variant that would have
+attached a reason string rather than a notification.
+
+**Rejected — redundant.** Claude already signals "done/blocked" by ending its turn:
+`stop.sh` → `waiting` → terminal bell → `!` one threshold later. A command Claude
+calls immediately before stopping fires seconds earlier carrying the same fact.
+
+**Rejected — blind to the only real gap.** The one case ambient attention misses is
+a session gone silently stuck in `working`. But a stuck session is stuck *inside a
+tool call*; it is not deciding whether to invoke a CLI. Self-report cannot cover the
+failure mode in which self-report is what broke. That case needs a daemon-side
+actuator or nothing.
+
+**Rejected — unreliable, therefore corrosive** (the decisive one). Claude would call
+it only sometimes. A signal that is only sometimes emitted destroys the meaning of
+its own absence: with ten sessions listed, you could no longer read a quiet row as
+"nothing to report" rather than "didn't bother". That degrades the derived `!` sitting
+next to it. Derived signals have no such failure mode — the daemon ticks every 2s
+regardless of what Claude feels like doing.
+
+**Decided:** sessions stay *observed*, never participants. Nothing Claude does
+reaches herd except through the five hooks, and attention stays derived-only.
+
+That settles the question `paged_at` / `paged_level` / `W6b_paged` were holding open.
+They were schema and SQL with no production caller — `paged_level` was structurally
+always `0`, so the preview could only ever print `(rung 0)` — kept warm for an
+actuator that is now decided against. Deleted, same as the write-only events table
+([#events](#events)). If a daemon-side notifier is ever built it brings its own
+columns; keeping dead ones warm bought nothing but a misleading render.
+
+**Protects:** attention being a binary armed/acked signal, the absence of any
+session→herd channel, and `test_pager_actuator_stays_deleted` in
+`tests/test_source_invariants.py`.
 
 ## 2026-07-18 — Ack is a timer restart, not a delete {#ack}
 

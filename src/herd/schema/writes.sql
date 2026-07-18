@@ -218,13 +218,12 @@ WHERE id = (SELECT h.session_pk FROM herd_sessions h
 -- action/edge persists here. See DESIGN.md#attention.
 -- W6a: arm — the rule tripped. COALESCE preserves the edge across ticks.
 -- :name W6a_arm
-INSERT INTO herd_attention(session_pk, attention_at, paged_level)
-VALUES(:pk, :now, 0)
+INSERT INTO herd_attention(session_pk, attention_at)
+VALUES(:pk, :now)
 ON CONFLICT(session_pk) DO UPDATE SET attention_at = COALESCE(attention_at, :now);
 
--- W6b: page fired — record action + rung.
--- :name W6b_paged
-UPDATE herd_attention SET paged_at = :now, paged_level = :level WHERE session_pk = :pk;
+-- (no W6b: there is no page action to record. herd owns no actuator, so the
+-- signal is binary — armed or acked. See DECISIONS.md.)
 
 -- W6c: ack (implicit focus / explicit dismiss). The attention_at<=focus_started_at
 -- guard closes a race where a NEW attention raised mid-jump would be acked unseen.
@@ -272,7 +271,7 @@ SELECT s.id, s.session_id, s.pid, s.cwd, s.status, s.status_source, s.model, s.s
        s.last_event_at, s.last_event_type, s.started_at, s.updated_at,
        h.job_name, h.kitty_socket, h.window_id,
        h.herd_var, h.source, h.verified_at,
-       a.attention_at, a.paged_at, a.paged_level, a.ack_at
+       a.attention_at, a.ack_at
 FROM sessions s
 LEFT JOIN herd_sessions  h ON h.session_pk = s.id
 LEFT JOIN herd_attention a ON a.session_pk = s.id
