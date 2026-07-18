@@ -32,17 +32,23 @@ def _run(hook_env, script, payload, env=None):
 
 
 def test_parallel_hot_path_hooks_all_land(hook_env):
-    """25 concurrent post_tool_use writers: every one exits 0 and every event is
-    durable. A lost write here would silently corrupt the activity clock."""
+    """25 concurrent post_tool_use writers, one per DISTINCT session: every one
+    exits 0 and every write is durable. Distinct sessions (not one) so a lost write
+    is countable — 25 UPDATEs to a single row collapse and hide a loss; they still
+    serialize on the one DB write lock, so busy_timeout/WAL stay under test."""
     c = hook_env.conn()
-    pk = mk_session(c, session_id="s1", cwd="/code/herd")
     n = 25
+    for i in range(n):
+        mk_session(c, session_id=f"s{i}", cwd="/code/herd", last_event_at=T0)
+    pay = lambda i: {"session_id": f"s{i}", "tool_name": "Bash", "tool_input": {},
+                     "tool_response": "ok", "hook_event_name": "PostToolUse"}
     with ThreadPoolExecutor(max_workers=n) as ex:
         results = list(ex.map(
-            lambda _: _run(hook_env, "post_tool_use.sh", PAY, NO_THROTTLE), range(n)))
+            lambda i: _run(hook_env, "post_tool_use.sh", pay(i), NO_THROTTLE), range(n)))
     assert [r.returncode for r in results] == [0] * n
-    got = c.execute("SELECT COUNT(*) FROM events WHERE session_pk=?", (pk,)).fetchone()[0]
-    assert got == n, f"expected {n} events, got {got} — a concurrent write was lost"
+    landed = c.execute("SELECT COUNT(*) FROM sessions WHERE last_event_at IS NOT ?",
+                       (T0,)).fetchone()[0]
+    assert landed == n, f"only {landed}/{n} writes landed — a concurrent write was lost"
 
 
 def test_parallel_mixed_hooks_do_not_corrupt_status(hook_env):
@@ -62,7 +68,7 @@ def test_hook_waits_out_a_held_write_lock(hook_env):
     """busy_timeout=3000 in db(): a hook must WAIT for a lock held briefly (the
     daemon mid-tick), not fail. Held ~0.5s, well inside the timeout."""
     c = hook_env.conn()
-    pk = mk_session(c, session_id="s1", cwd="/code/herd")
+    mk_session(c, session_id="s1", cwd="/code/herd", last_event_at=T0)
     released = threading.Event()
     holding = threading.Event()
 
@@ -84,8 +90,8 @@ def test_hook_waits_out_a_held_write_lock(hook_env):
     t.join()
     assert released.is_set()
     assert r.returncode == 0
-    assert c.execute("SELECT COUNT(*) FROM events WHERE session_pk=?",
-                     (pk,)).fetchone()[0] == 1, "the hook gave up instead of waiting"
+    assert c.execute("SELECT last_event_at FROM sessions WHERE session_id='s1'").fetchone()[0] != T0, \
+        "the hook gave up instead of waiting"
 
 
 def test_hook_exits_zero_even_when_the_lock_outlasts_the_timeout(hook_env):

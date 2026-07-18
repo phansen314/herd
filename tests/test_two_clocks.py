@@ -24,6 +24,4 @@ def test_last_event_advances_on_repeated_same_status(fresh):
     mk_session(c, session_id="s1", last_event_at=T0, last_event_type="tool")
     for t in ("2026-07-15T10:01:00.000Z", "2026-07-15T10:02:00.000Z", T1):
         c.execute(W["W4_event"], {"status": "working", "now": t, "etype": "tool", "session_id": "s1"})
-        c.execute(W["W4_event_log"], {"etype": "tool", "now": t, "raw": None, "session_id": "s1"})
     assert c.execute("SELECT last_event_at FROM sessions WHERE session_id='s1'").fetchone()[0] == T1
-    assert c.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 3   # events + sessions agree

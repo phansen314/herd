@@ -187,7 +187,7 @@ WHERE s.stopped_at IS NULL
 ORDER BY a.attention_at IS NULL, a.attention_at, s.started_at DESC;"
 ```
 
-The schema is split in two tiers — `sessions`/`events` are facts that would be true
+The schema is split in two tiers — `sessions` holds facts that would be true
 whether or not herd existed; `herd_sessions`/`herd_attention` are herd's own
 relationship to a session. Read tier 1 and you can ignore that herd exists at all.
 (Rationale: [DESIGN.md](DESIGN.md#tiers).)

@@ -25,10 +25,10 @@ if [ -f "$TFILE" ]; then
     esac
 fi
 
-# raw_json NULL by contract (fires per tool call). status + event in ONE txn.
+# advance the activity clock — the single lifecycle write (no events log).
 export HERD_P_session_id="$SID" HERD_P_now="$NOW_ISO" \
-       HERD_P_status="working" HERD_P_etype="tool" HERD_P_raw=""
-run_tx W4_event W4_event_log >/dev/null 2>&1
+       HERD_P_status="working" HERD_P_etype="tool"
+run W4_event >/dev/null 2>&1
 
 # tempfile+rename: a torn write must not leave a partial epoch for the next tick.
 printf '%s\n' "$NOW_EPOCH" > "$TFILE.tmp.$$" 2>/dev/null && mv -f "$TFILE.tmp.$$" "$TFILE" 2>/dev/null

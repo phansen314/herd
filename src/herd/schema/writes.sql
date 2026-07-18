@@ -34,7 +34,7 @@ UPDATE herd_sessions SET window_id = :win, verified_at = :now WHERE session_pk =
 -- W1c: the launch FAILED — drop the reservation so the job name frees immediately.
 -- DELETE, not stopped_at: this session never existed, so it must not appear in
 -- history. sessions.id is AUTOINCREMENT precisely so a real DELETE never causes
--- surrogate reuse; herd_sessions/events fall away via ON DELETE CASCADE.
+-- surrogate reuse; the herd_sessions row falls away via ON DELETE CASCADE.
 -- :name W1_spawn_abort
 DELETE FROM sessions WHERE id = :pk;
 
@@ -127,10 +127,12 @@ UPDATE sessions SET status = 'stopped', status_source = 'pid',
 WHERE stopped_at IS NULL AND started_at < :boot_time;
 
 
--- ── W4. LIFECYCLE HOOKS. Status + last_event_* in the SAME statement as the
--- event insert. NO `AND status IS NOT :status` GUARD, EVER — it freezes
--- last_event_at on the hot path (post_tool_use always 'working'), making a busy
--- session read silent and paging you about it. See DESIGN.md#two-clocks.
+-- ── W4. LIFECYCLE HOOKS. The single lifecycle write: status + last_event_* on
+-- one row. NO `AND status IS NOT :status` GUARD, EVER — it freezes last_event_at
+-- on the hot path (post_tool_use always 'working'), making a busy session read
+-- silent and paging you about it. sessions.last_event_at is the ONLY event signal
+-- anything reads — there is no second (events-log) write to keep in sync anymore.
+-- See DESIGN.md#two-clocks.
 -- :name W4_event
 UPDATE sessions
 SET status          = :status,
@@ -139,10 +141,6 @@ SET status          = :status,
     last_event_type = :etype,
     updated_at      = :now
 WHERE session_id = :session_id;
--- :name W4_event_log
-INSERT INTO events(session_pk, event_type, source, timestamp, raw_json)
-SELECT id, :etype, 'hook', :now, :raw FROM sessions WHERE session_id = :session_id;
--- post_tool_use.sh passes :raw = NULL — it fires per tool call.
 
 -- W4b: SESSION END — the only hook-driven death. status_source='hook' (it KNOWS,
 -- vs W3d's inference). session_end.sh MUST be registered BLOCKING.

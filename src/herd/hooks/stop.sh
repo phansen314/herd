@@ -12,9 +12,9 @@ SID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
 valid_sid "$SID" || exit 0
 now_pair
 
-# status -> waiting, log the event, and RE-ARM attention (W6d clears any silence
-# so the rule may trip fresh) — all in ONE txn. See DESIGN.md#attention.
+# status -> waiting and RE-ARM attention (W6d clears any silence so the rule may
+# trip fresh) — both in ONE txn. See DESIGN.md#attention.
 export HERD_P_session_id="$SID" HERD_P_now="$NOW_ISO" \
-       HERD_P_status="waiting" HERD_P_etype="stop" HERD_P_raw=""
-run_tx W4_event W4_event_log W6d_rearm_sid >/dev/null 2>&1
+       HERD_P_status="waiting" HERD_P_etype="stop"
+run_tx W4_event W6d_rearm_sid >/dev/null 2>&1
 exit 0

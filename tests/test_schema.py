@@ -9,7 +9,7 @@ def test_four_tables(fresh):
     c = fresh()
     tabs = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table' "
                                     "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
-    assert tabs == ['events', 'herd_attention', 'herd_sessions', 'sessions']
+    assert tabs == ['herd_attention', 'herd_sessions', 'sessions']
 
 
 def test_wal_mode(fresh):
@@ -38,11 +38,9 @@ def test_tier1_applies_standalone(fresh):
     c = fresh(tier2=False)
     t = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table' "
                                  "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
-    assert t == ['events', 'sessions']
+    assert t == ['sessions']
     pk = c.execute("INSERT INTO sessions(cwd,started_at,updated_at) VALUES('/a',?,?)",
                    (T0, T0)).lastrowid
-    c.execute("INSERT INTO events(session_pk,event_type,source,timestamp) "
-              "VALUES(?,'start','hook',?)", (pk, T0))
     c.execute("UPDATE sessions SET stopped_at=? WHERE id=?", (T1, pk))   # no trigger to fire
 
 

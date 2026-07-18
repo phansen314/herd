@@ -12,10 +12,9 @@ SID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
 valid_sid "$SID" || exit 0
 now_pair
 
-# Event log + death in ONE txn. Log first so the trail stays honest if W4_end
-# ever changes to delete the row. stopped_at frees the window/job via the JOIN.
-export HERD_P_session_id="$SID" HERD_P_now="$NOW_ISO" HERD_P_etype="end" HERD_P_raw=""
-run_tx W4_event_log W4_end >/dev/null 2>&1
+# Mark the death. stopped_at frees the window/job via the liveness JOIN.
+export HERD_P_session_id="$SID" HERD_P_now="$NOW_ISO"
+run W4_end >/dev/null 2>&1
 
 rm -f "$HERD_RUNTIME/herd-tool-$SID" 2>/dev/null
 exit 0

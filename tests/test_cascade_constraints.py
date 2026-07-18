@@ -7,15 +7,14 @@ import pytest
 from helpers import T0, T1, mk_session, mk_herd, mk_attention
 
 
-def test_cascade_cleans_tier2_and_events(fresh):
+def test_cascade_cleans_tier2(fresh):
     c = fresh()
     pk = mk_session(c, cwd="/a")
     mk_herd(c, pk, job_name="j", created_at=T0, kitty_socket="unix:/tmp/k1", window_id=7)
     mk_attention(c, pk, attention_at=T0)
-    c.execute("INSERT INTO events(session_pk,event_type,source,timestamp) VALUES(?,'start','hook',?)", (pk, T0))
     c.execute("DELETE FROM sessions WHERE id=?", (pk,))
     orph = {t: c.execute(f"SELECT COUNT(*) FROM {t} WHERE session_pk=?", (pk,)).fetchone()[0]
-            for t in ("herd_sessions", "herd_attention", "events")}
+            for t in ("herd_sessions", "herd_attention")}
     assert sum(orph.values()) == 0
 
 

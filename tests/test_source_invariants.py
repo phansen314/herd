@@ -48,10 +48,10 @@ def test_no_live_denormalization_column():
 
 
 def test_core_writers_take_no_tier2_value():
-    """In every sessions/events writer, the value region (before the first WHERE)
-    must not reference a herd_ table. Routing (WHERE + subqueries) may."""
+    """In every sessions writer, the value region (before the first WHERE) must not
+    reference a herd_ table. Routing (WHERE + subqueries) may."""
     core_writers = [n for n, s in W.items()
-                    if re.search(r"\b(INSERT\s+INTO|UPDATE)\s+(sessions|events)\b",
+                    if re.search(r"\b(INSERT\s+INTO|UPDATE)\s+sessions\b",
                                  _code(s), re.I)]
     assert core_writers, "expected some core writers"
     leaks = []

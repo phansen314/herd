@@ -77,12 +77,18 @@ def test_post_tool_use_advances_last_event(hook_env):
 def test_post_tool_use_throttle_keeps_first_write(hook_env):
     c = hook_env.conn()
     mk_session(c, session_id="s2", last_event_at=T0, last_event_type="tool")
-    for _ in range(5):
-        hook_env.run("post_tool_use.sh",
-                     {"session_id": "s2", "tool_name": "Bash", "tool_input": {}, "tool_response": "ok",
-                      "hook_event_name": "PostToolUse"}, {"HERD_TOOL_THROTTLE": "60"})
-    assert c.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
-    assert c.execute("SELECT last_event_at FROM sessions WHERE session_id='s2'").fetchone()[0] != T0
+    fire = lambda: hook_env.run(
+        "post_tool_use.sh",
+        {"session_id": "s2", "tool_name": "Bash", "tool_input": {}, "tool_response": "ok",
+         "hook_event_name": "PostToolUse"}, {"HERD_TOOL_THROTTLE": "60"})
+    fire()
+    first = c.execute("SELECT last_event_at FROM sessions WHERE session_id='s2'").fetchone()[0]
+    assert first != T0                       # the first fire wrote
+    for _ in range(4):
+        fire()
+    # the next 4 fires are inside the throttle window -> they must NOT write, so
+    # last_event_at never advances past the first fire's timestamp.
+    assert c.execute("SELECT last_event_at FROM sessions WHERE session_id='s2'").fetchone()[0] == first
 
 
 # ── 51/52/53. stop / notification / session_end ──────────────────────────────
@@ -155,7 +161,7 @@ def test_run_tx_aborts_on_unknown_statement(hook_env):
     subprocess.run(
         ["bash", "-c",
          '. "$1/common.sh"; export HERD_P_session_id=s1 HERD_P_now=T9 HERD_P_status=working '
-         'HERD_P_etype=tool HERD_P_raw=""; run_tx W4_event BOGUS_FK', "_", str(HOOKS.parent)],
+         'HERD_P_etype=tool; run_tx W4_event BOGUS_FK', "_", str(HOOKS.parent)],
         capture_output=True, text=True,
         env=dict(os.environ, HERD_DB=hook_env.path, HERD_RUNTIME=hook_env.runtime,
                  HERD_ERRLOG=f"{hook_env.runtime}/err.log"))
@@ -165,16 +171,18 @@ def test_run_tx_aborts_on_unknown_statement(hook_env):
 def test_bail_rolls_back_committed_prefix(hook_env):
     c = hook_env.conn()
     mk_session(c, session_id="s1", last_event_at=T0)
+    # a valid UPDATE then a statement that fails (FK: no session 99999). -bail must
+    # stop before COMMIT so the UPDATE rolls back too.
     tx = ("BEGIN IMMEDIATE;\n"
           "UPDATE sessions SET last_event_at='T9' WHERE session_id='s1';\n"
-          "INSERT INTO events(session_pk,event_type,source,timestamp) VALUES(99999,'x','hook','T9');\n"
+          "INSERT INTO herd_attention(session_pk,attention_at) VALUES(99999,'T9');\n"
           "COMMIT;\n")
     subprocess.run(["bash", "-c", f'. "{HOOKS}/common.sh"; db', "_"], input=tx,
                    capture_output=True, text=True,
                    env=dict(os.environ, HERD_DB=hook_env.path, HERD_RUNTIME=hook_env.runtime,
                             HERD_ERRLOG=f"{hook_env.runtime}/err.log"))
     assert c.execute("SELECT last_event_at FROM sessions WHERE session_id='s1'").fetchone()[0] == T0
-    assert c.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM herd_attention").fetchone()[0] == 0
 
 
 # ── session_start.sh: the third branch, and the pid capture ──────────────────

@@ -43,7 +43,6 @@ if [ "$ADOPTED" != "1" ]; then
         run W2b_insert >/dev/null 2>&1
     fi
 fi
-
-export HERD_P_etype="start" HERD_P_raw=""
-run W4_event_log >/dev/null 2>&1
+# W2/W2b already set status='working' and last_event_type='start' — nothing else
+# to record (the events log is gone).
 exit 0

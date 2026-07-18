@@ -15,7 +15,7 @@ Source of truth for behaviour is `schema/writes.sql` (the write paths) and
 
 The schema splits along a strict, one-way boundary:
 
-- **Tier 1 — `sessions`, `events`** (`schema/core.sql`): facts that would be
+- **Tier 1 — `sessions`** (`schema/core.sql`): facts that would be
   true whether or not herd existed — a Claude process with this pid, cwd,
   status. `core.sql` may **never** mention `herd_*`. Enforced by `the test suite`
   (check A scans comment-stripped DDL; another check applies `core.sql`
@@ -76,11 +76,14 @@ Two mirrored failure modes, both fatal:
    about a *busy* session. **Any suppressor must gate on nothing that carries a
    clock.** This is why `W4_event` has no status guard.
 
-`events` is append-only and **nothing reads it** (the TUI reads
-`sessions.last_event_at`; `MAX(timestamp)` per session per tick over an unbounded
-table is a cost we don't pay). Because nothing reads it, it can't corroborate
-`last_event_at`: any guard on the lifecycle `UPDATE` must apply identically to
-the `events` `INSERT`, or to neither.
+There is **one** lifecycle write — `W4_event` on `sessions`. herd used to also
+append every event to an `events` table, but nothing read it (the signal is
+`sessions.last_event_at`), so it was write-only clutter — removed. Its removal
+also killed a hazard: with two writes, a guard on one and not the other would let
+`events` and `sessions` silently disagree, and only `sessions` is read. One write,
+one source of truth: the only rule left is that `W4_event` must not freeze
+`last_event_at` (no status guard). Historical/analytics needs are served ad-hoc by
+parsing the per-session JSONL transcript (`sessions.transcript_path`).
 
 ### Liveness = `sessions.stopped_at`, from `ps`, one source {#liveness}
 
@@ -150,7 +153,7 @@ Inline comments inside a statement must not contain `;` (both parsers cut there;
 | `W2b_placement` | Tier-2 half of the W2b fallback: record the kitty window the hook stands in, so a user-started `claude` is a first-class tracked session. Only writer of `source='hook'`. pk via `SELECT session_id`, not `last_insert_rowid()` (which returns the INSERTed, not the ON-CONFLICT-updated, row). |
 | `W3d_reap` | Reaper: mark one session stopped whose pid the daemon found dead. `status_source='pid'` (inferred). |
 | `W3e_boot_sweep` | Boot sweep (see [pid](#pid)). |
-| `W4_event` / `W4_event_log` | Lifecycle: status + `last_event_*` in one statement, plus the append-only event. **No status guard** (see [two clocks](#two-clocks)). |
+| `W4_event` | Lifecycle: status + `last_event_*` in one statement — the single lifecycle write. **No status guard** (see [two clocks](#two-clocks)). |
 | `W4_end` | The only hook-driven death (`status_source='hook'` — it *knows*, vs W3d's inference). |
 | `W5_statusline` | The sink for **every** field the statusLine payload carries — metrics, plus `claude_code_version`, `output_style`, `git_worktree`, `original_cwd` — and `git_branch`, which the hook derives from its own `.git` walk. Nothing else writes these; a field absent from this statement is a column that stays NULL forever (`api_duration_ms` shipped that way: parsed, rendered, never bound). UPDATE only (never creates a row — would resurrect stopped sessions / invent empty cwd). Never touches `last_event_*`. Resets_at arrives as unix epoch, converted to ISO in SQLite (zero date forks); `COALESCE` keeps prior value on NULL. The `prev_cost` pair (burn-rate delta, resampled >300s) is correct as written: an UPDATE's RHS sees the OLD row, so `prev_cost_usd` captures the previous total before this statement overwrites it. |
 | `W5b_adopt` | Statusline adoption ("Path C"): statusline is a child of claude, inherits `KITTY_*` like a hook, so a reconciled session picks up metrics with no hooks wired. Same liveness JOIN as W2. |
@@ -224,8 +227,9 @@ hook guards: `__d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."`
   travel via the environment, so no shell quoting is involved. Empty value →
   `NULL`; unknown param → hard failure (nonzero exit), never a silent NULL.
 - **`run_tx`** wraps N statements in one `BEGIN IMMEDIATE ... COMMIT`, one fork,
-  one WAL commit — halves sqlite3 spawns on the hot path and makes an event + its
-  status change atomic. `BEGIN IMMEDIATE`, never plain `BEGIN`: a deferred txn
+  one WAL commit — its live use is `stop.sh` landing the status change (`W4_event`)
+  and the attention re-arm (`W6d_rearm_sid`) atomically. `BEGIN IMMEDIATE`, never
+  plain `BEGIN`: a deferred txn
   upgrades to a write lock lazily and can throw `SQLITE_BUSY_SNAPSHOT` which the
   busy timeout cannot retry away. All binding happens before any SQL runs, so an
   unbound param aborts with nothing executed.
@@ -246,7 +250,7 @@ hook guards: `__d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."`
   (must advance `last_event_at` or a busy session reads silent), so it
   **throttles** instead: one write per `HERD_TOOL_THROTTLE` (2s) window via a
   tmpfile epoch. The silence rule works in minutes, so 2s of staleness is
-  invisible. `raw_json` is NULL by contract (events table is unbounded).
+  invisible.
 - **`stop.sh`** — the `waiting` signal (turn ended). Also `W6d_rearm_sid` in the
   same txn: a new semantic event clears the attention row so the rule may trip
   fresh — this is what makes ack mean "I've seen *this* silence", not "never

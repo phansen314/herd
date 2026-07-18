@@ -89,23 +89,3 @@ CREATE INDEX IF NOT EXISTS idx_sessions_live
 
 CREATE INDEX IF NOT EXISTS idx_sessions_unadopted
     ON sessions(pid) WHERE session_id IS NULL AND stopped_at IS NULL;
-
-
--- ── EVENTS — append-only forensic trail. NOTHING reads it (the hot-path signal
--- is sessions.last_event_at). So it can't corroborate last_event_at: any guard
--- on the lifecycle UPDATE must apply identically to this INSERT, or to neither.
--- See DESIGN.md#two-clocks.
-CREATE TABLE IF NOT EXISTS events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_pk  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    event_type  TEXT NOT NULL,
-    source      TEXT NOT NULL,
-    timestamp   TEXT NOT NULL,
-    -- RESERVED, and NULL in every row today: every hook passes HERD_P_raw="".
-    -- The rule if it is ever populated: lifecycle events only, NEVER post_tool_use
-    -- (fires per tool call — storing payloads there would bloat the hot path).
-    raw_json    TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_events_session
-    ON events(session_pk, timestamp);
