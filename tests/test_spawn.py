@@ -157,3 +157,22 @@ def test_cmd_spawn_launch_type(monkeypatch, fresh, argv, want):
 def test_cmd_spawn_tab_and_pane_conflict(monkeypatch, fresh):
     _capture_spawn(monkeypatch)
     assert cli.cmd_spawn(fresh(), ["api", "--tab", "--pane"]) == 2   # usage error
+
+
+def test_a_raising_launcher_frees_the_job_name(fresh):
+    """subprocess.run raises FileNotFoundError when `kitten` is not on PATH. Letting
+    that propagate skipped the abort and left a pid-NULL reservation the reaper's
+    pid predicate never revisits — R_job_live counted it live, so the name was
+    burned until the next boot sweep."""
+    c = fresh()
+
+    def boom(spec, sock):
+        raise FileNotFoundError(2, "No such file or directory", "kitten")
+
+    ok, msg, pk = spawn(c, _spec(job="api"), SOCK, T0, launch_fn=boom)
+    assert not ok and pk is None
+    assert "kitten" in msg                       # the real cause reaches the user
+    assert c.execute("SELECT COUNT(*) n FROM sessions").fetchone()["n"] == 0
+    assert job_holder(c, "api") is None
+    ok2, _, _ = spawn(c, _spec(job="api"), SOCK, T0, launch_fn=lambda s, k: 42)
+    assert ok2                                   # the name is immediately reusable

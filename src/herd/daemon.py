@@ -39,6 +39,11 @@ ATTENTION_SECS = {
 }
 
 
+# Grace before a pid-NULL spawn reservation is swept as stranded. Must comfortably
+# exceed a kitty launch round trip + claude's startup to its first hook.
+STRANDED_SECS = int(os.environ.get("HERD_STRANDED_SECS", "120"))
+
+
 def _attention_enabled():
     """Gate the tier-2 attention tick. Default on; HERD_ATTENTION=0/false/no/off
     -> core-only (reaper runs, herd_attention untouched). See DESIGN.md#tiers."""
@@ -136,6 +141,20 @@ def reap_once(conn, procs, now):
     return reaped
 
 
+def sweep_stranded(conn, now, max_age=None):
+    """Drop spawn reservations that never became a session. reap_once cannot: its
+    pid predicate skips them by design, so without this they hold their job_name
+    live until the next boot sweep. Independent of `ps` — nothing to check, the row
+    names no process. Returns count."""
+    age = STRANDED_SECS if max_age is None else max_age
+    at = _epoch(now)
+    if at is None:
+        return 0
+    cutoff = (datetime.datetime.fromtimestamp(at - age, datetime.timezone.utc)
+              .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
+    return conn.execute(W["W3f_sweep_stranded"], {"cutoff": cutoff}).rowcount
+
+
 def boot_sweep(conn, now, boot_time):
     """Run ONCE at startup: reap live rows whose started_at precedes system boot
     (recycled pids could read dead sessions as alive). No-op when boot_time None."""
@@ -229,6 +248,7 @@ def run(interval=2.0, db_path=None, once=False, attend=None):
         procs = read_proc_table()
         if procs is not None:                         # tier 1 — always, unless ps
             reap_once(conn, procs, now)               # is untrustworthy this tick
+        sweep_stranded(conn, now)                     # tier 1 — needs no proc table
         if attend:
             attention_tick(conn, now)                 # tier 2 — herd's opinion
         if once:

@@ -101,14 +101,23 @@ def spawn(conn, spec, socket, now, *, launch_fn=None):
         return False, f"could not reserve the job {spec.job!r}: {e}", None
 
     # ── phase 2: launch, then stamp the placement onto the reservation ──
-    win = launch_fn(spec, socket)
+    # A RAISING launcher must be treated exactly like a failed one. subprocess.run
+    # raises FileNotFoundError when kitten isn't on PATH (and OSError under a fork
+    # limit); letting that propagate skips the abort below and strands the
+    # reservation as a pid-NULL row the reaper's pid predicate never revisits, so
+    # the job name stays burned until the next boot sweep.
+    try:
+        win, err = launch_fn(spec, socket), None
+    except Exception as e:                       # noqa: BLE001 — degrade, never crash the CLI
+        win, err = None, e
     if win is None:
         # drop the reservation, or the name stays taken by a session that never was
         try:
             conn.execute(W["W1_spawn_abort"], {"pk": pk})
         except Exception:                        # noqa: BLE001
             pass
-        return False, "kitty launch failed (remote control off, or bad socket?)", None
+        why = f": {err}" if err is not None else " (remote control off, or bad socket?)"
+        return False, f"kitty launch failed{why}", None
 
     try:
         conn.execute(W["W1_spawn_window"], {"pk": pk, "win": win, "now": now})

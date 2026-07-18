@@ -120,6 +120,19 @@ UPDATE sessions SET status = 'stopped', status_source = 'pid',
                     stopped_at = :now, updated_at = :now
 WHERE id = :pk AND stopped_at IS NULL;
 
+-- W3f: STRANDED RESERVATION SWEEP. A phase-1 spawn reservation whose claude never
+-- reached SessionStart: the launcher raised, claude died before its first hook, or
+-- the W5b adoption lost the session_id race. Such a row is pid NULL + session_id
+-- NULL, so W3d skips it forever (pid IS NOT NULL) while R_job_live still counts it
+-- live — the job name stays burned until W3e's next boot sweep. Age-gated because a
+-- reservation is legitimately pid-NULL for the span of the launch round trip.
+-- DELETE, not stopped_at, for W1_spawn_abort's reason: this session never existed,
+-- so it must not appear in history. CASCADE takes the herd_ rows.
+-- :name W3f_sweep_stranded
+DELETE FROM sessions
+WHERE stopped_at IS NULL AND pid IS NULL AND session_id IS NULL
+  AND started_at < :cutoff;
+
 -- W3e: BOOT SWEEP (once at startup). After a reboot, pids may be recycled, so
 -- W3d's liveness check can read a dead session as alive. See DESIGN.md#pid.
 -- :name W3e_boot_sweep

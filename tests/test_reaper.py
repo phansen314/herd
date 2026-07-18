@@ -116,3 +116,40 @@ def test_broken_ps_reaps_nothing(fresh, monkeypatch):
     if procs is not None:                     # mirrors run()'s guard
         reap_once(c, procs, T2)
     assert stopped_at(c, k) is None
+
+
+# ── W3f: stranded spawn reservations ────────────────────────────────────────
+# reap_once cannot touch these (pid IS NOT NULL by design), but R_job_live counts
+# them live, so without the sweep a job name stays burned until the next reboot.
+def _reservation(c, job, when=T0):
+    from herd.spawn import W
+    pk = c.execute(W["W1_spawn_session"], {"cwd": "/tmp", "now": when}).lastrowid
+    c.execute(W["W1_spawn_herd"], {"pk": pk, "job": job, "now": when, "socket": "unix:/x"})
+    return pk
+
+
+def test_sweep_drops_a_reservation_that_never_became_a_session(fresh):
+    c = fresh()
+    pk = _reservation(c, "ghost")
+    assert daemon.sweep_stranded(c, T2, max_age=60) == 1
+    assert c.execute("SELECT COUNT(*) n FROM sessions WHERE id=?", (pk,)).fetchone()["n"] == 0
+    assert c.execute("SELECT COUNT(*) n FROM herd_sessions").fetchone()["n"] == 0   # CASCADE
+
+
+def test_sweep_spares_a_reservation_still_mid_launch(fresh):
+    """A reservation is legitimately pid-NULL for the span of the kitty round trip —
+    sweeping it would kill a spawn that is about to succeed."""
+    c = fresh()
+    _reservation(c, "launching", when=T1)                    # 5 min before T2
+    assert daemon.sweep_stranded(c, T2, max_age=600) == 0     # grace not yet spent
+    assert stopped_at(c, 1) is None
+
+
+def test_sweep_never_touches_an_adopted_session(fresh):
+    """Only spawn reservations are pid-NULL AND session_id-NULL. A row a hook has
+    adopted must survive regardless of age."""
+    c = fresh()
+    live = mk_session(c, session_id="adopted", pid=4242, started_at=T0)
+    nopid = mk_session(c, session_id="hook-row-no-pid", started_at=T0)
+    assert daemon.sweep_stranded(c, T2, max_age=60) == 0
+    assert stopped_at(c, live) is None and stopped_at(c, nopid) is None

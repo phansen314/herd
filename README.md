@@ -245,6 +245,7 @@ not a dismissal. See [DESIGN.md#ack](DESIGN.md#ack).
 | `HERD_WAIT_SECS` | `30` | grace before a `waiting` session needs you |
 | `HERD_APPROVAL_SECS` | `15` | grace before a `needs_approval` prompt does |
 | `HERD_STUCK_SECS` | `300` | silence before a `working` session reads as stuck |
+| `HERD_STRANDED_SECS` | `120` | grace before a spawn reservation whose session never started is dropped |
 | `HERD_DB` | `~/.herd/herd.db` | database path |
 
 Read by the hooks and CLI rather than the daemon:
