@@ -8,6 +8,7 @@ escaping (DESIGN.md#write-paths-schemawritessql justifies the hand-rolled binder
 example) and valid_sid()'s path-escape rejection.
 """
 import json
+import pathlib
 import os
 import subprocess
 
@@ -147,3 +148,26 @@ def test_valid_sid_rejects_path_escapes_and_shell_metacharacters(sid):
     """The SID becomes a cache filename under $HERD_RUNTIME. Anything that can
     traverse or inject must be refused before it reaches the path."""
     assert not _valid_sid(sid)
+
+
+@pytest.mark.parametrize("script", ALL_HOOKS)
+def test_a_broken_jq_is_logged_not_merely_survived(hook_env, script, tmp_path):
+    """Exiting 0 is only half the contract. A hook that parses no session_id writes
+    nothing and stays quiet — correct, the payload wasn't ours — and a MISSING jq
+    produced the identical outcome: exit 0, nothing written, empty HERD_ERRLOG.
+    That is the file README's troubleshooting sends you to first, so herd recorded
+    nothing forever with no way to find out why."""
+    r = _run(hook_env, script, json.dumps(GOOD), env=_stub_bin(tmp_path, "jq"))
+    assert r.returncode == 0                          # still never blocks Claude
+    log = pathlib.Path(hook_env.runtime, "err.log")
+    assert log.exists(), f"{script} left no trace of a missing jq"
+    assert "jq NOT FOUND" in log.read_text()
+
+
+@pytest.mark.parametrize("script", ALL_HOOKS)
+def test_a_payload_without_a_session_id_stays_quiet(hook_env, script):
+    """The other side: not every payload is ours, and a hook that logged on every
+    one would bury the signal it exists to provide."""
+    _run(hook_env, script, json.dumps({"cwd": "/x"}))
+    log = pathlib.Path(hook_env.runtime, "err.log")
+    assert not log.exists() or "jq" not in log.read_text()

@@ -11,7 +11,7 @@ __d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."
 HERD_TOOL_THROTTLE="${HERD_TOOL_THROTTLE:-2}"
 
 INPUT=$(cat)
-SID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
+SID=$(jq_in -r '.session_id // empty')
 valid_sid "$SID" || exit 0
 
 now_pair    # one fork, gives ISO + epoch; the throttle needs epoch

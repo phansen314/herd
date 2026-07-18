@@ -39,6 +39,32 @@ herd_log() {
     printf '%s\t%s\t%s\n' "${NOW_ISO:-?}" "${0##*/}" "$*" >> "$HERD_ERRLOG" 2>/dev/null
 }
 
+# ── payload parsing ───────────────────────────────────────────────────────
+# jq_in <jq args...> — filter $INPUT, and LOG when jq itself fails.
+#
+# A hook that parses no session_id exits 0 and records nothing, which is correct:
+# the payload wasn't for us. A MISSING jq produced the identical outcome — exit 0,
+# nothing written, and an empty HERD_ERRLOG, the file troubleshooting tells you to
+# check first — so herd silently recorded nothing forever with no way to tell why.
+# rc=127 is the missing-binary case; anything else is a real jq/payload error.
+#
+# stderr stays discarded rather than captured: this runs on the statusline's
+# ~1/sec path, and merging it risks a jq warning landing in the parsed output.
+jq_in() {
+    local out rc
+    out=$(printf '%s' "$INPUT" | jq "$@" 2>/dev/null); rc=$?
+    if [ "$rc" -ne 0 ]; then
+        [ -n "$NOW_ISO" ] || now_pair          # failure path only — no extra fork
+        if [ "$rc" -eq 127 ]; then
+            herd_log "jq NOT FOUND (rc=127) — herd cannot parse any payload"
+        else
+            herd_log "jq failed (rc=$rc)"
+        fi
+        return "$rc"
+    fi
+    printf '%s' "$out"
+}
+
 # ── identity guard ────────────────────────────────────────────────────────
 # A session_id becomes a filename (throttle/cache); reject / and .. so a payload
 # can't escape $HERD_RUNTIME.

@@ -9,7 +9,7 @@ __d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."
 
 INPUT=$(cat)
 { read -r SID; read -r NTYPE; } <<JQ
-$(printf '%s' "$INPUT" | jq -r '.session_id // "", .notification_type // ""' 2>/dev/null)
+$(jq_in -r '.session_id // "", .notification_type // ""')
 JQ
 
 valid_sid "$SID" || exit 0

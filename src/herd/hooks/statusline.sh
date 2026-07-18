@@ -18,7 +18,7 @@ INPUT=$(cat)
 # model is an OBJECT here (.model.id). resets_at is a UNIX EPOCH.
 IFS=$'\x1f' read -r SID MODEL SNAME CTX COST RL5 RL5RESET RL7 RL7RESET CWD API_MS \
                     CTXSIZE OCWD LADD LDEL TOKIN TOKOUT VER GWT EXC200 OSTYLE <<JQ
-$(printf '%s' "$INPUT" | jq -rj '[
+$(jq_in -rj '[
   .session_id,
   .model.id,
   .session_name,
@@ -40,7 +40,7 @@ $(printf '%s' "$INPUT" | jq -rj '[
   .workspace.git_worktree,
   (if .exceeds_200k_tokens then 1 else 0 end),
   .output_style.name
-] | map(. // "" | tostring) | join("\u001f")' 2>/dev/null)
+] | map(. // "" | tostring) | join("\u001f")')
 JQ
 
 # ── pure-bash git branch (zero forks): walk CWD -> .git/HEAD ───────────────

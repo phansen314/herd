@@ -13,7 +13,7 @@ __d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."
 INPUT=$(cat)     # NEVER $(</dev/stdin) — Claude's invocation makes that empty.
 
 { read -r SID; read -r CWD; read -r MODEL; read -r TRANSCRIPT; } <<JQ
-$(printf '%s' "$INPUT" | jq -r '.session_id // "", .cwd // "", .model // "", .transcript_path // ""' 2>/dev/null)
+$(jq_in -r '.session_id // "", .cwd // "", .model // "", .transcript_path // ""')
 JQ
 # .model is a STRING on hook payloads (an OBJECT on the statusline payload).
 
