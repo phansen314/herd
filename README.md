@@ -232,7 +232,7 @@ own tooling on the `sessions` table; the *daemon* then never touches
 `herd_attention`. (`herd jump` still acks — that write comes from the CLI and is
 outside the gate.)
 
-**`herd jump` acks the `!`.** Jumping to a session clears its `!` without touching
+**`herd jump` acks the mark.** Jumping to a session clears its mark without touching
 Claude's activity clock. If you look and then answer nothing, the same timer runs
 again from the moment you jumped and it speaks up once more — so an ack is a snooze,
 not a dismissal. See [DESIGN.md#ack](DESIGN.md#ack).
@@ -276,8 +276,25 @@ can't). kitty then marks that tab and flags the window via `bell_on_tab` and
 visual-only bell), clearing when you focus the tab.
 
 This is deliberately outside herd — the daemon stays kitty-free and you keep control
-of your own Claude notification preference. herd's silence-rule signal (a session
-gone quiet) shows separately as the `!` in `herd ls` / the jump picker.
+of your own Claude notification preference.
+
+**The bell does not cover everything, and the marks say which.** herd's own signal
+shows in `herd ls` and the jump picker as one of three glyphs:
+
+| | | ambient signal? |
+|---|---|---|
+| 🙋 | `waiting` — turn ended, wants you | yes, Claude bells |
+| 🔐 | `needs_approval` — permission prompt sitting | yes, Claude bells |
+| 🥱 | `working` past `HERD_STUCK_SECS` — silently stuck | **no. nothing pushes this at you** |
+
+A stuck session never ends its turn, so it never bells and kitty never flags its tab.
+That is the one state you can only find by *looking* — which is what
+[`herd watch`](#herd-watch--the-dashboard) is for. Give it a dedicated tab and a key
+(recipe above), and the answer to "is anything wedged?" is one keystroke rather than
+a notification you'd have to trust herd to send.
+
+herd deliberately sends none. Why a session-invoked pager was considered and
+rejected: [DECISIONS.md#pager](DECISIONS.md#pager).
 
 ## Troubleshooting
 

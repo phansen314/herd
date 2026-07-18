@@ -199,11 +199,11 @@ def attention_tick(conn, now):
             conn.execute(W["W6d_rearm"], {"pk": r["id"]})
             disarmed += 1
         elif na and r["is_armed"] and r["ack_at"]:
-            # RE-NOTIFY. A jump acks the silence and the CLI stops rendering '!',
+            # RE-NOTIFY. A jump acks the silence and the CLI stops rendering the mark,
             # but the session is still silent and still unanswered. ack_at restarts
             # the same per-status timer: once THAT much silence has passed since the
             # ack, drop the row. The next tick's W6a re-arms with a fresh
-            # attention_at and ack_at NULL, and the '!' comes back.
+            # attention_at and ack_at NULL, and the mark comes back.
             #
             # Dropping the row is also why the ack can't simply be "disarm on jump":
             # W6d is a whole-row DELETE, so it takes ack_at with it. Deleting on the

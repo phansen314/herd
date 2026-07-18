@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS herd_attention (
 
     attention_at TEXT,    -- the EDGE: when the silence rule first tripped (not last_event_at's age).
     ack_at       TEXT     -- written by a jump (the only ack path). Means "seen THIS silence":
-                          -- the CLI stops rendering '!' while it is set, and the row STAYS armed.
+                          -- the CLI stops rendering the mark while it is set, and the row STAYS armed.
                           -- It is also the timer restart: the daemon re-notifies once the status
                           -- threshold of silence has passed since the ack (W6d, then a fresh W6a).
                           -- A jump can't just delete the row instead — W6d is a whole-row DELETE,

@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from helpers import CORE, HERD, WRITES, HOOKS, ROOT, W
+from helpers import CORE, HERD, WRITES, HOOKS, ROOT, W, cells
 
 
 # ── statement integrity ──────────────────────────────────────────────────────
@@ -30,6 +30,28 @@ def test_pager_actuator_stays_deleted():
     assert not re.search(r"\bpaged_(at|level)\b", _code(HERD)), "paged_* back in the schema"
     assert not re.search(r"\bpaged_(at|level)\b",
                          "\n".join(_code(s) for s in W.values())), "paged_* back in a statement"
+
+
+# ── the attention marks are column-safe ──────────────────────────────────────
+def test_attention_glyphs_are_two_cells():
+    """_line() budgets exactly two cells for the mark. A one-cell glyph shifts that
+    row's columns left and a three-cell one shifts them right — ragged for the one
+    row you most want to read. Emoji width is not obvious by eye (✓ is one cell,
+    ✅ is two), so it is asserted rather than trusted."""
+    from herd import cli
+    marks = {**cli.ATTENTION_MARKS, "UNKNOWN": cli.MARK_UNKNOWN, "NONE": cli.MARK_NONE}
+    bad = {k: (v, cells(v)) for k, v in marks.items() if cells(v) != 2}
+    assert not bad, f"marks that would break column alignment: {bad}"
+
+
+def test_every_attention_status_has_a_reason_and_a_mark():
+    """The picker and the preview must agree on which statuses are page-worthy, and
+    both must cover every status the daemon can actually arm."""
+    from herd import cli
+    from herd import daemon
+    assert set(cli.ATTENTION_MARKS) == set(cli.ATTENTION_REASONS)
+    assert set(cli.ATTENTION_MARKS) == set(daemon.ATTENTION_SECS), \
+        "a status the daemon arms has no glyph (or vice versa)"
 
 
 # ── doc cross-references resolve ─────────────────────────────────────────────

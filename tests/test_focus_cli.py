@@ -110,7 +110,9 @@ def test_preview_text_renders_detail():
                             "status": "waiting", "status_source": "hook", "cwd": "/x/api",
                             "total_cost_usd": 1.5, "context_percent": 42,
                             "attention_at": "2026-07-15T10:00:00.000Z"})
-    for s in ("my-refactor", "abc12345", "waiting", "/x/api", "42%", "$1.50", "needs attention"):
+    # the attention line names the REASON now, not a generic "needs attention"
+    for s in ("my-refactor", "abc12345", "waiting", "/x/api", "42%", "$1.50",
+              "🙋 waiting for you since"):
         assert s in pv
 
 

@@ -411,13 +411,31 @@ it's been in it (`now - last_event_at`), never stored as a flag. What persists i
 side effect in the world, and without memory a 1s poll would page you 60×/min
 about one stuck session.
 
-Page-worthy statuses and their grace (seconds, env-overridable):
+Page-worthy statuses, their grace (seconds, env-overridable), and the mark each
+renders in `ls` / the picker:
 
-- `waiting` (30s) — turn ended, Claude wants input.
-- `needs_approval` (15s) — a permission prompt is up.
-- `working` (300s) — no new event in a long time → likely stuck.
+| status | grace | mark | already covered by Claude's bell? |
+|---|---|---|---|
+| `waiting` | 30s | 🙋 | yes — the turn ended, so Claude rings |
+| `needs_approval` | 15s | 🔐 | yes — the prompt rings |
+| `working` | 300s | 🥱 | **no** — a stuck session never ends its turn, so it never rings |
 
 Statuses not listed (`stopped`, `unknown`) are never page-worthy.
+
+The marks differ **because the statuses are not equivalent**. Two of the three
+already reach you ambiently; the third is the only one herd tells you something you
+could not otherwise learn, and it is the case a herd-owned notifier was going to
+exist for. Rather than build the actuator, the mark is made legible and the answer to
+"is anything wedged?" is `herd watch` on a dedicated tab
+([DECISIONS.md#pager](DECISIONS.md#pager)).
+
+Rendering rules (`cli.ATTENTION_MARKS` / `ATTENTION_REASONS`): every glyph occupies
+exactly **two terminal cells**, and a quiet row reserves the same width, so the `#id`
+column never goes ragged. Emoji width is not obvious by eye — `✓` is one cell, `✅`
+is two — so it is asserted, not trusted
+(`test_source_invariants.py::test_attention_glyphs_are_two_cells`). The mark set and
+the daemon's threshold table must cover the same statuses, also asserted; the picker
+falls back to ❗ if an armed row is somehow seen under another status.
 
 - `attention_at` is the **edge**: when the rule first tripped (not the same as
   `last_event_at`'s age). `W6a_arm` uses `COALESCE` to preserve it across ticks.
@@ -432,7 +450,7 @@ Statuses not listed (`stopped`, `unknown`) are never page-worthy.
 
 ### Ack is a timer restart, not a delete {#ack}
 
-A jump acks the row. The CLI hides `!` while `ack_at` is set, but the row **stays
+A jump acks the row. The CLI hides the mark while `ack_at` is set, but the row **stays
 armed** — and that is deliberate, because `ack_at` is the only stamp that can
 restart the silence timer.
 
@@ -455,7 +473,7 @@ speaks up again one threshold later. Same per-status knobs, no new statement, no
 column.
 
 One known gap: reaching a session **without** `herd jump` — clicking the tab, kitty
-keyboard nav — writes no ack, so `!` persists until real activity. Closing it would
+keyboard nav — writes no ack, so the mark persists until real activity. Closing it would
 mean the daemon polling `kitten @ ls` for the focused window, which breaks
 [liveness comes from ps, never kitty](#liveness). Left open on purpose; revisit with
 the notifier.

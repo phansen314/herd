@@ -25,6 +25,14 @@ T0_240 = "2026-07-15T10:04:00.000Z"
 SOCK = "unix:/tmp/kitty-20035"
 HOOKS = ROOT / "src" / "herd" / "hooks"
 
+
+def cells(s):
+    """Terminal cells `s` occupies — East Asian Wide/Fullwidth count 2. Column
+    assertions must use this, NOT len(): '  ' is two codepoints and two cells, but
+    '🙋' is ONE codepoint and two cells, so len() disagrees with the screen."""
+    import unicodedata as ud
+    return sum(2 if ud.east_asian_width(c) in ("W", "F") else 1 for c in s)
+
 CORE = CORE_SCHEMA.read_text()
 HERD = HERD_SCHEMA.read_text()
 WRITES = WRITES_PATH.read_text()

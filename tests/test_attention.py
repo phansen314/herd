@@ -8,7 +8,8 @@ from herd import cli
 from herd.daemon import (needs_attention, attention_tick, _attention_enabled,
                          run as daemon_run)
 
-from helpers import T0, T1, T2, T0_10, T0_20, T0_240, W, mk_session, mk_attention
+from helpers import (T0, T1, T2, T0_10, T0_20, T0_240, W, cells, mk_session,
+                     mk_attention)
 
 
 @pytest.mark.parametrize("status,le,now,expect", [
@@ -67,7 +68,7 @@ def test_tick_ignores_stopped(fresh):
 
 
 # ── ack: a jump silences the row; ack_at restarts the same timer ─────────────
-# The '!' is rendered by cli, the timer is run by the daemon, and the bug this
+# The mark is rendered by cli, the timer is run by the daemon, and the bug this
 # guards against was the two disagreeing — so these drive both halves.
 T1_10 = "2026-07-15T10:05:10.000Z"   # ack + 10s: inside the 30s waiting threshold
 T1_40 = "2026-07-15T10:05:40.000Z"   # ack + 40s: past it
@@ -88,18 +89,26 @@ def _row(c, pk):
                      (pk,)).fetchone()
 
 
-def _bang(c):
-    """The rendered '!' column, straight through R1_list — the real read path."""
-    return [cli._line(r)[0] for r in cli._live(c)]
+def _marks(c):
+    """The rendered mark column, straight through _line — the real read path. Every
+    glyph is a single codepoint (rendering two cells); MARK_NONE is two spaces."""
+    out = []
+    for r in cli._live(c):
+        line = cli._line(r)
+        out.append(cli.MARK_NONE if line.startswith(cli.MARK_NONE) else line[0])
+    return out
+
+
+WAITING_MARK = cli.ATTENTION_MARKS["waiting"]
 
 
 def test_ack_silences_the_render_but_keeps_the_row(fresh):
     c = fresh()
     w = _waiting(c)
     attention_tick(c, T1)
-    assert _bang(c) == ["!"]
+    assert _marks(c) == [WAITING_MARK]
     _ack(c, w, T1)
-    assert _bang(c) == [" "]                     # quiet
+    assert _marks(c) == [cli.MARK_NONE]           # quiet
     assert _row(c, w)["ack_at"] == T1            # but still armed, still recorded
 
 
@@ -115,7 +124,7 @@ def test_acked_row_does_not_flap(fresh):
         assert (armed, dis) == (0, 0)
     r = _row(c, w)
     assert (r["attention_at"], r["ack_at"]) == (T1, T1)
-    assert _bang(c) == [" "]
+    assert _marks(c) == [cli.MARK_NONE]
 
 
 def test_ack_timer_renotifies(fresh):
@@ -129,7 +138,7 @@ def test_ack_timer_renotifies(fresh):
     assert (armed, dis) == (1, 0)
     r = _row(c, w)
     assert (r["attention_at"], r["ack_at"]) == (T1_40, None)
-    assert _bang(c) == ["!"]                     # and it speaks up again
+    assert _marks(c) == [WAITING_MARK]            # and it speaks up again
 
 
 def test_activity_clears_an_acked_row(fresh):
@@ -141,6 +150,54 @@ def test_activity_clears_an_acked_row(fresh):
     c.execute("UPDATE sessions SET status='working', last_event_at=? WHERE id=?", (T1_40, w))
     armed, dis = attention_tick(c, T1_40)
     assert (armed, dis) == (0, 1) and _row(c, w) is None
+
+
+# ── the mark says WHICH kind of attention ────────────────────────────────────
+# The distinction is the whole point: Claude's bell already covers `waiting` and
+# `needs_approval` (it ends a turn / raises a prompt), so the stuck mark is the only
+# one that reports something nothing else can tell you. See DECISIONS.md#pager.
+@pytest.mark.parametrize("status,expect", [
+    ("waiting", "🙋"),
+    ("needs_approval", "🔐"),
+    ("working", "🥱"),          # silently stuck — no bell, no tab flag, nothing
+])
+def test_mark_distinguishes_the_page_worthy_statuses(fresh, status, expect):
+    c = fresh()
+    mk_session(c, session_id="s", status=status, last_event_at=T0, last_event_type="stop")
+    attention_tick(c, T1)
+    assert _marks(c) == [expect]
+    assert cli.ATTENTION_MARKS[status] == expect, "glyph moved without updating this test"
+
+
+def test_mark_falls_back_on_an_armed_row_with_an_unexpected_status(fresh):
+    """status is CHECK-constrained to five values but only three are page-worthy, and
+    a reconcile can flip an armed row to 'unknown' before the next tick disarms it.
+    The picker must render that, not raise."""
+    c = fresh()
+    pk = mk_session(c, session_id="s", status="waiting", last_event_at=T0, last_event_type="stop")
+    attention_tick(c, T1)
+    c.execute("UPDATE sessions SET status='unknown' WHERE id=?", (pk,))
+    assert _marks(c) == [cli.MARK_UNKNOWN]
+
+
+def test_every_row_reserves_the_same_mark_width(fresh):
+    """Quiet and marked rows must start their '#id' at the same column."""
+    c = fresh()
+    mk_session(c, session_id="a", status="waiting", last_event_at=T0, last_event_type="stop")
+    mk_session(c, session_id="b", status="working", last_event_at=T1, last_event_type="tool",
+               started_at=T1, updated_at=T1)
+    attention_tick(c, T1)
+    cols = {cells(cli._line(r).split("#", 1)[0]) for r in cli._live(c)}
+    assert cols == {3}, f"mark column (glyph + gutter) is not uniform: {cols}"
+
+
+def test_preview_names_the_reason_not_just_attention(fresh):
+    """The pane has room for words; 'stuck' and 'waiting for you' are different facts."""
+    c = fresh()
+    mk_session(c, session_id="s", status="working", last_event_at=T0, last_event_type="tool")
+    attention_tick(c, T1)
+    text = cli._preview_text(next(iter(cli._live(c))))
+    assert "🥱 stuck — no activity since" in text, text
 
 
 # ── the statement-level lifecycle: arm (edge-preserving), ack, re-arm ────────

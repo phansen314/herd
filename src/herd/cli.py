@@ -51,10 +51,45 @@ def _short_cwd(cwd):
 
 
 def _unacked(r):
-    """Show '!' only for attention nobody has looked at yet. A jump acks the row
-    (W6c) without deleting it, so an acked row stays armed and stays quiet; the
-    daemon re-arms it from ack_at once that silence runs long again."""
+    """Mark only attention nobody has looked at yet. A jump acks the row (W6c)
+    without deleting it, so an acked row stays armed and stays quiet; the daemon
+    re-arms it from ack_at once that silence runs long again."""
     return bool(r["attention_at"]) and not r["ack_at"]
+
+
+# The mark says WHICH KIND of attention, because they are not equivalent: Claude
+# rings the terminal bell for `waiting` and `needs_approval` (it ends a turn or
+# raises a prompt), but a session stuck in `working` never ends its turn, so
+# NOTHING pushes it at you. 🥱 is the only one you can miss by not looking.
+# See README#notifications-kitty-tab-bell and DECISIONS.md#pager.
+# Every glyph MUST be two terminal cells wide or the column goes ragged for that
+# row alone — enforced by test_source_invariants.test_attention_glyphs_are_two_cells.
+ATTENTION_MARKS = {
+    "waiting":        "🙋",   # turn ended, wants you
+    "needs_approval": "🔐",   # blocked on a permission prompt
+    "working":        "🥱",   # silently stuck: past HERD_STUCK_SECS with no activity
+}
+MARK_UNKNOWN = "❗"           # armed under a status we don't have a glyph for
+MARK_NONE = "  "             # quiet: unarmed, or armed-but-acked
+
+# The preview pane has room to say it in words. Same keys as ATTENTION_MARKS.
+ATTENTION_REASONS = {
+    "waiting":        "waiting for you",
+    "needs_approval": "needs approval",
+    "working":        "stuck — no activity",
+}
+
+
+def _mark_for(status):
+    """The glyph a page-worthy status earns. needs_attention() only ever arms the
+    three above, but status can drift between 2s ticks, so an armed row with an
+    unexpected status must still render something rather than blow up the picker."""
+    return ATTENTION_MARKS.get(status, MARK_UNKNOWN)
+
+
+def _mark(r):
+    """The two-cell attention flag for a row. Quiet rows still occupy the column."""
+    return _mark_for(r["status"]) if _unacked(r) else MARK_NONE
 
 
 def _line(r):
@@ -62,7 +97,7 @@ def _line(r):
     name = _name(r)
     name = name[:25] + "…" if len(name) > 26 else name
     cost = f"${r['total_cost_usd']:.2f}" if r["total_cost_usd"] is not None else "—"
-    return (f"{'!' if _unacked(r) else ' '} #{r['id']:<3} {name:26} {r['status']:14} "
+    return (f"{_mark(r)} #{r['id']:<3} {name:26} {r['status']:14} "
             f"{cost:>8}  {_short_cwd(r['cwd'])}")
 
 
@@ -163,7 +198,9 @@ def _preview_text(row):
         f"last      {g('last_event_at')}  ({g('last_event_type')})",
     ]
     if d.get("attention_at") and not d.get("ack_at"):      # acked -> armed but quiet
-        lines.append(f"⚠ needs attention since {d['attention_at']}")
+        lines.append(f"{_mark_for(d.get('status'))} "
+                     f"{ATTENTION_REASONS.get(d.get('status'), 'needs attention')} "
+                     f"since {d['attention_at']}")
     return "\n".join(lines)
 
 
