@@ -1,6 +1,7 @@
 """P (64-66d) — installer surgery on settings.json / the statusline wrapper, the
 systemd unit, CLI paths, and the terminal-bell opt-in. Pure functions."""
 import json
+import os
 import pathlib
 
 import pytest
@@ -105,7 +106,7 @@ def test_selftest_passes_against_the_real_hooks():
     """It direct-execs the shipped scripts (not `bash <path>`), so this also covers
     the +x bit the way production hits it."""
     from herd import install as I
-    ok, detail = I.selftest()
+    ok, detail = I.selftest(I.HOOKS_DIR)
     assert ok, detail
     assert detail["status"] == "working" and detail["context_percent"] == 10
 
@@ -120,8 +121,7 @@ def test_selftest_reports_a_missing_executable_bit(monkeypatch, tmp_path):
         p = fake / name
         p.write_text("#!/usr/bin/env bash\nexit 0\n")
         p.chmod(0o644)                      # readable, NOT executable
-    monkeypatch.setattr(I, "HOOKS_DIR", fake)
-    ok, detail = I.selftest()
+    ok, detail = I.selftest(fake)
     assert not ok
     assert sorted(detail["not_executable"]) == ["session_start.sh", "statusline.sh"]
 
@@ -132,7 +132,7 @@ def test_selftest_leaves_the_real_db_alone(tmp_path, monkeypatch):
     from herd import install as I
     real = tmp_path / "herd.db"
     monkeypatch.setattr(I, "DB", real)
-    I.selftest()
+    I.selftest(I.HOOKS_DIR)
     assert not real.exists()
 
 
@@ -146,6 +146,9 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setattr(inst, "WRAPPER", tmp_path / "custom-status-line.sh")
     monkeypatch.setattr(inst, "HERD_DIR", tmp_path)
     monkeypatch.setattr(inst, "DB", tmp_path / "herd.db")
+    # sync_hooks() COPIES into these — unpatched, the suite writes to the real ~/.herd
+    monkeypatch.setattr(inst, "INSTALLED_HOOKS", tmp_path / "hooks")
+    monkeypatch.setattr(inst, "INSTALLED_SCHEMA", tmp_path / "schema")
     monkeypatch.setattr(inst, "install_service", lambda dry=False: "service stubbed")
     monkeypatch.setattr(inst, "uninstall_service", lambda: "service stubbed")
     monkeypatch.setattr(inst, "install_cli", lambda dry=False: "cli stubbed")
@@ -160,8 +163,10 @@ PRISTINE = {"model": "opus", "hooks": {"PreToolUse": [
     {"matcher": "Bash", "hooks": [{"type": "command", "command": "/opt/audit.sh"}]}]}}
 
 
-def _wired(d):
-    return any(str(inst.HOOKS_DIR) in h.get("command", "")
+def _wired(d, hooks_dir=None):
+    """Wired to the dir install() targets — the installed COPY by default."""
+    root = str(hooks_dir or inst.INSTALLED_HOOKS)
+    return any(root in h.get("command", "")
                for bs in d["hooks"].values() for b in bs for h in b["hooks"])
 
 
@@ -203,7 +208,7 @@ def test_uninstall_migrates_a_legacy_double_install(home):
 def test_a_failed_selftest_aborts_before_touching_settings(home, monkeypatch):
     """The self-test exists to catch hooks that are wired but silently no-op. Running
     it after the write meant reporting FAIL on a config already pointed at herd."""
-    monkeypatch.setattr(inst, "selftest", lambda: (False, {"not_executable": ["stop.sh"]}))
+    monkeypatch.setattr(inst, "selftest", lambda *a, **k: (False, {"not_executable": ["stop.sh"]}))
     inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
     assert inst.install() == 1
     assert json.loads(inst.SETTINGS.read_text()) == PRISTINE
@@ -297,4 +302,73 @@ def test_install_wires_the_statusline_on_a_machine_with_no_wrapper(home, capsys)
     inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
     assert not inst.WRAPPER.exists()
     inst.install()
-    assert _sl(json.loads(inst.SETTINGS.read_text())) == inst.STATUSLINE
+    assert _sl(json.loads(inst.SETTINGS.read_text())) == inst.statusline_cmd()
+
+
+# ── hook installation: copy by default, --dev for the checkout ──────────────
+def test_sync_copies_hooks_and_the_sql_they_read(home):
+    """common.sh resolves HERD_WRITES as <hooks>/../schema/writes.sql. Hooks copied
+    WITHOUT their schema find no statements, so every write path fails with "no
+    such statement" while each hook still exits 0 — a herd that records nothing."""
+    hooks_dir = inst.sync_hooks()
+    assert hooks_dir == inst.INSTALLED_HOOKS
+    names = {p.name for p in hooks_dir.glob("*.sh")}
+    assert {p.name for p in inst.HOOKS_DIR.glob("*.sh")} == names
+    assert (inst.INSTALLED_SCHEMA / "writes.sql").exists()
+    assert (inst.INSTALLED_SCHEMA / "writes.sql").read_text() == \
+        (inst.SCHEMA_DIR / "writes.sql").read_text()
+
+
+def test_copied_hooks_keep_the_executable_bit(home):
+    """settings.json exec's these paths directly; a lost +x is a silent no-op."""
+    for p in inst.sync_hooks().glob("*.sh"):
+        assert os.access(p, os.X_OK), f"{p.name} lost +x in the copy"
+
+
+def test_the_copied_hooks_actually_work(home):
+    """The copy is only worth anything if the SELF-TEST passes against it — that is
+    what proves the schema travelled and the paths still resolve."""
+    ok, detail = inst.selftest(inst.sync_hooks())
+    assert ok, detail
+
+
+def test_dev_wires_the_checkout_instead(home):
+    assert inst.sync_hooks(dev=True) == inst.HOOKS_DIR
+    assert not inst.INSTALLED_HOOKS.exists()     # nothing copied
+
+
+def test_install_wires_the_copy_and_dev_wires_the_tree(home):
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+    inst.install()
+    assert _wired(json.loads(inst.SETTINGS.read_text()))               # the copy
+    inst.install(dev=True)
+    assert _wired(json.loads(inst.SETTINGS.read_text()), inst.HOOKS_DIR)
+
+
+def test_reinstalling_in_the_other_mode_leaves_one_entry_per_event(home):
+    """Switching modes must REPLACE the wiring, not stack a second copy — two
+    entries per event means every hook fires twice."""
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+    inst.install()
+    inst.install(dev=True)
+    hooks = json.loads(inst.SETTINGS.read_text())["hooks"]
+    for event in inst.HERD_HOOKS:
+        ours = [h["command"] for bs in [hooks[event]] for b in bs for h in b["hooks"]
+                if inst._is_managed(h.get("command", ""))]
+        assert len(ours) == 1, f"{event} wired {len(ours)}x: {ours}"
+
+
+def test_a_moved_checkout_is_still_recognised_as_ours():
+    """_is_managed matched only the CURRENT roots, so an install made from a
+    checkout that has since moved survived the strip and got a second entry."""
+    stale = "/old/place/herd/src/herd/hooks/session_start.sh"
+    assert inst._is_managed(stale)
+    assert not inst._is_managed("/opt/other-tool/session_start.sh")   # not ours
+    assert not inst._is_managed("cdh-claude-hook postToolUse")
+
+
+def test_hooks_are_current_detects_drift(home):
+    inst.sync_hooks()
+    assert inst.hooks_are_current()
+    (inst.INSTALLED_HOOKS / "stop.sh").write_text("#!/bin/bash\n# edited\nexit 0\n")
+    assert not inst.hooks_are_current()

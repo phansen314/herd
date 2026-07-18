@@ -77,9 +77,14 @@ def check_db(path, connect_fn=None):
     return out
 
 
-def check_wiring(settings_text, hooks_dir, statusline_path, events):
+def check_wiring(settings_text, hook_roots, statusline_paths, events):
     """Are herd's hooks and statusline actually wired into settings.json, and do
-    the wired paths still exist? A moved checkout leaves absolute paths behind."""
+    the wired paths still exist?
+
+    hook_roots / statusline_paths are the ACCEPTABLE locations, in preference
+    order: the installed copy (~/.herd/hooks) and the checkout (a --dev install).
+    Accepting either is what lets doctor report the mode rather than mistaking a
+    deliberate --dev install for broken wiring."""
     if settings_text is None:
         return [(FAIL, "settings.json missing", "run: python3 -m herd.install")]
     try:
@@ -92,7 +97,8 @@ def check_wiring(settings_text, hooks_dir, statusline_path, events):
     wired = {e: [h.get("command", "") for b in hooks.get(e, []) for h in b["hooks"]]
              for e in hooks}
     for event in events:
-        cmds = [c for c in wired.get(event, []) if str(hooks_dir) in c]
+        cmds = [c for c in wired.get(event, [])
+                if any(str(r) in c for r in hook_roots)]
         if not cmds:
             out.append((FAIL, f"{event} not wired", "run: python3 -m herd.install"))
         elif not os.path.exists(cmds[0]):
@@ -107,13 +113,60 @@ def check_wiring(settings_text, hooks_dir, statusline_path, events):
     if not sl:
         out.append((FAIL, "statusLine not set",
                     "no cost / context / branch will ever be recorded"))
-    elif sl == statusline_path or str(hooks_dir) in sl:
+    elif sl in statusline_paths or any(str(r) in sl for r in hook_roots):
         out.append((OK, "statusLine", sl))
-    elif os.path.exists(sl) and statusline_path in pathlib.Path(sl).read_text():
+    elif os.path.exists(sl) and any(s in pathlib.Path(sl).read_text()
+                                    for s in statusline_paths):
         out.append((OK, "statusLine (via wrapper)", sl))
     else:
         out.append((WARN, "statusLine is not herd's", f"{sl} — herd records no metrics"))
     return out
+
+
+def check_hook_mode(settings_text, installed_root, checkout_root, current=None):
+    """Which hooks are actually running, and are they current?
+
+    A --dev install wires the checkout, so a `git checkout`, stash or rebase
+    changes what every live Claude session executes — that is a legitimate choice
+    while developing hooks, but it should never be a surprise. A copy install is
+    stable, and gains the opposite failure: edits to the tree do nothing until you
+    re-install. Both are quiet, so both are reported."""
+    if settings_text is None:
+        return [(FAIL, "hook mode unknown", "settings.json missing")]
+    try:
+        data = json.loads(settings_text)
+    except ValueError:
+        return [(FAIL, "hook mode unknown", "settings.json unparseable")]
+    cmds = [h.get("command", "") for bs in (data.get("hooks") or {}).values()
+            for b in bs for h in b["hooks"]]
+    on_checkout = [c for c in cmds if str(checkout_root) in c]
+    on_installed = [c for c in cmds if str(installed_root) in c]
+
+    if on_checkout and not on_installed:
+        return [(WARN, "hooks run from the CHECKOUT (--dev)",
+                 f"{checkout_root}\n      a git checkout/stash changes what running "
+                 "sessions execute")]
+    if on_checkout and on_installed:
+        return [(FAIL, "hooks wired to BOTH the checkout and the installed copy",
+                 "some events fire twice — re-run the installer")]
+    if not on_installed:
+        return [(FAIL, "no herd hooks wired", "run: python3 -m herd.install")]
+    fresh = current if current is not None else _hooks_current()
+    if fresh is None:
+        return [(OK, "hooks run from the installed copy", str(installed_root))]
+    if fresh:
+        return [(OK, "hooks run from the installed copy", f"{installed_root} (current)")]
+    return [(WARN, "the installed hooks are STALE",
+             f"{installed_root} differs from the checkout — "
+             "re-run python3 -m herd.install to pick up your edits")]
+
+
+def _hooks_current():
+    from herd import install
+    try:
+        return install.hooks_are_current()
+    except OSError:
+        return None
 
 
 def check_daemon(lock_path, holder=None, alive=None):
@@ -179,11 +232,13 @@ def collect(environ=None, settings_path=None):
     text = settings.read_text() if settings.exists() else None
     errlog = environ.get("HERD_ERRLOG",
                          str(pathlib.Path.home() / ".herd" / "hook-errors.log"))
+    roots = (install.INSTALLED_HOOKS, install.HOOKS_DIR)
+    statuslines = tuple(install.statusline_cmd(r) for r in roots)
     return [
         ("dependencies", check_deps()),
         ("database", check_db(_db_path())),
-        ("wiring", check_wiring(text, install.HOOKS_DIR, install.STATUSLINE,
-                                tuple(install.HERD_HOOKS))),
+        ("wiring", check_wiring(text, roots, statuslines, tuple(install.HERD_HOOKS))
+                   + check_hook_mode(text, install.INSTALLED_HOOKS, install.HOOKS_DIR)),
         ("daemon", check_daemon(daemon.lock_path())),
         ("environment", check_env(environ)),
         ("hook errors", check_errlog(errlog)),

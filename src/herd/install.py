@@ -3,6 +3,12 @@
     python3 -m herd.install            # wire herd, unwire klawde (backs up first)
     python3 -m herd.install --uninstall  # restore the pre-herd state
     python3 -m herd.install --dry-run    # show what would change, touch nothing
+    python3 -m herd.install --dev        # wire the CHECKOUT, not the installed copy
+
+Hooks are COPIED to ~/.herd/hooks (with the SQL they read) and settings.json is
+wired there, so a git checkout in the source tree cannot change what running
+Claude sessions execute. `--dev` wires the checkout directly for hook development;
+`herd doctor` reports which mode is active and whether the copy has drifted.
 
 Idempotent. Every edited file is backed up as <file>.herd-bak.<ts> before the
 first change, and once as <file>.herd-bak.original — the pre-herd copy uninstall
@@ -20,7 +26,8 @@ import tempfile
 
 from herd.db import connect, apply_schema
 
-HOOKS_DIR = pathlib.Path(__file__).resolve().parent / "hooks"
+HOOKS_DIR = pathlib.Path(__file__).resolve().parent / "hooks"   # in the checkout
+SCHEMA_DIR = pathlib.Path(__file__).resolve().parent / "schema"
 PKG_SRC = pathlib.Path(__file__).resolve().parent.parent   # .../src (for PYTHONPATH)
 REPO = PKG_SRC.parent                                       # repo root
 HOME = pathlib.Path.home()
@@ -28,6 +35,15 @@ SETTINGS = HOME / ".claude" / "settings.json"
 WRAPPER = HOME / ".claude" / "custom-status-line.sh"
 HERD_DIR = HOME / ".herd"
 DB = HERD_DIR / "herd.db"
+
+# Where the hooks that actually RUN live, by default. Wiring settings.json at the
+# checkout makes every Claude session on the machine execute whatever is in the
+# working tree at that instant: a `git checkout`, stash or rebase silently changes
+# the behaviour of running sessions (this is how `no such statement: W4_event_log`
+# reached a live hook-errors.log), and moving the clone breaks all five hooks at
+# once. Installing a COPY decouples the two. `--dev` opts back into the checkout.
+INSTALLED_HOOKS = HERD_DIR / "hooks"
+INSTALLED_SCHEMA = HERD_DIR / "schema"
 SERVICE = HOME / ".config" / "systemd" / "user" / "herd.service"
 CLI_SRC = REPO / "bin" / "herd"
 CLI_LINK = HOME / ".local" / "bin" / "herd"
@@ -44,22 +60,41 @@ HERD_HOOKS = {
     "PostToolUse":  ("post_tool_use.sh", True),
 }
 
-STATUSLINE = str(HOOKS_DIR / "statusline.sh")
+STATUSLINE = str(INSTALLED_HOOKS / "statusline.sh")
 
 # systemctl can block on a busy/degraded manager; the installer must not hang.
 SYSTEMCTL_TIMEOUT = 15
 # A wired hook that hangs would hang the self-test that exists to vet it.
 SELFTEST_TIMEOUT = 20
 
+_OUR_SCRIPTS = {s for s, _ in HERD_HOOKS.values()} | {"statusline.sh", "common.sh"}
 
-def hook_cmd(script):
-    return str(HOOKS_DIR / script)
+
+def hook_cmd(script, hooks_dir=None):
+    return str((hooks_dir or INSTALLED_HOOKS) / script)
+
+
+def statusline_cmd(hooks_dir=None):
+    return str((hooks_dir or INSTALLED_HOOKS) / "statusline.sh")
 
 
 def _is_managed(cmd):
-    """A command herd owns — klawde's, or a prior herd install. Everything else
-    (cdh, the PreToolUse HTTP hook, anything unknown) is preserved untouched."""
-    return "/.klawde/" in cmd or cmd.startswith(str(HOOKS_DIR))
+    """A command herd owns — klawde's, or any prior herd install. Everything else
+    (cdh, the PreToolUse HTTP hook, anything unknown) is preserved untouched.
+
+    Recognising our own scripts BY NAME matters as much as by path: a prefix test
+    against the current roots misses an install made from a checkout that has since
+    moved, so the stale entry survives the strip and step 2 adds a second one —
+    every hook then fires twice. The herd-shaped-path condition keeps us from
+    claiming an unrelated tool's session_start.sh."""
+    if not cmd:
+        return False
+    if "/.klawde/" in cmd:
+        return True
+    if cmd.startswith(str(HOOKS_DIR)) or cmd.startswith(str(INSTALLED_HOOKS)):
+        return True
+    path = cmd.split()[0]
+    return path.rsplit("/", 1)[-1] in _OUR_SCRIPTS and ("/herd/" in path or "/.herd/" in path)
 
 
 def _ts():
@@ -81,8 +116,13 @@ ORIGINAL_SUFFIX = ".herd-bak.original"
 
 def _is_wired(path, text):
     """Does this file already point at herd? Cheap and textual on purpose — it only
-    has to distinguish 'pristine' from 'a previous herd install'."""
-    return str(HOOKS_DIR) in text if text else False
+    has to distinguish 'pristine' from 'a previous herd install'.
+
+    BOTH roots, or a copy-mode install reads as pristine and overwrites the
+    pre-herd snapshot with a herd-wired one — the uninstall trap again."""
+    if not text:
+        return False
+    return str(HOOKS_DIR) in text or str(INSTALLED_HOOKS) in text
 
 
 def backup_original(path, text):
@@ -124,6 +164,46 @@ def _atomic_write(path, text):
     finally:
         if tmp.exists():
             tmp.unlink()
+
+
+# ── hook installation (copy, or point at the checkout with --dev) ──────────
+def sync_hooks(dev=False, dry=False):
+    """Put the hooks where they will be RUN from, and return that directory.
+
+    Copies the SQL too, and that is not incidental: common.sh resolves
+    HERD_WRITES as <hooks>/../schema/writes.sql, so hooks installed without their
+    schema find no statements and every write path fails with "no such statement"
+    — a herd that records nothing while every hook still exits 0."""
+    if dev:
+        return HOOKS_DIR
+    if dry:
+        return INSTALLED_HOOKS
+    INSTALLED_HOOKS.mkdir(parents=True, exist_ok=True)
+    INSTALLED_SCHEMA.mkdir(parents=True, exist_ok=True)
+    for src in sorted(HOOKS_DIR.glob("*.sh")):
+        dst = INSTALLED_HOOKS / src.name
+        shutil.copy2(src, dst)
+        dst.chmod(dst.stat().st_mode | 0o111)   # +x, or the hook is a silent no-op
+    for src in sorted(SCHEMA_DIR.glob("*.sql")):
+        shutil.copy2(src, INSTALLED_SCHEMA / src.name)
+    return INSTALLED_HOOKS
+
+
+def hooks_are_current(hooks_dir=None):
+    """Do the installed copies match the checkout? False means the tree moved on
+    without a re-install — the cost of the copy, and what `herd doctor` reports."""
+    hooks_dir = hooks_dir or INSTALLED_HOOKS
+    if hooks_dir == HOOKS_DIR:
+        return True                              # --dev: the checkout IS the copy
+    for src in sorted(HOOKS_DIR.glob("*.sh")):
+        dst = hooks_dir / src.name
+        if not dst.exists() or dst.read_bytes() != src.read_bytes():
+            return False
+    for src in sorted(SCHEMA_DIR.glob("*.sql")):
+        dst = INSTALLED_SCHEMA / src.name
+        if not dst.exists() or dst.read_bytes() != src.read_bytes():
+            return False
+    return True
 
 
 # ── DB bootstrap ───────────────────────────────────────────────────────────
@@ -283,7 +363,7 @@ def _statusline_cmd(data):
     return sl.get("command", "") if isinstance(sl, dict) else ""
 
 
-def statusline_plan(data, wrapper_exists):
+def statusline_plan(data, wrapper_exists, hooks_dir=None):
     """What settings.statusLine needs, as one of:
 
     'wrapper' — an existing custom-status-line.sh already sits in front of it, and
@@ -296,15 +376,16 @@ def statusline_plan(data, wrapper_exists):
     ONLY through the wrapper, so a machine without one (anybody who wasn't already
     a klawde user) got no statusline at all while install still printed PASS —
     and statusline.sh is the only writer of every metric column."""
+    sl = statusline_cmd(hooks_dir)
     cmd = _statusline_cmd(data)
-    if not cmd or cmd == STATUSLINE or "/.klawde/" in cmd:
+    if not cmd or cmd == sl or "/.klawde/" in cmd:
         return "set"
     if cmd == str(WRAPPER):
         return "wrapper" if wrapper_exists else "set"     # dangling pointer -> ours
     return "foreign"
 
 
-def rewire_settings(data, wrapper_exists=False):
+def rewire_settings(data, wrapper_exists=False, hooks_dir=None):
     """Return a NEW settings dict with herd wired and klawde unwired. Pure —
     caller decides whether to write it."""
     data = json.loads(json.dumps(data))          # deep copy
@@ -326,30 +407,31 @@ def rewire_settings(data, wrapper_exists=False):
     # 2. add herd's authoritative entry for each event, in its OWN block at the
     #    front (so herd runs first; cdh keeps its block).
     for event, (script, is_async) in HERD_HOOKS.items():
-        entry = {"type": "command", "command": hook_cmd(script)}
+        entry = {"type": "command", "command": hook_cmd(script, hooks_dir)}
         if is_async:
             entry["async"] = True
         hooks.setdefault(event, []).insert(0, {"hooks": [entry]})
 
     # 3. the statusline. Preserve any sibling keys (padding etc.) — only the
     #    command is ours to set.
-    if statusline_plan(data, wrapper_exists) == "set":
+    if statusline_plan(data, wrapper_exists, hooks_dir) == "set":
         sl = dict(data["statusLine"]) if isinstance(data.get("statusLine"), dict) else {}
-        sl.update({"type": "command", "command": STATUSLINE})
+        sl.update({"type": "command", "command": statusline_cmd(hooks_dir)})
         data["statusLine"] = sl
 
     return data
 
 
 # ── statusline wrapper ─────────────────────────────────────────────────────
-def rewire_wrapper(text):
+def rewire_wrapper(text, hooks_dir=None):
     """Swap the klawde statusline invocation for herd's. Idempotent."""
+    sl = statusline_cmd(hooks_dir)
     out = []
     replaced = False
     for line in text.splitlines():
-        if ".klawde/statusline.sh" in line or STATUSLINE in line:
+        if ".klawde/statusline.sh" in line or sl in line or "/herd/hooks/statusline.sh" in line:
             indent = line[:len(line) - len(line.lstrip())]
-            out.append(f'{indent}"{STATUSLINE}"')
+            out.append(f'{indent}"{sl}"')
             replaced = True
         else:
             out.append(line)
@@ -357,7 +439,7 @@ def rewire_wrapper(text):
 
 
 # ── self-test: run the WIRED hook against a temp DB ────────────────────────
-def selftest():
+def selftest(hooks_dir=None):
     """Prove the wired hooks actually write, using a throwaway DB so the real one
     is untouched.
 
@@ -373,17 +455,18 @@ def selftest():
                    HERD_ERRLOG=f"{tmp}/err.log")
         c = connect(f"{tmp}/t.db"); apply_schema(c); c.close()
 
-        not_exec = [p.name for p in sorted(HOOKS_DIR.glob("*.sh"))
+        hd = hooks_dir or INSTALLED_HOOKS
+        not_exec = [p.name for p in sorted(hd.glob("*.sh"))
                     if not os.access(p, os.X_OK)]
         if not_exec:
             return False, {"not_executable": not_exec}
 
         try:
-            subprocess.run([hook_cmd("session_start.sh")],          # direct exec
+            subprocess.run([hook_cmd("session_start.sh", hd)],      # direct exec
                            input=f'{{"session_id":"{SID}","cwd":"/x","model":"m","source":"startup"}}',
                            capture_output=True, text=True, env=env,
                            timeout=SELFTEST_TIMEOUT)
-            sl = subprocess.run([STATUSLINE],                        # direct exec
+            sl = subprocess.run([statusline_cmd(hd)],                # direct exec
                                 input=f'{{"session_id":"{SID}","model":{{"id":"m"}},"cwd":"/x",'
                                       '"context_window":{"used_percentage":10},"cost":{"total_cost_usd":0.5}}',
                                 capture_output=True, text=True, env=env,
@@ -404,24 +487,34 @@ def selftest():
                                           "statusline_out": sl.stdout.strip()}
 
 
-def install(dry=False):
+def install(dry=False, dev=False):
     ts = _ts()
-    print(f"herd install  (ts={ts})\n")
+    print(f"herd install  (ts={ts}{', DEV' if dev else ''})\n")
     print("  " + bootstrap_db(dry))
+
+    hooks_dir = sync_hooks(dev=dev, dry=dry)
+    if dev:
+        print(f"  hooks: WIRED TO THE CHECKOUT {hooks_dir}")
+        print("     --dev: a git checkout/stash changes what running sessions execute.")
+    else:
+        print(f"  {'would copy' if dry else 'copied'} hooks + schema -> {hooks_dir}")
 
     # A first-time machine may have no settings.json at all — treat that as empty
     # rather than a traceback. rewire_settings() setdefaults "hooks", backup()
     # no-ops on a missing file, so the absent case needs no other special-casing.
     settings = json.loads(SETTINGS.read_text()) if SETTINGS.exists() else {}
-    plan = statusline_plan(settings, WRAPPER.exists())
-    new_settings = rewire_settings(settings, wrapper_exists=WRAPPER.exists())
-    wrapper_text, wrap_ok = rewire_wrapper(WRAPPER.read_text()) if WRAPPER.exists() else ("", False)
+    plan = statusline_plan(settings, WRAPPER.exists(), hooks_dir)
+    new_settings = rewire_settings(settings, wrapper_exists=WRAPPER.exists(),
+                                   hooks_dir=hooks_dir)
+    wrapper_text, wrap_ok = (rewire_wrapper(WRAPPER.read_text(), hooks_dir)
+                             if WRAPPER.exists() else ("", False))
+    sl_target = statusline_cmd(hooks_dir)
     sl_note = {
-        "set":     f"statusLine -> {STATUSLINE}",
+        "set":     f"statusLine -> {sl_target}",
         "wrapper": f"statusLine -> {WRAPPER} (rewired to herd below)",
         "foreign": (f"statusLine LEFT ALONE — it runs {_statusline_cmd(settings)!r}, "
                     "which herd does not own. Point it at\n      "
-                    f"{STATUSLINE} yourself, or herd records no cost/context/branch."),
+                    f"{sl_target} yourself, or herd records no cost/context/branch."),
     }[plan]
 
     if dry:
@@ -442,7 +535,7 @@ def install(dry=False):
     # depends on nothing we are about to write, so it can run first. Running it
     # afterwards (as this used to) meant a provably broken set of hooks was already
     # wired into the user's global config by the time we found out.
-    ok, row = selftest()
+    ok, row = selftest(hooks_dir)
     print(f"\n  self-test (wired hooks -> temp DB): {'PASS' if ok else 'FAIL'}  {row}")
     if not ok:
         print("\n  ABORTED — nothing was rewired. The hooks do not work as installed;")
@@ -504,7 +597,7 @@ def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
     if "--uninstall" in argv:
         return uninstall()
-    return install(dry="--dry-run" in argv)
+    return install(dry="--dry-run" in argv, dev="--dev" in argv)
 
 
 if __name__ == "__main__":

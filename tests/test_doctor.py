@@ -79,14 +79,14 @@ def _settings(cmds, statusline=SL):
 
 
 def test_unwired_hooks_are_reported(tmp_path):
-    out = doctor.check_wiring(_settings({}), HOOKS, SL, EVENTS)
+    out = doctor.check_wiring(_settings({}), (HOOKS,), (SL,), EVENTS)
     assert _text(out).count("not wired") == 2
 
 
 def test_a_hook_wired_to_a_missing_file_is_reported(tmp_path):
     """The moved-checkout case: settings.json holds absolute paths into the tree."""
     out = doctor.check_wiring(
-        _settings({"SessionStart": "/hooks/session_start.sh"}), HOOKS, SL, ("SessionStart",))
+        _settings({"SessionStart": "/hooks/session_start.sh"}), (HOOKS,), (SL,), ("SessionStart",))
     assert FAIL in _levels(out) and "missing file" in _text(out)
 
 
@@ -94,30 +94,30 @@ def test_a_hook_without_the_executable_bit_is_reported(tmp_path):
     h = tmp_path / "session_start.sh"
     h.write_text("#!/bin/bash\n")
     h.chmod(0o644)                                 # the silent-no-op bug
-    out = doctor.check_wiring(_settings({"SessionStart": str(h)}), tmp_path,
-                              str(tmp_path / "statusline.sh"), ("SessionStart",))
+    out = doctor.check_wiring(_settings({"SessionStart": str(h)}), (tmp_path,),
+                              (str(tmp_path / "statusline.sh"),), ("SessionStart",))
     assert FAIL in _levels(out) and "not executable" in _text(out)
 
 
 def test_an_unset_statusline_is_a_failure(tmp_path):
-    out = doctor.check_wiring(json.dumps({"hooks": {}}), HOOKS, SL, ())
+    out = doctor.check_wiring(json.dumps({"hooks": {}}), (HOOKS,), (SL,), ())
     assert FAIL in _levels(out) and "statusLine not set" in _text(out)
 
 
 def test_a_statusline_behind_a_wrapper_counts_as_wired(tmp_path):
     wrapper = tmp_path / "custom-status-line.sh"
     wrapper.write_text(f'#!/bin/bash\nexec "{SL}" "$@"\n')
-    out = doctor.check_wiring(_settings({}, statusline=str(wrapper)), HOOKS, SL, ())
+    out = doctor.check_wiring(_settings({}, statusline=str(wrapper)), (HOOKS,), (SL,), ())
     assert FAIL not in _levels(out) and "via wrapper" in _text(out)
 
 
 def test_a_foreign_statusline_warns_that_no_metrics_are_recorded(tmp_path):
-    out = doctor.check_wiring(_settings({}, statusline="/opt/mine.sh"), HOOKS, SL, ())
+    out = doctor.check_wiring(_settings({}, statusline="/opt/mine.sh"), (HOOKS,), (SL,), ())
     assert WARN in _levels(out) and "records no metrics" in _text(out)
 
 
 def test_unparseable_settings_is_reported_not_raised():
-    out = doctor.check_wiring("{not json", HOOKS, SL, EVENTS)
+    out = doctor.check_wiring("{not json", (HOOKS,), (SL,), EVENTS)
     assert _levels(out) == [FAIL]
 
 
@@ -195,3 +195,53 @@ def test_cli_dispatches_doctor_without_opening_the_db(monkeypatch):
     monkeypatch.setattr(cli, "connect",
                         lambda *a, **k: pytest.fail("doctor must not open the DB"))
     assert cli.main(["doctor"]) in (0, 1)
+
+
+# ── hook mode: which hooks are actually running ─────────────────────────────
+INST = pathlib.Path("/home/u/.herd/hooks")
+TREE = pathlib.Path("/home/u/code/herd/src/herd/hooks")
+
+
+def _mode_settings(root):
+    return json.dumps({"hooks": {"Stop": [{"hooks": [
+        {"type": "command", "command": f"{root}/stop.sh"}]}]}})
+
+
+def test_copy_mode_is_reported_as_healthy():
+    out = doctor.check_hook_mode(_mode_settings(INST), INST, TREE, current=True)
+    assert _levels(out) == [OK] and "installed copy" in _text(out)
+
+
+def test_dev_mode_is_reported_as_a_warning_not_a_failure():
+    """--dev is a legitimate choice while editing hooks, but it must never be a
+    surprise: a git checkout changes what every running session executes."""
+    out = doctor.check_hook_mode(_mode_settings(TREE), INST, TREE)
+    assert _levels(out) == [WARN]
+    assert "CHECKOUT" in _text(out) and "--dev" in _text(out)
+
+
+def test_stale_installed_hooks_are_reported():
+    """The cost of the copy: edits to the tree do nothing until you re-install."""
+    out = doctor.check_hook_mode(_mode_settings(INST), INST, TREE, current=False)
+    assert _levels(out) == [WARN] and "STALE" in _text(out)
+
+
+def test_wiring_to_both_roots_is_a_failure():
+    """Every event wired twice means every hook fires twice."""
+    both = json.dumps({"hooks": {"Stop": [
+        {"hooks": [{"type": "command", "command": f"{INST}/stop.sh"}]},
+        {"hooks": [{"type": "command", "command": f"{TREE}/stop.sh"}]}]}})
+    out = doctor.check_hook_mode(both, INST, TREE)
+    assert _levels(out) == [FAIL] and "BOTH" in _text(out)
+
+
+def test_no_herd_hooks_at_all_is_a_failure():
+    out = doctor.check_hook_mode(json.dumps({"hooks": {}}), INST, TREE)
+    assert _levels(out) == [FAIL] and "no herd hooks wired" in _text(out)
+
+
+def test_a_dev_install_is_not_mistaken_for_broken_wiring():
+    """check_wiring accepts either root — otherwise --dev reads as 'not wired'."""
+    out = doctor.check_wiring(_mode_settings(TREE), (INST, TREE),
+                              (f"{INST}/statusline.sh", f"{TREE}/statusline.sh"), ("Stop",))
+    assert not any(l == FAIL and "not wired" in h for l, h, _ in out)
