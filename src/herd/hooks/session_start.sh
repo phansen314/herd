@@ -28,11 +28,25 @@ export HERD_P_session_id="$SID" HERD_P_cwd="$CWD" HERD_P_model="$MODEL" \
 export HERD_P_pid="$(claude_pid)"
 run W2c_pid_claim >/dev/null 2>&1
 
-ADOPTED=0; IN_KITTY=0
+ADOPTED=0; IN_KITTY=0; W2_RC=0
 if [ -n "${KITTY_WINDOW_ID:-}" ] && [ -n "${KITTY_LISTEN_ON:-}" ]; then
     IN_KITTY=1
     export HERD_P_socket="$KITTY_LISTEN_ON" HERD_P_win="$KITTY_WINDOW_ID"
-    ADOPTED=$(run W2_adopt "SELECT changes();" 2>/dev/null)
+    ADOPTED=$(run W2_adopt "SELECT changes();" 2>/dev/null); W2_RC=$?
+fi
+
+# W2 FAILED (a locked DB is the common case) — "0 rows changed" and "we never
+# found out" are different answers, and only the first means "no row to adopt".
+# Falling through on a failure inserted a SECOND row for this window while the
+# spawn reservation kept the job_name, so the live session was left unnamed and
+# `herd jump <job>` could never find it again.
+#
+# Deferring is safe: statusline Path C (W5b_adopt) retries adoption on the same
+# (socket, window_id) about once a second, and claims the reservation as soon as
+# the lock clears — long before W3f's stranded sweep would reclaim it.
+if [ "$W2_RC" -ne 0 ]; then
+    herd_log "W2_adopt failed (rc=$W2_RC) — deferring to statusline adoption"
+    exit 0
 fi
 
 # W2 missed: insert the session (+ its placement when in kitty) in ONE txn.

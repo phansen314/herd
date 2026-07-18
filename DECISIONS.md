@@ -99,8 +99,25 @@ before attempting adoption. A failure means we learned *nothing* about whether t
 row is adopted; the only correct response is to skip the DB work and render from
 the payload, which the hook can always do.
 
-**Protects:** the `RC` capture in `statusline.sh`. Collapsing it back to a test on
-`$CH` alone restores the 3× stall. `test_a_failing_db_is_not_retried_as_an_adoption_miss`
+**The same bug lived in `session_start.sh`**, where the cost was correctness rather
+than latency. `ADOPTED=$(run W2_adopt "SELECT changes();")` fell through to
+`W2b_insert` on a failure, inserting a SECOND row for a window the spawn reservation
+already held — so the live session had no `job_name` and `herd jump <job>` could
+never find it again. Reproduced under a held write lock:
+
+```
+id 1  session_id NULL       job_name api    <- reservation, orphaned
+id 2  session_id sid-real   job_name NULL   <- duplicate, unnamed forever
+```
+
+There the fix is to **defer**, not to insert: on a failed adopt we have learned
+nothing, and statusline Path C retries the same `(socket, window_id)` about once a
+second, so the row is claimed as soon as the lock clears — well inside W3f's
+stranded-sweep grace.
+
+**Protects:** the `RC` capture in `statusline.sh` and the `W2_RC` guard in
+`session_start.sh`. Collapsing either back to a test on the output alone restores
+the stall / the duplicate. `test_a_failing_db_is_not_retried_as_an_adoption_miss`
 asserts the DB-error *count*, not wall-clock, so it stays deterministic and free —
 a corrupt DB reaches the same branch instantly that a locked one reaches slowly.
 `test_a_genuine_adoption_miss_still_adopts` holds the other side: a healthy DB

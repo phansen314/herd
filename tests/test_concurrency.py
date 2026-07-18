@@ -8,6 +8,7 @@ processes against one file.
 """
 import json
 import os
+import pathlib
 import sqlite3
 import subprocess
 import threading
@@ -16,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from herd.spawn import SpawnSpec, spawn
 
-from helpers import HOOKS, T0, mk_session
+from helpers import HOOKS, T0, SOCK, mk_session, mk_herd
 
 PAY = {"session_id": "s1", "cwd": "/code/herd", "model": {"id": "opus"}}
 NO_THROTTLE = {"HERD_TOOL_THROTTLE": "0"}   # else the 2s coalesce hides the race
@@ -223,3 +224,71 @@ def test_reservation_is_not_visible_as_a_placement_until_launched(fresh, tmp_pat
     assert seen["row"]["window_id"] is None     # but not yet placed
     assert conn.execute("SELECT window_id FROM herd_sessions").fetchone()[0] == 42
     conn.close()
+
+
+# ── a failed adopt must not become a duplicate row ──────────────────────────
+def _chmod_db(path, mode):
+    """SQLite creates -wal/-shm with the DATABASE FILE's permissions, so a chmod that
+    misses the sidecars leaves the DB unwritable after it is nominally restored."""
+    for p in (path, path + "-wal", path + "-shm"):
+        if os.path.exists(p):
+            os.chmod(p, mode)
+
+
+def _readonly(path):
+    """Make every write fail INSTANTLY, exercising the same rc != 0 branch a lock
+    reaches after 3s. Deterministic and free — no sleeping out a busy_timeout."""
+    _chmod_db(path, 0o444)
+
+
+def test_a_failed_adopt_defers_instead_of_inserting_a_duplicate(hook_env):
+    """session_start read "" (W2_adopt FAILED) the same as "0" (adopted nothing) and
+    fell through to W2b_insert. That inserted a second row for the window while the
+    spawn reservation kept the job_name, so the live session was unnamed forever and
+    `herd jump <job>` could never find it.
+
+    Deferring is correct: statusline Path C retries the same adoption ~1/sec."""
+    c = hook_env.conn()
+    pk = mk_session(c, cwd="/code/app")                      # the spawn reservation
+    mk_herd(c, pk, job_name="api", kitty_socket=SOCK, window_id=7)
+    c.close()
+    _readonly(hook_env.path)
+
+    r = hook_env.run("session_start.sh",
+                     {"session_id": "sid-real", "cwd": "/code/app", "model": "opus",
+                      "source": "startup"},
+                     env={"KITTY_WINDOW_ID": "7", "KITTY_LISTEN_ON": SOCK})
+    assert r.returncode == 0                                  # never blocks Claude
+
+    _chmod_db(hook_env.path, 0o644)
+    c = hook_env.conn()
+    rows = c.execute("SELECT id, session_id FROM sessions").fetchall()
+    assert len(rows) == 1 and rows[0]["id"] == pk             # no duplicate
+    assert c.execute("SELECT job_name FROM herd_sessions").fetchone()[0] == "api"
+    log = pathlib.Path(hook_env.runtime, "err.log")
+    assert "W2_adopt failed" in log.read_text()               # and it is diagnosable
+
+
+def test_the_deferred_session_is_recovered_by_path_c(hook_env):
+    """The other half of the contract: deferring is only safe because the statusline
+    adopts the same (socket, window_id) on its next render."""
+    c = hook_env.conn()
+    pk = mk_session(c, cwd="/code/app")
+    mk_herd(c, pk, job_name="api", kitty_socket=SOCK, window_id=7)
+    c.close()
+    _readonly(hook_env.path)
+    hook_env.run("session_start.sh",
+                 {"session_id": "sid-real", "cwd": "/code/app", "model": "opus",
+                  "source": "startup"},
+                 env={"KITTY_WINDOW_ID": "7", "KITTY_LISTEN_ON": SOCK})
+    _chmod_db(hook_env.path, 0o644)                           # contention clears
+
+    hook_env.run("statusline.sh",
+                 {"session_id": "sid-real", "model": {"id": "claude-opus-4-8"},
+                  "cwd": "/code/app", "context_window": {"used_percentage": 12}},
+                 env={"KITTY_WINDOW_ID": "7", "KITTY_LISTEN_ON": SOCK})
+    c = hook_env.conn()
+    row = c.execute("SELECT s.session_id, s.context_percent, h.job_name FROM sessions s "
+                    "JOIN herd_sessions h ON h.session_pk = s.id WHERE s.id = ?", (pk,)).fetchone()
+    assert (row["session_id"], row["job_name"]) == ("sid-real", "api")   # one row, named
+    assert row["context_percent"] == 12                                  # and metrics flow
