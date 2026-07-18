@@ -1,10 +1,11 @@
 """S — the attention tick (daemon.py): the derived silence rule, arm/disarm edge
 handling, and the HERD_ATTENTION core/herd layer gate."""
 import datetime as dt
+import sqlite3
 
 import pytest
 
-from herd import cli
+from herd import cli, daemon
 from herd.daemon import (needs_attention, attention_tick, _attention_enabled,
                          run as daemon_run)
 
@@ -284,3 +285,39 @@ def test_run_gates_attention_end_to_end(fresh):
     assert c.execute("SELECT COUNT(*) FROM herd_attention").fetchone()[0] == 0
     daemon_run(db_path=dbp, once=True, attend=True)
     assert c.execute("SELECT COUNT(*) FROM herd_attention").fetchone()[0] == 1
+
+
+# ── orphaned attention rows ─────────────────────────────────────────────────
+def test_attention_for_a_dead_session_is_reclaimed(fresh):
+    """Death is an UPDATE (W3d_reap, W4_end), never a DELETE, so ON DELETE CASCADE
+    never fires — and attention_tick only visits live rows, so it cannot see the
+    orphan it would need to clean. One row leaks per session that ever needed you
+    and then died: invisible to every read, and unbounded."""
+    c = fresh()
+    dead = mk_session(c, session_id="dead", status="waiting", last_event_at=T0)
+    live = mk_session(c, session_id="live", status="waiting", last_event_at=T0)
+    mk_attention(c, dead, attention_at=T0)
+    mk_attention(c, live, attention_at=T0)
+    c.execute("UPDATE sessions SET stopped_at=? WHERE id=?", (T1, dead))
+
+    assert daemon.attention_tick(c, T2) is not None       # the tick cannot reach it
+    assert c.execute("SELECT COUNT(*) FROM herd_attention "
+                     "WHERE session_pk=?", (dead,)).fetchone()[0] == 1
+
+    assert daemon.sweep_dead_attention(c) == 1
+    assert c.execute("SELECT COUNT(*) FROM herd_attention "
+                     "WHERE session_pk=?", (dead,)).fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM herd_attention "
+                     "WHERE session_pk=?", (live,)).fetchone()[0] == 1   # untouched
+
+
+def test_the_sweep_runs_on_the_tick(fresh, tmp_path):
+    """It has to be wired in, not merely available."""
+    c = fresh(name="att.db")
+    dead = mk_session(c, session_id="d", status="waiting", last_event_at=T0)
+    mk_attention(c, dead, attention_at=T0)
+    c.execute("UPDATE sessions SET stopped_at=? WHERE id=?", (T1, dead))
+    c.close()
+    daemon.run(interval=0, db_path=str(tmp_path / "att.db"), once=True, attend=True)
+    c = sqlite3.connect(str(tmp_path / "att.db"))
+    assert c.execute("SELECT COUNT(*) FROM herd_attention").fetchone()[0] == 0

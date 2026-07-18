@@ -5,7 +5,7 @@ import sqlite3
 import pytest
 
 from herd import cli
-from herd.kitty.launch import build_launch_argv
+from herd.kitty.launch import build_launch_argv, launch
 from herd.spawn import SpawnSpec, spawn, valid_job
 
 from helpers import T0, SOCK, mk_session, mk_herd, job_holder
@@ -176,3 +176,51 @@ def test_a_raising_launcher_frees_the_job_name(fresh):
     assert job_holder(c, "api") is None
     ok2, _, _ = spawn(c, _spec(job="api"), SOCK, T0, launch_fn=lambda s, k: 42)
     assert ok2                                   # the name is immediately reusable
+
+
+# ── launch(): kitten's stdout -> window_id ──────────────────────────────────
+# The lowest-covered code in the repo, and it decides whether a launched tab gets
+# RECORDED or stranded. Tests stubbed spawn(launch_fn=) one layer above this, so
+# the conversion itself — and the timeout path written for a dead kitty — had none.
+def test_launch_parses_the_window_id():
+    assert launch(_spec(), SOCK, run_fn=lambda argv: "42\n") == 42
+
+
+def test_launch_tolerates_surrounding_whitespace():
+    assert launch(_spec(), SOCK, run_fn=lambda argv: "  7  \n") == 7
+
+
+@pytest.mark.parametrize("out,label", [
+    ("", "empty (timeout, or a socket with nothing listening)"),
+    ("\n", "blank line"),
+    ("Error: no such window", "kitten error text"),
+    ("42abc", "not an integer"),
+    (None, "no stdout at all"),
+])
+def test_launch_reads_any_non_integer_as_failure(out, label):
+    """spawn() keys off None to drop the reservation and free the job name, so
+    anything that is not a window id MUST come back as None, not raise."""
+    assert launch(_spec(), SOCK, run_fn=lambda argv: out) is None, label
+
+
+def test_launch_passes_the_built_argv_through():
+    seen = {}
+    launch(_spec(job="api", cwd="/code/app"), SOCK,
+           run_fn=lambda argv: (seen.update(argv=argv), "9")[1])
+    assert seen["argv"] == build_launch_argv(_spec(job="api", cwd="/code/app"), SOCK)
+
+
+def test_launch_times_out_against_a_socket_that_never_answers(tmp_path, monkeypatch):
+    """The real path: a stale unix:/tmp/kitty-<pid> whose kitty is gone. Drives the
+    actual subprocess call, not a stub, so the TimeoutExpired -> "" -> None chain
+    is exercised end to end."""
+    import socket as _socket
+    from herd.kitty import launch as L
+    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    p = str(tmp_path / "kitty-stale")
+    srv.bind(p); srv.listen(1)
+    monkeypatch.setattr(L, "LAUNCH_TIMEOUT", 1)
+    try:
+        assert L.launch(_spec(), f"unix:{p}") is None
+    finally:
+        srv.close()

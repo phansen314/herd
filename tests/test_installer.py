@@ -5,6 +5,7 @@ import os
 import pathlib
 
 import pytest
+from types import SimpleNamespace
 
 from herd import install as inst
 
@@ -372,3 +373,86 @@ def test_hooks_are_current_detects_drift(home):
     assert inst.hooks_are_current()
     (inst.INSTALLED_HOOKS / "stop.sh").write_text("#!/bin/bash\n# edited\nexit 0\n")
     assert not inst.hooks_are_current()
+
+
+# ── symlinks + service: the side-effecting paths ────────────────────────────
+def test_relink_backs_up_a_real_file_instead_of_destroying_it(tmp_path):
+    """uninstall_cli only removes symlinks resolving to OUR target, so anything
+    _relink deleted was gone for good. Every other installer path backs up first."""
+    link = tmp_path / "bin" / "herd"
+    link.parent.mkdir()
+    link.write_text("#!/bin/sh\n# my own herd script\n")
+    inst._relink(link, tmp_path / "real-herd", ts="20260101-000000")
+    assert link.is_symlink()
+    saved = list(link.parent.glob("herd.herd-bak.*"))
+    assert saved, "the pre-existing script was destroyed with no backup"
+    assert "my own herd script" in saved[0].read_text()
+
+
+def test_relink_replaces_its_own_symlink_without_a_backup(tmp_path):
+    """A symlink carries nothing to preserve — backing those up would litter."""
+    link = tmp_path / "herd"
+    link.symlink_to(tmp_path / "old-target")
+    inst._relink(link, tmp_path / "new-target")
+    assert link.readlink() == tmp_path / "new-target"
+    assert not list(tmp_path.glob("herd.herd-bak.*"))
+
+
+def test_relink_refuses_a_directory(tmp_path):
+    d = tmp_path / "herd"
+    d.mkdir()
+    with pytest.raises(IsADirectoryError):
+        inst._relink(d, tmp_path / "target")
+    assert d.is_dir()                                   # left intact
+
+
+def test_relink_is_idempotent(tmp_path):
+    link, target = tmp_path / "herd", tmp_path / "target"
+    inst._relink(link, target)
+    inst._relink(link, target)
+    assert link.readlink() == target
+    assert not list(tmp_path.glob("herd.herd-bak.*"))
+
+
+def test_service_install_is_a_graceful_noop_without_systemd(monkeypatch, tmp_path):
+    """macOS/headless: the daemon still works, you just run it yourself. This must
+    not look like a failure, and must not write a unit nowhere useful."""
+    monkeypatch.setattr(inst, "_has_systemd_user", lambda: False)
+    monkeypatch.setattr(inst, "SERVICE", tmp_path / "herd.service")
+    msg = inst.install_service()
+    assert "SKIPPED" in msg and "herd.daemon" in msg     # tells you what to do
+    assert not (tmp_path / "herd.service").exists()
+    assert inst.uninstall_service() == "no herd.service to remove"
+
+
+def test_uninstall_service_removes_the_unit(monkeypatch, tmp_path):
+    unit = tmp_path / "herd.service"
+    unit.write_text("[Unit]\n")
+    monkeypatch.setattr(inst, "SERVICE", unit)
+    monkeypatch.setattr(inst, "_has_systemd_user", lambda: True)
+    monkeypatch.setattr(inst.subprocess, "run",
+                        lambda *a, **k: SimpleNamespace(stdout="", returncode=0))
+    assert "removed" in inst.uninstall_service()
+    assert not unit.exists()
+
+
+def test_install_cli_links_both_and_warns_when_not_on_path(monkeypatch, tmp_path):
+    monkeypatch.setattr(inst, "CLI_LINK", tmp_path / "bin" / "herd")
+    monkeypatch.setattr(inst, "COMPLETION_LINK", tmp_path / "comp" / "herd")
+    monkeypatch.setenv("PATH", "/usr/bin")               # ~/.local/bin absent
+    msg = inst.install_cli()
+    assert (tmp_path / "bin" / "herd").is_symlink()
+    assert (tmp_path / "comp" / "herd").is_symlink()
+    assert "WARN" in msg or "PATH" in msg
+
+
+def test_uninstall_cli_leaves_a_foreign_link_alone(monkeypatch, tmp_path):
+    """It only removes links resolving to our own target — a stranger's `herd`
+    on PATH is not ours to delete."""
+    foreign = tmp_path / "bin" / "herd"
+    foreign.parent.mkdir()
+    foreign.symlink_to(tmp_path / "someone-elses-herd")
+    monkeypatch.setattr(inst, "CLI_LINK", foreign)
+    monkeypatch.setattr(inst, "COMPLETION_LINK", tmp_path / "comp" / "herd")
+    inst.uninstall_cli()
+    assert foreign.is_symlink()                          # untouched

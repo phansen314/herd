@@ -258,6 +258,16 @@ DELETE FROM herd_attention WHERE session_pk = :pk;
 DELETE FROM herd_attention
 WHERE session_pk = (SELECT id FROM sessions WHERE session_id = :session_id);
 
+-- W6e: DROP ATTENTION FOR THE DEAD. Death is recorded by UPDATE (W3d_reap, W4_end),
+-- never DELETE, so the ON DELETE CASCADE never fires; and attention_tick only
+-- visits rows WHERE stopped_at IS NULL, so a session that dies while armed keeps
+-- its herd_attention row forever. Invisible to every read (R1_list joins through
+-- the same liveness filter) and therefore unbounded — one orphan per session that
+-- ever needed you and then died.
+-- :name W6e_sweep_dead
+DELETE FROM herd_attention
+WHERE session_pk IN (SELECT id FROM sessions WHERE stopped_at IS NOT NULL);
+
 
 -- ── R_statusline. RENDER INPUT (statusline.sh): feeds only the burn rate (the
 -- prev_cost pair). One read per fingerprint miss. '|'-joined for a single bash read.

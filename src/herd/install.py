@@ -294,10 +294,21 @@ def uninstall_service():
 
 
 # ── CLI on PATH + bash completion ──────────────────────────────────────────
-def _relink(link, target):
-    """Idempotently point `link` at `target` (symlink). mkdir parents."""
+def _relink(link, target, ts=None):
+    """Idempotently point `link` at `target` (symlink). mkdir parents.
+
+    A REAL FILE at the link path gets backed up first. This used to unlink
+    whatever it found, so an unrelated ~/.local/bin/herd of your own was destroyed
+    with no copy kept — and uninstall_cli() could not put it back, since it
+    (correctly) only removes symlinks resolving to our own target. Every other
+    path in this installer backs up before overwriting; this one didn't."""
     link.parent.mkdir(parents=True, exist_ok=True)
-    if link.is_symlink() or link.exists():
+    if link.is_symlink():
+        link.unlink()                       # a symlink carries nothing to preserve
+    elif link.exists():
+        if link.is_dir():
+            raise IsADirectoryError(f"{link} is a directory — refusing to replace it")
+        backup(link, ts or _ts())
         link.unlink()
     link.symlink_to(target)
 

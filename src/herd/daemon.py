@@ -185,6 +185,13 @@ def sweep_stranded(conn, now, max_age=None):
     return conn.execute(W["W3f_sweep_stranded"], {"cutoff": cutoff}).rowcount
 
 
+def sweep_dead_attention(conn):
+    """Reclaim herd_attention rows whose session has stopped. Tier 2 — runs with
+    the attention tick, which cannot do it itself: that tick only visits live rows,
+    so the orphan it would need to see is filtered out before it looks."""
+    return conn.execute(W["W6e_sweep_dead"]).rowcount
+
+
 def boot_sweep(conn, now, boot_time):
     """Run ONCE at startup: reap live rows whose started_at precedes system boot
     (recycled pids could read dead sessions as alive). No-op when boot_time None."""
@@ -358,6 +365,7 @@ def run(interval=2.0, db_path=None, once=False, attend=None):
             sweep_stranded(conn, now)                 # tier 1 — needs no proc table
             if attend:
                 attention_tick(conn, now)             # tier 2 — herd's opinion
+                sweep_dead_attention(conn)            # tier 2 — reclaim the dead
             fails = 0
         except Exception as e:                        # noqa: BLE001 — a daemon outlives its errors
             fails += 1
