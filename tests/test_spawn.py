@@ -99,3 +99,33 @@ def test_split_dashdash():
     assert cli._split_dashdash(["api", "--type", "pane", "--", "--model", "opus"]) == \
         (["api", "--type", "pane"], ["--model", "opus"])
     assert cli._split_dashdash(["api"]) == (["api"], [])
+
+
+# ── cmd_spawn: --type / --tab / --pane shorthand ─────────────────────────────
+def _capture_spawn(monkeypatch):
+    seen = {}
+
+    def fake_spawn(conn, spec, socket, now, **kw):
+        seen["spec"], seen["socket"] = spec, socket
+        return True, "ok", 1
+
+    monkeypatch.setattr(cli, "spawn", fake_spawn)
+    monkeypatch.setenv("KITTY_LISTEN_ON", SOCK)
+    return seen
+
+
+@pytest.mark.parametrize("argv,want", [
+    (["api"], "tab"),                  # default
+    (["api", "--tab"], "tab"),
+    (["api", "--pane"], "pane"),
+    (["api", "--type", "pane"], "pane"),
+])
+def test_cmd_spawn_launch_type(monkeypatch, fresh, argv, want):
+    seen = _capture_spawn(monkeypatch)
+    assert cli.cmd_spawn(fresh(), argv) == 0
+    assert seen["spec"].launch_type == want and seen["socket"] == SOCK
+
+
+def test_cmd_spawn_tab_and_pane_conflict(monkeypatch, fresh):
+    _capture_spawn(monkeypatch)
+    assert cli.cmd_spawn(fresh(), ["api", "--tab", "--pane"]) == 2   # usage error

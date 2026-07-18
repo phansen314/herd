@@ -381,12 +381,18 @@ def cmd_spawn(conn, args):
     p = argparse.ArgumentParser(prog="herd spawn", add_help=False)
     p.add_argument("job")
     p.add_argument("--cwd", default=None)
-    p.add_argument("--type", dest="launch_type", choices=("tab", "pane"), default="tab")
     p.add_argument("--prompt", default=None)
+    # --type tab|pane, with --tab / --pane as shorthand. Mutually exclusive so
+    # `--tab --pane` (or --type with either) is a clean usage error, not a
+    # silent last-wins.
+    t = p.add_mutually_exclusive_group()
+    t.add_argument("--type", dest="launch_type", choices=("tab", "pane"), default="tab")
+    t.add_argument("--tab", dest="launch_type", action="store_const", const="tab")
+    t.add_argument("--pane", dest="launch_type", action="store_const", const="pane")
     try:
         ns = p.parse_args(herd_args)
     except SystemExit:
-        print("usage: herd spawn <job> [--cwd DIR] [--type tab|pane] "
+        print("usage: herd spawn <job> [--cwd DIR] [--type tab|pane | --tab | --pane] "
               "[--prompt TEXT] [-- <claude args...>]")
         return 2
     spec = SpawnSpec(job=ns.job, cwd=ns.cwd or os.getcwd(), launch_type=ns.launch_type,
