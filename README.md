@@ -123,20 +123,38 @@ a unique match, in which case it focuses immediately.
 sessions change. Give it a dedicated kitty tab and a key to reach it:
 
 ```conf
-# ~/.config/kitty/kitty.conf — focus the herd tab, launching it once if needed
-map ctrl+space>c launch --type=background ~/.config/kitty/focus-herd.sh
+# ~/.config/kitty/kitty.conf — focus the herd tab, launching it once if needed.
+# --allow-remote-control is REQUIRED: a plain --type=background process gets no
+# KITTY_LISTEN_ON, so every `kitten @` in the script fails silently and the key
+# looks like it does nothing.
+map ctrl+space>c launch --type=background --allow-remote-control ~/.config/kitty/focus-herd.sh
 ```
 
 ```sh
 #!/bin/sh
 # ~/.config/kitty/focus-herd.sh
-kitten @ focus-tab --match title:herd 2>/dev/null && exit 0
-kitten @ launch --type=tab --tab-title herd herd watch
+set -eu
+# Match values are unanchored regexes — bare `title:herd` also hits `herd-2`.
+kitten @ focus-tab --match 'title:^herd$' 2>/dev/null && exit 0
+exec kitten @ launch --type=tab --tab-title herd --cwd "$HOME" \
+    bash -l -i -c 'herd watch; exec bash'
 ```
 
-Enter jumps to a session, `ctrl-r` forces a refresh, `ctrl-q` quits. Esc re-opens the
-picker rather than exiting — it's a tab you can't accidentally fall out of, so after
-jumping away, the same key brings you back to a live list.
+The login shell matters: `herd` lives in `~/.local/bin`, which a bare `launch` may not
+have on PATH. `exec bash` means quitting the dashboard leaves a shell rather than
+closing the tab.
+
+To have the tab from the start, add it to your `startup_session` file:
+
+```conf
+new_tab herd
+cd ~
+launch bash -l -i -c 'herd watch; exec bash'
+```
+
+Enter jumps to a session, `ctrl-r` forces a refresh, `ctrl-q` / `ctrl-c` quit. Esc
+re-opens the picker rather than exiting — it's a tab you can't accidentally fall out
+of, so after jumping away, the same key brings you back to a live list.
 
 **Or read the DB directly** — everything the CLI shows, and more:
 
