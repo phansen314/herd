@@ -1395,45 +1395,52 @@ okn, _ = focus_session(c2, p2, T1, list_fn=lambda s: [], focus_fn=lambda s, w: T
 check("focus_session errors on kitty failure and on a session with no placement",
       not okf and not okn)
 
-# cli.resolve: herd id, uuid prefix, cwd substring, exact job.
+# cli.resolve: herd id, uuid prefix, session-name/cwd substring, exact job.
 c = fresh()
-a = c.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at)"
-              " VALUES('aaa11111','/x/api','working',?,?)",(T0,T0)).lastrowid
+a = c.execute("INSERT INTO sessions(session_id,session_name,cwd,status,started_at,updated_at)"
+              " VALUES('aaa11111','refactor-api','/x/api','working',?,?)",(T0,T0)).lastrowid
 c.execute("INSERT INTO herd_sessions(session_pk,job_name,kitty_socket,window_id,source,verified_at)"
           " VALUES(?,?,?,?,'spawn',?)",(a,"api",SOCK,1,T0))
 b = c.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at)"
               " VALUES('bbb22222','/y/web','working',?,?)",(T0,T0)).lastrowid
 ids = lambda ms: sorted(r["id"] for r in ms)
-check("cli.resolve matches by herd id / uuid prefix / cwd / job",
+check("cli.resolve matches by herd id / uuid / NAME / cwd / job",
       ids(_cli.resolve(c, str(a))) == [a] and ids(_cli.resolve(c, "aaa1")) == [a]
+      and ids(_cli.resolve(c, "refactor")) == [a]      # Claude /rename name
       and ids(_cli.resolve(c, "web")) == [b] and ids(_cli.resolve(c, "api")) == [a]
       and _cli.resolve(c, "nomatch") == [])
 check("cli.resolve refuses an empty query (never matches all)",
       _cli.resolve(c, "") == [] and _cli.resolve(c, "   ") == [])
 
-# fzf picker pieces (pure): the herd id is a hidden first field for parse + preview.
-_pline = _cli._row_line({"id": 3, "session_id": "abc12345", "status": "waiting",
-                         "job_name": "api", "total_cost_usd": 1.5, "cwd": "/x/api", "attn": 1})
-check("cli._row_line prefixes the herd id as a hidden tab field",
-      _pline.split("\t", 1)[0] == "3" and all(s in _pline for s in ("abc12345", "waiting", "/x/api")))
+# display shows the recognizable NAME (session_name > job > uuid8), not the uuid.
+_named = {"id": 3, "session_id": "abc12345", "session_name": "my-refactor",
+          "status": "waiting", "job_name": "api", "total_cost_usd": 1.5, "cwd": "/x/api", "attn": 1}
+_pline = _cli._row_line(_named)
+check("cli._row_line shows the session name (hidden id field kept for parse)",
+      _pline.split("\t", 1)[0] == "3" and "my-refactor" in _pline and "waiting" in _pline)
+check("cli._name falls back session_name -> job -> uuid8",
+      _cli._name(_named) == "my-refactor"
+      and _cli._name({"session_name": None, "job_name": "api", "session_id": "x"}) == "api"
+      and _cli._name({"session_name": None, "job_name": None, "session_id": "abc12345-z"}) == "abc12345")
 _prows = [{"id": 3}, {"id": 9}]
 check("cli._parse_pick maps fzf's chosen line back to its row, and fails safe",
-      _cli._parse_pick(_prows, "3\t #3 …")["id"] == 3
+      _cli._parse_pick(_prows, "3\t …")["id"] == 3
       and _cli._parse_pick(_prows, "") is None
       and _cli._parse_pick(_prows, "x\t") is None
       and _cli._parse_pick(_prows, "99\t") is None)
-_pv = _cli._preview_text({"id": 3, "session_id": "abc12345", "status": "waiting",
-                          "status_source": "hook", "cwd": "/x/api", "total_cost_usd": 1.5,
-                          "context_percent": 42, "attention_at": "2026-07-15T10:00:00.000Z"})
-check("cli._preview_text renders the session detail block (incl. live attention)",
-      all(s in _pv for s in ("abc12345", "waiting", "/x/api", "42%", "$1.50", "needs attention")),
+_pv = _cli._preview_text({"id": 3, "session_id": "abc12345", "session_name": "my-refactor",
+                          "status": "waiting", "status_source": "hook", "cwd": "/x/api",
+                          "total_cost_usd": 1.5, "context_percent": 42,
+                          "attention_at": "2026-07-15T10:00:00.000Z"})
+check("cli._preview_text renders the detail block (name, status, cwd, live attention)",
+      all(s in _pv for s in ("my-refactor", "abc12345", "waiting", "/x/api", "42%", "$1.50", "needs attention")),
       _pv.replace(chr(10), " ⏎ "))
 _ctoks = _cli._complete_tokens([
-    {"session_id": "aaa11111-x", "job_name": "api", "cwd": "/x/api/"},   # job==basename -> dedup
-    {"session_id": "bbb22222-y", "job_name": None,  "cwd": "/y/web"},
-    {"session_id": None,          "job_name": None,  "cwd": "/"}])         # nothing usable
-check("cli._complete_tokens yields uuid8 / job / cwd-basename, deduped+sorted",
-      _ctoks == ["aaa11111", "api", "bbb22222", "web"], _ctoks)
+    {"session_name": "refactor-api", "session_id": "aaa11111-x", "job_name": "api", "cwd": "/x/api/"},
+    {"session_name": None, "session_id": "bbb22222-y", "job_name": None, "cwd": "/y/web"},
+    {"session_name": None, "session_id": None, "job_name": None, "cwd": "/"}])   # nothing usable
+check("cli._complete_tokens yields name / job / uuid8 / cwd-basename, deduped+sorted",
+      _ctoks == ["aaa11111", "api", "bbb22222", "refactor-api", "web"], _ctoks)
 
 print("\n" + "═"*72)
 if FAILED:

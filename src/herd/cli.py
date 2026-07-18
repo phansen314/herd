@@ -2,12 +2,15 @@
 
     herd ls                 # list live sessions
     herd jump               # fuzzy-pick a session (fzf) and focus its kitty window
-    herd jump <query>       # query = herd id, uuid-prefix, cwd, or job
+    herd jump <query>       # query = herd id, name (/rename), job, uuid, or cwd
     herd preview <id>       # session detail (used by the fzf preview pane)
 
-`jump` focuses immediately on a unique query match (scriptable); otherwise it opens
-an fzf picker with a live detail preview. Without fzf (or a tty) it prints the list.
+Sessions show by their recognizable name — Claude's /rename name, else herd's job,
+else the uuid. `jump` focuses immediately on a unique query match (scriptable);
+otherwise it opens an fzf picker with a live detail preview. Without fzf (or a tty)
+it prints the list.
 """
+import os
 import shutil
 import subprocess
 import sys
@@ -16,10 +19,12 @@ from herd.db import connect
 from herd.daemon import DEFAULT_DB, _now_iso
 from herd.kitty.focus import focus_session
 
+_HOME = os.path.expanduser("~")
+
 
 def _live(conn):
     return conn.execute(
-        "SELECT s.id, s.session_id, s.pid, s.status, s.cwd, s.total_cost_usd, "
+        "SELECT s.id, s.session_id, s.session_name, s.pid, s.status, s.cwd, s.total_cost_usd, "
         "       h.job_name, (a.attention_at IS NOT NULL) AS attn "
         "FROM sessions s "
         "LEFT JOIN herd_sessions  h ON h.session_pk = s.id "
@@ -28,12 +33,23 @@ def _live(conn):
         "ORDER BY a.attention_at IS NULL, a.attention_at, s.started_at DESC").fetchall()
 
 
+def _name(r):
+    """The recognizable label: Claude's /rename name, else herd's job, else uuid8."""
+    return r["session_name"] or r["job_name"] or (r["session_id"] or "")[:8] or "—"
+
+
+def _short_cwd(cwd):
+    cwd = cwd or ""
+    return "~" + cwd[len(_HOME):] if cwd.startswith(_HOME) else cwd
+
+
 def _line(r):
     """The display half of a session row (no id prefix)."""
-    uuid = (r["session_id"] or "")[:8] or "—"
+    name = _name(r)
+    name = name[:25] + "…" if len(name) > 26 else name
     cost = f"${r['total_cost_usd']:.2f}" if r["total_cost_usd"] is not None else "—"
-    return (f"{'!' if r['attn'] else ' '} #{r['id']:<3} {uuid:8} {r['status']:14} "
-            f"{(r['job_name'] or '—'):12} {cost:>7}  {r['cwd']}")
+    return (f"{'!' if r['attn'] else ' '} #{r['id']:<3} {name:26} {r['status']:14} "
+            f"{cost:>8}  {_short_cwd(r['cwd'])}")
 
 
 def _fmt(rows):
@@ -41,8 +57,8 @@ def _fmt(rows):
 
 
 def resolve(conn, query):
-    """Live sessions matching query: exact herd id, uuid prefix, cwd substring, or
-    exact job name. An empty query matches nothing (never all)."""
+    """Live sessions matching query: exact herd id, uuid prefix, session-name or
+    cwd substring, or exact job name. An empty query matches nothing (never all)."""
     q = query.strip()
     if not q:
         return []
@@ -54,6 +70,7 @@ def resolve(conn, query):
     ql = q.lower()
     return [r for r in rows
             if (r["session_id"] or "").startswith(q)
+            or ql in (r["session_name"] or "").lower()
             or ql in (r["cwd"] or "").lower()
             or (r["job_name"] or "") == q]
 
@@ -104,7 +121,9 @@ def _preview_text(row):
 
     cost = f"${d['total_cost_usd']:.2f}" if d.get("total_cost_usd") is not None else "—"
     ctx = f"{d['context_percent']}%" if d.get("context_percent") is not None else "—"
+    name = d.get("session_name") or d.get("job_name") or (d.get("session_id") or "")[:8] or "—"
     lines = [
+        f"name      {name}",
         f"session   {g('session_id')}",
         f"herd id   #{d.get('id', '—')}",
         f"status    {g('status')}" + (f"  ({d['status_source']})" if d.get("status_source") else ""),
@@ -160,13 +179,15 @@ def cmd_jump(conn, args):
 
 def _complete_tokens(rows):
     """Completion candidates for `herd jump` — the things resolve() matches on:
-    each live session's 8-char uuid, its job name, and its cwd basename."""
+    each live session's name (/rename), job, 8-char uuid, and cwd basename."""
     toks = set()
     for r in rows:
-        if r["session_id"]:
-            toks.add(r["session_id"][:8])
+        if r["session_name"]:
+            toks.add(r["session_name"])
         if r["job_name"]:
             toks.add(r["job_name"])
+        if r["session_id"]:
+            toks.add(r["session_id"][:8])
         cwd = (r["cwd"] or "").rstrip("/")
         if cwd:
             toks.add(cwd.rsplit("/", 1)[-1] or cwd)
@@ -182,8 +203,8 @@ def cmd_preview(conn, args):
     if not args or not args[0].strip().isdigit():
         return 1
     r = conn.execute(
-        "SELECT s.id, s.session_id, s.pid, s.status, s.status_source, s.model, s.cwd, "
-        "       s.git_branch, s.context_percent, s.total_cost_usd, s.started_at, "
+        "SELECT s.id, s.session_id, s.session_name, s.pid, s.status, s.status_source, s.model, "
+        "       s.cwd, s.git_branch, s.context_percent, s.total_cost_usd, s.started_at, "
         "       s.last_event_at, s.last_event_type, h.job_name, a.attention_at, a.paged_level "
         "FROM sessions s "
         "LEFT JOIN herd_sessions  h ON h.session_pk = s.id "
