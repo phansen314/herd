@@ -1,9 +1,12 @@
 """T — jump / focus (kitty/focus.py + cli.py): pid->window resolution, the focus
 path (re-derive, ack, self-heal), and cli display/resolve/completion."""
 import inspect
+import socket
+import time
 
 import pytest
 
+from herd.kitty import focus
 from herd.kitty.focus import window_for_pid, flatten_windows, focus_session
 from herd import cli
 
@@ -406,3 +409,49 @@ def test_jump_without_fzf_reports_an_unmatched_query(monkeypatch, fresh, capsys)
     cli.cmd_jump(c, ["nope-no-such"])
     out = capsys.readouterr().out
     assert "no live session matches" in out and "api" in out   # explains, then lists
+
+
+# ── kitty IO must be bounded ────────────────────────────────────────────────
+# `kitten @` against a stale unix socket (the kitty is gone, the socket file is
+# not) BLOCKS. These sit on the interactive path, so an unbounded call hangs
+# `herd jump` with no output — on exactly the stale placement the cache tolerates.
+def _hanging_socket(tmp_path):
+    """A real AF_UNIX socket that is listening but never answers — the precise
+    shape of a stale kitty socket, not an approximation of it."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    p = str(tmp_path / "kitty-stale")
+    s.bind(p); s.listen(1)
+    return f"unix:{p}", s
+
+
+def test_ls_against_a_dead_kitty_gives_up(tmp_path, monkeypatch):
+    sock, srv = _hanging_socket(tmp_path)
+    monkeypatch.setattr(focus, "KITTY_TIMEOUT", 1)      # keep the test quick
+    try:
+        t0 = time.monotonic()
+        out = focus._ls(sock)
+        elapsed = time.monotonic() - t0
+    finally:
+        srv.close()
+    assert out == ""                                    # -> falls back to the cache
+    assert elapsed < 10, f"_ls blocked for {elapsed:.1f}s"
+
+
+def test_focus_against_a_dead_kitty_reports_failure(tmp_path, monkeypatch):
+    sock, srv = _hanging_socket(tmp_path)
+    monkeypatch.setattr(focus, "KITTY_TIMEOUT", 1)
+    try:
+        t0 = time.monotonic()
+        ok = focus._focus(sock, 7)
+        elapsed = time.monotonic() - t0
+    finally:
+        srv.close()
+    assert ok is False                                  # -> "kitty focus failed"
+    assert elapsed < 10, f"_focus blocked for {elapsed:.1f}s"
+
+
+def test_jump_without_kitten_installed_is_a_message_not_a_traceback(tmp_path, monkeypatch):
+    """kitten absent from PATH raised FileNotFoundError out of `herd jump`."""
+    monkeypatch.setenv("PATH", str(tmp_path))          # no kitten anywhere
+    assert focus._ls("unix:/tmp/nope") == ""
+    assert focus._focus("unix:/tmp/nope", 7) is False

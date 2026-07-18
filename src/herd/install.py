@@ -46,6 +46,11 @@ HERD_HOOKS = {
 
 STATUSLINE = str(HOOKS_DIR / "statusline.sh")
 
+# systemctl can block on a busy/degraded manager; the installer must not hang.
+SYSTEMCTL_TIMEOUT = 15
+# A wired hook that hangs would hang the self-test that exists to vet it.
+SELFTEST_TIMEOUT = 20
+
 
 def hook_cmd(script):
     return str(HOOKS_DIR / script)
@@ -186,9 +191,11 @@ def install_service(dry=False):
     SERVICE.parent.mkdir(parents=True, exist_ok=True)
     SERVICE.write_text(service_unit_text())
     for args in (["daemon-reload"], ["enable", "herd.service"], ["restart", "herd.service"]):
-        subprocess.run(["systemctl", "--user", *args], check=False, capture_output=True)
+        subprocess.run(["systemctl", "--user", *args], check=False,
+                       capture_output=True, timeout=SYSTEMCTL_TIMEOUT)
     active = subprocess.run(["systemctl", "--user", "is-active", "herd.service"],
-                            capture_output=True, text=True).stdout.strip()
+                            capture_output=True, text=True,
+                            timeout=SYSTEMCTL_TIMEOUT).stdout.strip()
     return f"herd.service written + enabled ({active or 'unknown'})"
 
 
@@ -196,9 +203,10 @@ def uninstall_service():
     if not _has_systemd_user() or not SERVICE.exists():
         return "no herd.service to remove"
     subprocess.run(["systemctl", "--user", "disable", "--now", "herd.service"],
-                   check=False, capture_output=True)
+                   check=False, capture_output=True, timeout=SYSTEMCTL_TIMEOUT)
     SERVICE.unlink(missing_ok=True)
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False, capture_output=True)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False,
+                   capture_output=True, timeout=SYSTEMCTL_TIMEOUT)
     return f"removed {SERVICE}"
 
 
@@ -367,13 +375,21 @@ def selftest():
         if not_exec:
             return False, {"not_executable": not_exec}
 
-        subprocess.run([hook_cmd("session_start.sh")],          # direct exec
-                       input=f'{{"session_id":"{SID}","cwd":"/x","model":"m","source":"startup"}}',
-                       capture_output=True, text=True, env=env)
-        sl = subprocess.run([STATUSLINE],                        # direct exec
-                            input=f'{{"session_id":"{SID}","model":{{"id":"m"}},"cwd":"/x",'
-                                  '"context_window":{"used_percentage":10},"cost":{"total_cost_usd":0.5}}',
-                            capture_output=True, text=True, env=env)
+        try:
+            subprocess.run([hook_cmd("session_start.sh")],          # direct exec
+                           input=f'{{"session_id":"{SID}","cwd":"/x","model":"m","source":"startup"}}',
+                           capture_output=True, text=True, env=env,
+                           timeout=SELFTEST_TIMEOUT)
+            sl = subprocess.run([STATUSLINE],                        # direct exec
+                                input=f'{{"session_id":"{SID}","model":{{"id":"m"}},"cwd":"/x",'
+                                      '"context_window":{"used_percentage":10},"cost":{"total_cost_usd":0.5}}',
+                                capture_output=True, text=True, env=env,
+                                timeout=SELFTEST_TIMEOUT)
+        except subprocess.TimeoutExpired as e:
+            # A hook that hangs is a FAIL, not a hung installer — and since the
+            # self-test now gates the write, this is the difference between
+            # refusing to wire a hanging hook and wedging on it.
+            return False, {"timed_out": e.cmd[0] if e.cmd else "?"}
         c = connect(f"{tmp}/t.db")
         row = c.execute("SELECT status, context_percent FROM sessions "
                         "WHERE session_id=?", (SID,)).fetchone()

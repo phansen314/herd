@@ -32,8 +32,18 @@ def build_launch_argv(spec, socket):
     return argv
 
 
+# Bounded for the same reason as focus.py: `kitten @` against a socket with nothing
+# listening blocks forever. A timeout reads as a failed launch, which spawn() already
+# handles — it drops the reservation so the job name frees.
+LAUNCH_TIMEOUT = 10
+
+
 def _run(argv):
-    return subprocess.run(argv, capture_output=True, text=True).stdout
+    try:
+        return subprocess.run(argv, capture_output=True, text=True,
+                              timeout=LAUNCH_TIMEOUT).stdout
+    except subprocess.TimeoutExpired:
+        return ""                      # non-integer -> launch() returns None
 
 
 def launch(spec, socket):

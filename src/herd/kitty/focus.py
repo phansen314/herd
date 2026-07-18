@@ -20,15 +20,33 @@ CLAUDE_NAME = os.environ.get("HERD_CLAUDE_NAME", "claude")
 
 
 # ── kitty IO (swappable in tests) ────────────────────────────────────────────
+# A stale `unix:/tmp/kitty-<pid>` outlives the kitty that made it — exactly the
+# placement the cache is designed to tolerate. Measured against a socket that
+# listens but never answers: `kitten @` has its own ~10s timeout, so this was a
+# 10s stall on the interactive path rather than the indefinite hang it looks like.
+# We bound it ourselves anyway — kitten's timeout is its business, not a contract —
+# and the OSError arm is the real bug: with kitten absent from PATH, `herd jump`
+# raised FileNotFoundError straight out of the CLI.
+KITTY_TIMEOUT = 5
+
+
 def _ls(socket):
-    return subprocess.run(["kitten", "@", "--to", socket, "ls"],
-                          capture_output=True, text=True).stdout
+    try:
+        return subprocess.run(["kitten", "@", "--to", socket, "ls"],
+                              capture_output=True, text=True,
+                              timeout=KITTY_TIMEOUT).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return ""                      # unparseable -> flatten_windows None -> fall
+                                       # back to the cached window_id
 
 
 def _focus(socket, window_id):
-    return subprocess.run(
-        ["kitten", "@", "--to", socket, "focus-window", "--match", f"id:{window_id}"],
-        capture_output=True, text=True).returncode == 0
+    try:
+        return subprocess.run(
+            ["kitten", "@", "--to", socket, "focus-window", "--match", f"id:{window_id}"],
+            capture_output=True, text=True, timeout=KITTY_TIMEOUT).returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False                   # -> "kitty focus failed", a real message
 
 
 # ── pure resolution ──────────────────────────────────────────────────────────

@@ -70,6 +70,11 @@ ATTENTION_SECS = {
 # exceed a kitty launch round trip + claude's startup to its first hook.
 STRANDED_SECS = _int_env("HERD_STRANDED_SECS", 120)
 
+# One tick's `ps` must not outlive the tick. Generous — a loaded box can be slow —
+# but finite, because a hung ps freezes the reaper while the process stays alive,
+# so systemd's Restart never fires.
+PS_TIMEOUT = 5
+
 
 def _attention_enabled():
     """Gate the tier-2 attention tick. Default on; HERD_ATTENTION=0/false/no/off
@@ -108,9 +113,11 @@ def read_proc_table():
     machine is idle. Callers must skip the tick on None."""
     try:
         p = subprocess.run(["ps", "-eo", "pid=,stat=,comm="],
-                           capture_output=True, text=True)
-    except OSError:                              # ps missing from PATH, fork limit
-        return None
+                           capture_output=True, text=True, timeout=PS_TIMEOUT)
+    except subprocess.TimeoutExpired:            # a wedged ps would freeze the loop
+        return None                              # forever — and systemd's restart
+    except OSError:                              # never fires on a LIVE process
+        return None                              # ps missing from PATH, fork limit
     if p.returncode != 0:
         return None
     procs = _parse_proc_table(p.stdout)
