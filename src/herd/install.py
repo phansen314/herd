@@ -178,6 +178,36 @@ def uninstall_cli():
     return f"removed CLI links: {removed}" if removed else "no herd CLI links to remove"
 
 
+# ── optional: Claude terminal-bell notifications (kitty tab bell) ───────────
+# herd does NOT own this — it's a Claude-level, terminal-specific preference. So
+# the installer OFFERS it (interactive, opt-in, defaults to no) and never forces it:
+# on a non-tty it just prints a tip, and it never overrides an existing choice.
+def _bell_decision(current, answer):
+    """Pure: the channel to set, or None to leave unchanged. Respects any existing
+    preferredNotifChannel; otherwise sets terminal_bell only on an affirmative."""
+    if current:
+        return None
+    return "terminal_bell" if answer.strip().lower() in ("y", "yes") else None
+
+
+def _offer_bell(new_settings):
+    """Interactively offer terminal-bell notifications; mutate new_settings if
+    accepted. Returns a status line."""
+    cur = new_settings.get("preferredNotifChannel")
+    if cur:
+        return f"preferredNotifChannel already set ({cur!r}) — left as-is"
+    if not sys.stdin.isatty():
+        return ('kitty tab bell: set "preferredNotifChannel":"terminal_bell" in '
+                "settings.json to enable (README, Notifications)")
+    ch = _bell_decision(None, input(
+        "  Enable kitty tab-bell notifications? Claude rings the bell when a session\n"
+        "  wants you (sets preferredNotifChannel=terminal_bell; see README) [y/N]: "))
+    if ch:
+        new_settings["preferredNotifChannel"] = ch
+        return "terminal_bell notifications enabled"
+    return "terminal_bell notifications skipped (enable later via README)"
+
+
 # ── settings.json surgery ──────────────────────────────────────────────────
 def rewire_settings(data):
     """Return a NEW settings dict with herd wired and klawde unwired. Pure —
@@ -278,6 +308,7 @@ def install(dry=False):
         print(f"  would back up + rewrite {WRAPPER} (statusline -> herd: {wrap_ok})")
         print("  " + install_service(dry=True))
         print("  " + install_cli(dry=True))
+        print("  would offer (interactive, opt-in) to enable terminal_bell notifications")
         print("\n  resulting hooks:")
         for e, blocks in new_settings["hooks"].items():
             cmds = [h.get("command") or f"<{h.get('type','?')}:{h.get('url','')}>"
@@ -285,6 +316,7 @@ def install(dry=False):
             print(f"    {e}: {cmds}")
         return
 
+    bell_note = _offer_bell(new_settings)   # interactive opt-in; may set the key before we write
     backup(SETTINGS, ts)
     SETTINGS.write_text(json.dumps(new_settings, indent=2) + "\n")
     print(f"  rewired {SETTINGS} (backup: *.herd-bak.{ts})")
@@ -297,12 +329,10 @@ def install(dry=False):
     print(f"\n  self-test (wired hooks -> temp DB): {'PASS' if ok else 'FAIL'}  {row}")
     print("  " + install_service())
     print("  " + install_cli())
+    print("  " + bell_note)
     print("\n  use it (new shell picks up `herd` + completion):")
     print("    herd ls        # live sessions, attention-first, by name")
     print("    herd jump      # fuzzy-pick (fzf) a session and focus its window")
-    print("\n  optional — kitty tab bell when a session wants you (herd sends nothing;")
-    print("  Claude rings it, kitty flags the tab). In ~/.claude/settings.json:")
-    print('    "preferredNotifChannel": "terminal_bell"      # see README, Notifications')
     print("\n  klawde is unwired but NOT deleted — ~/.klawde/sessions.db (history) is kept.")
     print(f"  restore:  python3 -m herd.install --uninstall")
 

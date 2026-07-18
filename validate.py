@@ -1059,6 +1059,16 @@ with guard("66c CLI install paths resolve + completion ships"):
           "readlink" in _install.CLI_SRC.read_text(),
           "bin/herd must dereference ${BASH_SOURCE} so ~/.local/bin/herd finds src/")
 
+with guard("66d terminal-bell opt-in: never forces, never overrides"):
+    # herd offers preferredNotifChannel but never imposes it. The decision is pure
+    # (no input()): respect an existing channel; set terminal_bell only on yes.
+    check("66d bell opt-in respects an existing channel and sets only on 'yes'",
+          _install._bell_decision("desktop", "y") is None          # existing choice untouched
+          and _install._bell_decision(None, "y") == "terminal_bell"
+          and _install._bell_decision(None, "yes") == "terminal_bell"
+          and _install._bell_decision(None, "n") is None
+          and _install._bell_decision(None, "") is None)
+
 print("\n\033[1m═══ Q. ID DURABILITY + W2b/RECONCILE SEAM (67-71) ═══\033[0m")
 
 # 67. AUTOINCREMENT: a surrogate id is NEVER reused after a delete. Without it a

@@ -166,6 +166,9 @@ channel to the terminal bell in `~/.claude/settings.json`:
 "preferredNotifChannel": "terminal_bell"
 ```
 
+The installer **offers** to set this (interactive, opt-in — it never forces it, and
+never overrides a channel you've already chosen).
+
 Claude rings it when a turn ends waiting for input or a permission prompt appears
 (it's the only process with the window's tty — herd's hooks run detached, so they
 can't). kitty then marks that tab and flags the window via `bell_on_tab` and
