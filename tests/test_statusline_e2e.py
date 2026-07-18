@@ -1,5 +1,7 @@
 """O (59-63) — statusline.sh end to end: the sink + render + fingerprint cache +
 Path C adoption, driven through the real bash script."""
+import subprocess
+
 from helpers import T0, T1, SOCK, mk_session, mk_herd
 
 SL_PAY = {"session_id": "s1", "model": {"id": "claude-opus-4-8"}, "session_name": "sess",
@@ -9,8 +11,102 @@ SL_PAY = {"session_id": "s1", "model": {"id": "claude-opus-4-8"}, "session_name"
                           "seven_day": {"used_percentage": 12, "resets_at": 1784259174}}}
 
 
+# The payload as Claude Code really sends it — every field W5 sinks. SL_PAY above
+# is the minimal one; this is the one that catches an unbound column. A parsed-and-
+# rendered-but-never-stored field (api_duration_ms shipped that way) is invisible to
+# any fixture that omits it.
+SL_FULL = {**SL_PAY,
+           "version": "2.1.90",
+           "output_style": {"name": "Explanatory"},
+           "workspace": {"current_dir": "/code/herd", "project_dir": "/code/herd"},
+           "worktree": {"original_cwd": "/code/herd-main"},
+           "exceeds_200k_tokens": True,
+           "context_window": {"used_percentage": 42.7, "context_window_size": 1000000,
+                              "total_input_tokens": 15500, "total_output_tokens": 320},
+           "cost": {"total_cost_usd": 1.50, "total_api_duration_ms": 2300,
+                    "total_lines_added": 156, "total_lines_removed": 23}}
+
+
 def _statusline(hook_env, payload, env=None):
     return hook_env.run("statusline.sh", payload, env)
+
+
+def test_sinks_every_payload_field(hook_env):
+    """Each field the payload carries reaches its column. api_duration_ms is the
+    canary: it was parsed and rendered for months while the column stayed NULL."""
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/code/herd")
+    _statusline(hook_env, SL_FULL)
+    r = c.execute("SELECT api_duration_ms, lines_added, lines_removed, "
+                  "total_input_tokens, total_output_tokens, context_window_size, "
+                  "exceeds_200k_tokens, claude_code_version, output_style, "
+                  "original_cwd FROM sessions WHERE session_id='s1'").fetchone()
+    assert r["api_duration_ms"] == 2300
+    assert (r["lines_added"], r["lines_removed"]) == (156, 23)
+    assert (r["total_input_tokens"], r["total_output_tokens"]) == (15500, 320)
+    assert r["context_window_size"] == 1000000
+    assert r["claude_code_version"] == "2.1.90"
+    assert r["output_style"] == "Explanatory"
+    assert r["original_cwd"] == "/code/herd-main"
+    # coerced to 0/1 in the hook's jq — a bare bool would land as the TEXT "true"
+    assert r["exceeds_200k_tokens"] == 1
+
+
+def test_exceeds_200k_false_is_zero_not_empty(hook_env):
+    """`if . then 1 else 0 end` must emit 0 for false AND for an absent key —
+    `// ""` would turn a legitimate false into NULL."""
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/code/herd")
+    _statusline(hook_env, {**SL_FULL, "exceeds_200k_tokens": False})
+    assert c.execute("SELECT exceeds_200k_tokens FROM sessions "
+                     "WHERE session_id='s1'").fetchone()[0] == 0
+
+
+def test_git_worktree_lands_from_payload(hook_env):
+    """workspace.git_worktree is the linked-worktree NAME, absent in a main tree."""
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/code/herd")
+    _statusline(hook_env, {**SL_FULL,
+                           "workspace": {"current_dir": "/code/herd",
+                                         "git_worktree": "feature-xyz"}})
+    assert c.execute("SELECT git_worktree FROM sessions "
+                     "WHERE session_id='s1'").fetchone()[0] == "feature-xyz"
+
+
+def test_main_worktree_leaves_git_worktree_null(hook_env):
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/code/herd")
+    _statusline(hook_env, SL_FULL)          # workspace has no git_worktree key
+    assert c.execute("SELECT git_worktree FROM sessions "
+                     "WHERE session_id='s1'").fetchone()[0] is None
+
+
+def test_real_git_worktree_end_to_end(hook_env, tmp_path):
+    """The one path with no production evidence: no session has yet run inside a
+    linked worktree. Build a real one, confirm the branch walk resolves through
+    the `.git`-as-a-file indirection that a worktree checkout uses."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    g = ["git", "-C", str(repo)]
+    subprocess.run(g + ["init", "-q", "-b", "main"], check=True)
+    subprocess.run(g + ["config", "user.email", "t@t"], check=True)
+    subprocess.run(g + ["config", "user.name", "t"], check=True)
+    (repo / "f").write_text("x")
+    subprocess.run(g + ["add", "f"], check=True)
+    subprocess.run(g + ["commit", "-qm", "init"], check=True)
+    wt = tmp_path / "wt"
+    subprocess.run(g + ["worktree", "add", "-q", "-b", "feature-xyz", str(wt)], check=True)
+    assert (wt / ".git").is_file()          # the indirection this test exists for
+
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd=str(wt))
+    _statusline(hook_env, {**SL_FULL, "cwd": str(wt),
+                           "workspace": {"current_dir": str(wt),
+                                         "git_worktree": "feature-xyz"}})
+    r = c.execute("SELECT git_branch, git_worktree FROM sessions "
+                  "WHERE session_id='s1'").fetchone()
+    assert r["git_worktree"] == "feature-xyz"
+    assert r["git_branch"] == "feature-xyz"   # resolved via `gitdir:` -> worktree HEAD
 
 
 def test_sinks_metrics_and_renders_claude_name(hook_env):

@@ -1,10 +1,9 @@
 """G / 42 — the idle-signal thesis: statusline moves updated_at but never
 last_event_at, and lifecycle writes advance last_event_at on repeated same-status
 events (no clock-freezing guard)."""
-from helpers import W, T0, T1, T2, mk_session
+from helpers import W, T0, T1, T2, mk_session, SL_PARAMS
 
-_SL = {"model": None, "sname": None, "ctx": 42, "cost": 1.5, "branch": None,
-       "rl5": None, "rl5reset": None, "rl7": None, "rl7reset": None}
+_SL = {**SL_PARAMS, "ctx": 42, "cost": 1.5}
 
 
 def test_statusline_moves_updated_not_last_event(fresh):

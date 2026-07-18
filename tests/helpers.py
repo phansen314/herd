@@ -32,6 +32,15 @@ WRITES = WRITES_PATH.read_text()
 # The loader is production code (herd.db); using it here tests it too.
 W = load_statements()
 
+# Every W5_statusline param, all NULL. Spread it (`{**SL_PARAMS, "ctx": 42}`) and
+# name only what the test asserts on. Canonical here, not copied per test file:
+# W5 grows, and two hand-kept copies drift into "did not supply a value" failures.
+SL_PARAMS = {k: None for k in (
+    "model", "sname", "ctx", "cost", "branch", "rl5", "rl5reset", "rl7", "rl7reset",
+    "gwt", "ocwd", "ver", "ostyle", "ctxsize", "exc200", "tokin", "tokout",
+    "ladd", "ldel", "apims",
+)}
+
 
 def strip_sql(text):
     """Drop `--` comments per line and collapse whitespace — for source-level

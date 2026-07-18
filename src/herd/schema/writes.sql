@@ -8,7 +8,7 @@
 
 -- ── W1. SPAWN (herd/kitty) — job + window known, UUID/pid not yet.
 -- status_source='reconcile' is a white lie (CHECK has no 'spawn'); real
--- provenance is herd_sessions.source. Not yet wired to a CLI verb.
+-- provenance is herd_sessions.source. Driven by `herd spawn` (cli.cmd_spawn).
 -- :name W1_spawn_session
 INSERT INTO sessions(cwd, status, status_source, started_at, updated_at)
 VALUES(:cwd, 'unknown', 'reconcile', :now, :now);
@@ -137,8 +137,11 @@ SET status          = 'stopped',
 WHERE session_id = :session_id AND stopped_at IS NULL;
 
 
--- ── W5. STATUSLINE — UPDATE ONLY (never creates a row: would resurrect stopped
--- sessions / invent empty cwd). NEVER touches last_event_*. Fires ~1/sec, guarded
+-- ── W5. STATUSLINE — the sink for EVERY field the statusLine payload carries
+-- (metrics, version, output_style, worktree, original_cwd), plus git_branch, which
+-- the hook derives from a pure-bash .git walk. UPDATE ONLY (never creates a row:
+-- would resurrect stopped sessions / invent empty cwd).
+-- NEVER touches last_event_*. Fires ~1/sec, guarded
 -- upstream by the fingerprint diff-cache. resets_at arrives as unix epoch,
 -- converted to ISO in SQLite; COALESCE keeps the prior value on NULL. The
 -- prev_cost pair captures the OLD row's total (an UPDATE's RHS sees the old row) —
@@ -150,6 +153,17 @@ UPDATE sessions SET
     context_percent      = COALESCE(CAST(:ctx AS INTEGER), context_percent),
     total_cost_usd       = COALESCE(:cost, total_cost_usd),
     git_branch           = COALESCE(:branch, git_branch),
+    git_worktree         = COALESCE(:gwt, git_worktree),
+    original_cwd         = COALESCE(:ocwd, original_cwd),
+    claude_code_version  = COALESCE(:ver, claude_code_version),
+    output_style         = COALESCE(:ostyle, output_style),
+    context_window_size  = COALESCE(CAST(:ctxsize AS INTEGER), context_window_size),
+    exceeds_200k_tokens  = COALESCE(CAST(:exc200 AS INTEGER), exceeds_200k_tokens),
+    total_input_tokens   = COALESCE(CAST(:tokin AS INTEGER), total_input_tokens),
+    total_output_tokens  = COALESCE(CAST(:tokout AS INTEGER), total_output_tokens),
+    lines_added          = COALESCE(CAST(:ladd AS INTEGER), lines_added),
+    lines_removed        = COALESCE(CAST(:ldel AS INTEGER), lines_removed),
+    api_duration_ms      = COALESCE(CAST(:apims AS INTEGER), api_duration_ms),
     rate_limit_5h_percent   = COALESCE(:rl5, rate_limit_5h_percent),
     rate_limit_5h_resets_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%SZ', :rl5reset, 'unixepoch'),
                                        rate_limit_5h_resets_at),
@@ -222,7 +236,9 @@ FROM sessions s WHERE s.session_id = :session_id;
 
 
 -- ── R_job_live. Recyclable-handle check (spawn): does a LIVE session already
--- hold this job name? By JOIN, no unique index. Unused until the spawn verb lands.
+-- hold this job name? By JOIN, no unique index. Called by spawn.spawn() BEFORE
+-- the launch, so a rejection never opens a tab. Dead rows keep their job_name —
+-- name reuse is by design, and resolution only ever searches live sessions.
 -- :name R_job_live
 SELECT h.session_pk FROM herd_sessions h
 JOIN sessions s ON s.id = h.session_pk

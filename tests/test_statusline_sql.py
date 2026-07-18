@@ -1,9 +1,8 @@
 """H / 58 — W5_statusline is UPDATE-only (never creates/resurrects) and captures
 rate limits with epoch->ISO conversion, keeping prior values on an absent tick."""
-from helpers import W, T0, T1, T2, mk_session
+from helpers import W, T0, T1, T2, mk_session, SL_PARAMS
 
-_SL = {"model": None, "sname": None, "ctx": 50, "cost": None, "branch": None,
-       "rl5": None, "rl5reset": None, "rl7": None, "rl7reset": None}
+_SL = {**SL_PARAMS, "ctx": 50}
 
 
 def test_statusline_on_unknown_session_is_noop(fresh):
@@ -20,8 +19,7 @@ def test_statusline_cannot_resurrect_stopped(fresh):
 def test_rate_limits_epoch_to_iso_and_coalesce(fresh):
     c = fresh()
     mk_session(c, session_id="s1")
-    c.execute(W["W5_statusline"], {"model": None, "sname": None, "ctx": None, "cost": None,
-                                   "branch": None, "rl5": "73.5", "rl5reset": "1784172774",
+    c.execute(W["W5_statusline"], {**SL_PARAMS, "rl5": "73.5", "rl5reset": "1784172774",
                                    "rl7": "12", "rl7reset": "1784259174",
                                    "now": T1, "session_id": "s1"})
     r = c.execute("SELECT rate_limit_5h_percent,rate_limit_5h_resets_at FROM sessions "

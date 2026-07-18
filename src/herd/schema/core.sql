@@ -22,9 +22,12 @@ CREATE TABLE IF NOT EXISTS sessions (
 
     -- location
     cwd                 TEXT NOT NULL,
-    original_cwd        TEXT,          -- worktree.original_cwd
+    original_cwd        TEXT,          -- worktree.original_cwd — ONLY set during a --worktree session
     git_branch          TEXT,          -- derived: pure-bash walk to .git/HEAD
-    git_worktree        TEXT,
+    git_worktree        TEXT,          -- workspace.git_worktree — the linked-worktree NAME.
+                                       -- Absent (NULL) in a main working tree, which is the
+                                       -- common case; unlike worktree.*, it is set for ANY
+                                       -- `git worktree add` checkout, not just --worktree runs.
 
     -- claude's identity for this session. session_name is Claude's /rename name,
     -- user-mutable; deliberately NOT herd's job_name (aliasing would break the handle).
@@ -49,8 +52,11 @@ CREATE TABLE IF NOT EXISTS sessions (
 
     -- metrics (statusline-owned; UPDATE only, never INSERT).
     context_percent      INTEGER,
-    context_window_size  INTEGER,
-    exceeds_200k_tokens  INTEGER,
+    context_window_size  INTEGER,      -- max tokens for the model (200k, or 1M extended)
+    exceeds_200k_tokens  INTEGER,      -- 0/1; coerced from a bool in the hook's jq
+    -- NOT cumulative session totals despite the names. Since Claude Code v2.1.132
+    -- these are what is currently IN the context window, from the latest API
+    -- response — a gauge, not a counter. Named to match klawde's schema.
     total_input_tokens   INTEGER,
     total_output_tokens  INTEGER,
     total_cost_usd       REAL,
@@ -95,7 +101,10 @@ CREATE TABLE IF NOT EXISTS events (
     event_type  TEXT NOT NULL,
     source      TEXT NOT NULL,
     timestamp   TEXT NOT NULL,
-    raw_json    TEXT   -- lifecycle only. NEVER from post_tool_use (fires per tool call).
+    -- RESERVED, and NULL in every row today: every hook passes HERD_P_raw="".
+    -- The rule if it is ever populated: lifecycle events only, NEVER post_tool_use
+    -- (fires per tool call — storing payloads there would bloat the hot path).
+    raw_json    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_session

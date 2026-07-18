@@ -16,7 +16,8 @@ INPUT=$(cat)
 # ── parse: ONE jq into \x1f-separated fields ──────────────────────────────
 # \x1f (Unit Separator), NOT tab (tab is IFS whitespace and collapses empties).
 # model is an OBJECT here (.model.id). resets_at is a UNIX EPOCH.
-IFS=$'\x1f' read -r SID MODEL SNAME CTX COST RL5 RL5RESET RL7 RL7RESET CWD GWT API_MS <<JQ
+IFS=$'\x1f' read -r SID MODEL SNAME CTX COST RL5 RL5RESET RL7 RL7RESET CWD API_MS \
+                    CTXSIZE OCWD LADD LDEL TOKIN TOKOUT VER GWT EXC200 OSTYLE <<JQ
 $(printf '%s' "$INPUT" | jq -rj '[
   .session_id,
   .model.id,
@@ -28,8 +29,17 @@ $(printf '%s' "$INPUT" | jq -rj '[
   .rate_limits.seven_day.used_percentage,
   .rate_limits.seven_day.resets_at,
   .cwd,
+  .cost.total_api_duration_ms,
+  .context_window.context_window_size,
+  .worktree.original_cwd,
+  .cost.total_lines_added,
+  .cost.total_lines_removed,
+  .context_window.total_input_tokens,
+  .context_window.total_output_tokens,
+  .version,
   .workspace.git_worktree,
-  .cost.total_api_duration_ms
+  (if .exceeds_200k_tokens then 1 else 0 end),
+  .output_style.name
 ] | map(. // "" | tostring) | join("\u001f")' 2>/dev/null)
 JQ
 
@@ -146,6 +156,7 @@ valid_sid "$SID" && CACHE="$HERD_RUNTIME/herd-stline-$SID"
 # ── fingerprint: skip ALL DB work when nothing changed. Covers every rendered
 # field so a hit can't show a stale line. Cache is 3 fixed lines: FP, L1, L2.
 FP="$MODEL|$SNAME|$CTX|$COST|$RL5|$RL5RESET|$RL7|$RL7RESET|$CWD|$BRANCH|$API_MS"
+FP="$FP|$CTXSIZE|$OCWD|$LADD|$LDEL|$TOKIN|$TOKOUT|$VER|$GWT|$EXC200|$OSTYLE"
 if [ -n "$CACHE" ] && [ -f "$CACHE" ]; then
     { IFS= read -r PREV_FP; IFS= read -r C1; IFS= read -r C2; } < "$CACHE" 2>/dev/null
     if [ "$FP" = "$PREV_FP" ]; then
@@ -165,7 +176,12 @@ now_pair
 export HERD_P_session_id="$SID" HERD_P_model="$MODEL" HERD_P_sname="$SNAME" \
        HERD_P_ctx="$CTX" HERD_P_cost="$COST" HERD_P_branch="$BRANCH" \
        HERD_P_rl5="$RL5" HERD_P_rl5reset="$RL5RESET" \
-       HERD_P_rl7="$RL7" HERD_P_rl7reset="$RL7RESET" HERD_P_now="$NOW_ISO"
+       HERD_P_rl7="$RL7" HERD_P_rl7reset="$RL7RESET" HERD_P_now="$NOW_ISO" \
+       HERD_P_ctxsize="$CTXSIZE" HERD_P_ocwd="$OCWD" \
+       HERD_P_ladd="$LADD" HERD_P_ldel="$LDEL" \
+       HERD_P_tokin="$TOKIN" HERD_P_tokout="$TOKOUT" \
+       HERD_P_ver="$VER" HERD_P_gwt="$GWT" \
+       HERD_P_exc200="$EXC200" HERD_P_ostyle="$OSTYLE" HERD_P_apims="$API_MS"
 
 CH=$(run W5_statusline "SELECT changes();" 2>/dev/null)
 
