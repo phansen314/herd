@@ -16,8 +16,26 @@ valid_sid "$SID" || exit 0
 
 now_pair    # one fork, gives ISO + epoch; the throttle needs epoch
 
+# No ISO stamp, nothing worth writing: W4_event would set last_event_at NULL, and
+# the attention rule reads NULL as "no signal" — worse than not writing at all.
+# Log it, because a hook that vanishes silently is the bug class this file keeps
+# hitting.
+if [ -z "$NOW_ISO" ]; then
+    herd_log "clock unavailable — skipping the activity write"
+    exit 0
+fi
+
 TFILE="$HERD_RUNTIME/herd-tool-$SID"
-if [ -f "$TFILE" ]; then
+# BOTH sides of the subtraction must be numeric. LAST was guarded; NOW_EPOCH was
+# not, and it failed in the UNSAFE direction: a non-numeric NOW_EPOCH (a partial
+# `date`, an unexpected format) makes $((NOW_EPOCH - LAST)) nonsense, and the
+# throttle swallows the write. The activity clock then never advances and a busy
+# session reads silent — the exact failure this hook exists to prevent. A usable
+# ISO with an unusable epoch means: skip the throttle, take the write.
+case "$NOW_EPOCH" in
+    ''|*[!0-9]*) NOW_EPOCH="" ;;
+esac
+if [ -n "$NOW_EPOCH" ] && [ -f "$TFILE" ]; then
     IFS= read -r LAST < "$TFILE" 2>/dev/null
     case "$LAST" in
         ''|*[!0-9]*) ;;   # garbage -> fall through and write
@@ -31,5 +49,11 @@ export HERD_P_session_id="$SID" HERD_P_now="$NOW_ISO" \
 run W4_event >/dev/null 2>&1
 
 # tempfile+rename: a torn write must not leave a partial epoch for the next tick.
-printf '%s\n' "$NOW_EPOCH" > "$TFILE.tmp.$$" 2>/dev/null && mv -f "$TFILE.tmp.$$" "$TFILE" 2>/dev/null
+# Skipped when the clock is unusable — writing "" would make the next read's
+# garbage guard the only thing standing between us and a permanently stuck window.
+if [ -n "$NOW_EPOCH" ]; then
+    printf '%s\n' "$NOW_EPOCH" > "$TFILE.tmp.$$" 2>/dev/null &&
+        mv -f "$TFILE.tmp.$$" "$TFILE" 2>/dev/null
+    rm -f "$TFILE.tmp.$$" 2>/dev/null      # the && skipped the mv: leave no debris
+fi
 exit 0

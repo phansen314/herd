@@ -14,7 +14,7 @@ import subprocess
 
 import pytest
 
-from helpers import HOOKS
+from helpers import HOOKS, T0, mk_session
 
 # statusline.sh is included deliberately: it is not a "hook" in settings.json terms,
 # but it runs on the same ~1/sec path and a nonzero exit is just as user-visible.
@@ -199,3 +199,44 @@ def test_rotation_can_be_disabled(hook_env, tmp_path):
     for _ in range(20):
         _run(hook_env, "stop.sh", json.dumps(GOOD), env=env)
     assert not pathlib.Path(hook_env.runtime, "err.log.1").exists()
+
+
+# ── the clock must fail SAFE ────────────────────────────────────────────────
+def _stub_date(tmp_path, script):
+    d = tmp_path / "stub-date"
+    d.mkdir(exist_ok=True)
+    p = d / "date"
+    p.write_text(script)
+    p.chmod(0o755)
+    return {"PATH": f"{d}{os.pathsep}{os.environ['PATH']}"}
+
+
+TOOL_PAY = {"session_id": "s1", "tool_name": "Bash", "hook_event_name": "PostToolUse"}
+
+
+def test_a_garbage_epoch_does_not_swallow_the_activity_write(hook_env, tmp_path):
+    """The throttle compares NOW_EPOCH - LAST. LAST was guarded against non-numeric
+    input and NOW_EPOCH was not, so a partial `date` made the comparison nonsense
+    and the write was skipped — freezing the activity clock, which is exactly the
+    'busy session reads silent and pages you' failure this hook exists to prevent.
+    A usable ISO with an unusable epoch must skip the THROTTLE, not the write."""
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/x", last_event_at=T0)
+    pathlib.Path(hook_env.runtime, "herd-tool-s1").write_text("9999999999\n")  # "just wrote"
+    env = _stub_date(tmp_path, '#!/bin/sh\nprintf "2026-07-18T10:05:00.000Z notanumber\\n"\n')
+    hook_env.run("post_tool_use.sh", TOOL_PAY, env=env)
+    got = c.execute("SELECT last_event_at FROM sessions WHERE session_id='s1'").fetchone()[0]
+    assert got != T0, "the throttle swallowed the write on a bad epoch"
+
+
+def test_no_clock_at_all_is_logged_rather_than_written_as_null(hook_env, tmp_path):
+    """Without an ISO stamp W4_event would set last_event_at NULL, which the
+    attention rule reads as 'no signal' — worse than not writing. Skipping is
+    right; skipping SILENTLY is the bug class this suite keeps finding."""
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/x", last_event_at=T0)
+    hook_env.run("post_tool_use.sh", TOOL_PAY,
+                 env=_stub_date(tmp_path, "#!/bin/sh\nexit 1\n"))
+    got = c.execute("SELECT last_event_at FROM sessions WHERE session_id='s1'").fetchone()[0]
+    assert got == T0                                   # untouched, not NULLed
+    assert "clock unavailable" in pathlib.Path(hook_env.runtime, "err.log").read_text()

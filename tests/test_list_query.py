@@ -1,5 +1,7 @@
 """L — R1_list: the dashboard's main read (cli._live, so `ls` / the picker / the
 preview pane) uses the live index, hits tier-2 PKs directly, orders attention-first."""
+from herd import cli
+
 from helpers import W, T0, T1, T2, mk_session, mk_herd, mk_attention
 
 
@@ -28,3 +30,13 @@ def test_attention_first_ordering(fresh):
     _seed(c)
     rows = c.execute(W["R1_list"]).fetchall()
     assert rows[0]["cwd"] == "/app" and rows[0]["attention_at"] == T1
+
+
+def test_the_list_order_is_total(fresh):
+    """started_at is second-resolution, so a scripted multi-spawn ties and the list
+    reorders between renders of `herd watch`. s.id DESC breaks the tie."""
+    c = fresh()
+    ids = [mk_session(c, session_id=f"s{i}", cwd="/x", started_at=T0) for i in range(5)]
+    order = [r["id"] for r in cli._live(c)]
+    assert order == sorted(ids, reverse=True)          # newest first, deterministic
+    assert order == [r["id"] for r in cli._live(c)]    # and stable across reads

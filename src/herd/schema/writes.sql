@@ -289,6 +289,9 @@ FROM sessions s
 LEFT JOIN herd_sessions  h ON h.session_pk = s.id
 LEFT JOIN herd_attention a ON a.session_pk = s.id
 WHERE s.stopped_at IS NULL
+-- s.id DESC makes the order TOTAL: started_at is second-resolution, so a scripted
+-- multi-spawn ties and the list reorders between renders of `herd watch`.
 ORDER BY a.attention_at IS NULL,   -- attention first
          a.attention_at ASC,       -- longest-waiting first
-         s.started_at DESC;
+         s.started_at DESC,
+         s.id DESC;

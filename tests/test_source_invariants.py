@@ -114,11 +114,19 @@ def test_herd_declares_no_trigger():
 
 
 def test_no_tier2_ddl_attaches_to_sessions():
-    assert "on sessions" not in _code(HERD)
+    """Match `ON sessions` as a DDL target, not as a substring — an index named
+    idx_..._on_sessions_... or a comment mentioning it is not a violation."""
+    assert not re.search(r"\bon\s+sessions\b", _code(HERD), re.I)
 
 
 def test_no_live_denormalization_column():
-    assert "live" not in _code(HERD)
+    """A DECLARATION named `live`, not the substring: `"live" not in code` also
+    rejects last_alive_at, delivery, or an index with live_ in its name, so the
+    invariant would fail on changes that do not reintroduce the column.
+    See DECISIONS.md#live-column."""
+    decls = re.findall(r"^\s*(\w+)\s+(?:INTEGER|TEXT|REAL|BOOLEAN)",
+                       _code(HERD), re.I | re.M)
+    assert "live" not in [d.lower() for d in decls]
 
 
 def test_core_writers_take_no_tier2_value():

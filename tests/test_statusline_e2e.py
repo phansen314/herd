@@ -1,10 +1,11 @@
 """O (59-63) — statusline.sh end to end: the sink + render + fingerprint cache +
 Path C adoption, driven through the real bash script."""
+import json
 import os
 import pathlib
 import subprocess
 
-from helpers import T0, T1, SOCK, mk_session, mk_herd
+from helpers import HOOKS, T0, T1, SOCK, mk_session, mk_herd
 
 SL_PAY = {"session_id": "s1", "model": {"id": "claude-opus-4-8"}, "session_name": "sess",
           "cwd": "/code/herd", "context_window": {"used_percentage": 42.7},
@@ -195,3 +196,40 @@ def test_a_genuine_adoption_miss_still_adopts(hook_env):
     assert row["session_id"] == SL_PAY["session_id"]        # adopted
     assert row["context_percent"] is not None              # and the retry wrote metrics
     assert _errlog(hook_env) == []
+
+
+def test_a_relative_gitdir_resolves_against_the_repo_not_the_hook_cwd(hook_env, tmp_path):
+    """Git writes RELATIVE gitdirs for submodules and worktrees
+    ("gitdir: ../../.git/modules/foo"). Resolved against the hook's cwd they either
+    miss — dropping the branch — or hit and record a DIFFERENT repo's HEAD into
+    sessions.git_branch, which is wrong data rather than missing data."""
+    (tmp_path / "real").mkdir()
+    (tmp_path / "real" / "HEAD").write_text("ref: refs/heads/correct-branch\n")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / ".git").write_text("gitdir: ../real\n")
+
+    c = hook_env.conn()
+    mk_session(c, session_id="g1", cwd=str(sub))
+    pay = {**SL_PAY, "session_id": "g1", "cwd": str(sub)}
+    r = subprocess.run(["bash", str(HOOKS / "statusline.sh")], input=json.dumps(pay),
+                       capture_output=True, text=True, cwd="/",   # NOT inside the repo
+                       env=dict(os.environ, HERD_DB=hook_env.path,
+                                HERD_RUNTIME=hook_env.runtime,
+                                HERD_ERRLOG=f"{hook_env.runtime}/err.log"))
+    assert "correct-branch" in r.stdout
+    assert c.execute("SELECT git_branch FROM sessions WHERE session_id='g1'"
+                     ).fetchone()[0] == "correct-branch"
+
+
+def test_session_end_removes_both_per_session_runtime_files(hook_env):
+    """One leak per session otherwise — bounded on a tmpfs XDG_RUNTIME_DIR,
+    unbounded under the /tmp fallback."""
+    c = hook_env.conn()
+    mk_session(c, session_id="e1", cwd="/x")
+    rt = pathlib.Path(hook_env.runtime)
+    (rt / "herd-tool-e1").write_text("1\n")
+    (rt / "herd-stline-e1").write_text("fp\nL1\nL2\n")
+    hook_env.run("session_end.sh", {"session_id": "e1"})
+    assert not (rt / "herd-tool-e1").exists()
+    assert not (rt / "herd-stline-e1").exists(), "the statusline cache file leaked"

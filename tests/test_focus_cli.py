@@ -315,7 +315,7 @@ def test_cli_hides_machinery():
     meant adding a verb failed here twice, in two places, for no defect."""
     from herd import install as inst
     completion = inst.COMPLETION_SRC.read_text()
-    offered = re.search(r'compgen -W "([^"]*)"', completion).group(1).split()
+    offered = re.search(r'_herd_offer "\$cur" "([a-z ]+)"', completion).group(1).split()
     assert set(offered) == set(cli.USER_COMMANDS)
     assert set(MACHINERY) <= set(cli.COMMANDS)          # callable ...
     assert not set(MACHINERY) & set(cli.USER_COMMANDS)  # ... but not advertised

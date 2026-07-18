@@ -19,12 +19,12 @@ transcription](#transcription) · [ctrl-q](#expect) · [the poker](#poker) ·
 ## 2026-07-18 — No Claude-invoked pager; the escalation stub is deleted {#pager}
 
 Considered giving herd a pager Claude could invoke — a CLI verb plus a skill, so a
-session could raise itself deliberately instead of waiting for the derived `!`.
+session could raise itself deliberately instead of waiting for the derived mark.
 Rejected, along with the softer `herd say "<reason>"` variant that would have
 attached a reason string rather than a notification.
 
 **Rejected — redundant.** Claude already signals "done/blocked" by ending its turn:
-`stop.sh` → `waiting` → terminal bell → `!` one threshold later. A command Claude
+`stop.sh` → `waiting` → terminal bell → 🙋 one threshold later. A command Claude
 calls immediately before stopping fires seconds earlier carrying the same fact.
 
 **Rejected — blind to the only real gap.** The one case ambient attention misses is
@@ -36,7 +36,7 @@ actuator or nothing.
 **Rejected — unreliable, therefore corrosive** (the decisive one). Claude would call
 it only sometimes. A signal that is only sometimes emitted destroys the meaning of
 its own absence: with ten sessions listed, you could no longer read a quiet row as
-"nothing to report" rather than "didn't bother". That degrades the derived `!` sitting
+"nothing to report" rather than "didn't bother". That degrades the derived mark sitting
 next to it. Derived signals have no such failure mode — the daemon ticks every 2s
 regardless of what Claude feels like doing.
 
@@ -69,7 +69,7 @@ a flap on every tick, ~2s apart, forever.
 clock and a jump is not Claude activity; writing it would corrupt the very signal
 attention is derived from (see [two clocks](#clocks)).
 
-**Decided:** an acked row stays in `herd_attention`. The CLI hides `!` while
+**Decided:** an acked row stays in `herd_attention`. The CLI hides the mark while
 `ack_at` is set, and the daemon re-notifies once a full status threshold of silence
 has passed *since the ack*. Ack is a snooze, not a dismissal.
 

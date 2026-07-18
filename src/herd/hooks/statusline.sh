@@ -53,7 +53,16 @@ git_branch_of() {
                 head="$dir/.git/HEAD"
             else
                 IFS= read -r g < "$dir/.git" 2>/dev/null   # "gitdir: <path>"
-                g="${g#gitdir: }"; head="$g/HEAD"
+                g="${g#gitdir: }"
+                # RELATIVE gitdirs are the norm for submodules and worktrees
+                # ("gitdir: ../../.git/modules/foo"). Resolved against the HOOK's
+                # cwd instead of $dir they either miss — dropping the branch — or,
+                # worse, hit and report a DIFFERENT repo's HEAD into git_branch.
+                case "$g" in
+                    /*) ;;                                 # absolute: as-is
+                    *)  g="$dir/$g" ;;
+                esac
+                head="$g/HEAD"
             fi
             [ -f "$head" ] || return 1
             IFS= read -r ref < "$head" 2>/dev/null

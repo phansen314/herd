@@ -292,8 +292,13 @@ def _http_send(url, data):
 
 
 def cmd_poke(conn, args):
-    """Background child of the picker. fzf exports $FZF_PORT, so --listen=0 can take
-    a free port and we never collide on a fixed one."""
+    """Background child of the picker, reading the port from $FZF_PORT.
+
+    `watch` chooses the port itself (_free_port) and passes it in via --listen and
+    this variable. The obvious alternative — `--listen=0` plus fzf's own $FZF_PORT
+    on a `start:` bind — was measured NOT to work: the start event does not reliably
+    see the variable, so auto-refresh worked on one picker and not the next. See
+    DECISIONS.md#poker."""
     import time
     port = os.environ.get("FZF_PORT")
     if not port:
