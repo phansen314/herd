@@ -79,13 +79,18 @@ def _has_fzf():
 
 
 def _fzf_pick(rows, query):
-    """Interactive fuzzy pick with a live preview pane. Returns a row or None."""
+    """Interactive fuzzy pick with a live preview pane. Returns a row or None.
+
+    Capture ONLY stdout (the selection). fzf draws its UI to stderr/the tty — piping
+    stderr (capture_output=True) makes the picker invisible and looks like a hang.
+    """
     preview = f"{sys.executable} -m herd.cli preview {{1}}"   # {1} = the hidden id
     p = subprocess.run(
         ["fzf", "--delimiter", "\t", "--with-nth", "2..", "--reverse",
          "--height", "60%", "--query", query, "--prompt", "jump ▸ ",
          "--preview", preview, "--preview-window", "right,55%,wrap"],
-        input="\n".join(_row_line(r) for r in rows), capture_output=True, text=True)
+        input="\n".join(_row_line(r) for r in rows),
+        stdout=subprocess.PIPE, text=True)   # stderr stays on the terminal (fzf's UI)
     return _parse_pick(rows, p.stdout)
 
 
