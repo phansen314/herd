@@ -59,14 +59,27 @@ def test_service_unit_is_well_formed():
     assert inst.PKG_SRC.name == "src"
 
 
+def _section(unit, name):
+    """The keys under [name]. Directives are section-scoped and systemd IGNORES a
+    misplaced one with only a log line, so asserting on the whole file is not
+    enough — StartLimitIntervalSec in [Service] shipped exactly that way."""
+    body = unit.split(f"[{name}]", 1)[1]
+    body = body.split("\n[", 1)[0]
+    return dict(ln.split("=", 1) for ln in body.strip().splitlines() if "=" in ln)
+
+
 def test_service_unit_retries_forever():
     """The daemon is the only reaper of silent deaths, so a stopped unit is
     invisible: sessions just never leave `herd ls`. on-failure ignores a clean
     exit, and the default start limit latches a persistently-failing unit into
     `failed` — both leave nothing reaping with nothing to notice."""
     u = inst.service_unit_text()
-    assert "Restart=always" in u
-    assert "StartLimitIntervalSec=0" in u
+    assert _section(u, "Service")["Restart"] == "always"
+    # StartLimitIntervalSec is a [Unit] directive. In [Service] systemd logs
+    # "Unknown key name ... ignoring" and keeps the 10s default — the fix looks
+    # applied and does nothing.
+    assert _section(u, "Unit")["StartLimitIntervalSec"] == "0"
+    assert "StartLimitIntervalSec" not in _section(u, "Service")
 
 
 def test_cli_paths_resolve_and_completion_ships():

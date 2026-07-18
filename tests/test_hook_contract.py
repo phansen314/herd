@@ -171,3 +171,31 @@ def test_a_payload_without_a_session_id_stays_quiet(hook_env, script):
     _run(hook_env, script, json.dumps({"cwd": "/x"}))
     log = pathlib.Path(hook_env.runtime, "err.log")
     assert not log.exists() or "jq" not in log.read_text()
+
+
+# ── the error log must stay bounded ─────────────────────────────────────────
+def _log_via(hook_env, script, env=None):
+    e = {"HERD_ERRLOG_MAX": "200"}
+    e.update(env or {})
+    return _run(hook_env, script, json.dumps(GOOD), env=e)
+
+
+def test_the_errlog_rotates_instead_of_growing_without_bound(hook_env, tmp_path):
+    """A persistent fault logs on EVERY hook fire — six scripts per prompt, plus a
+    statusline ~1/sec/session. Unbounded, today's error ends up buried under weeks
+    of history in the file troubleshooting tells you to read."""
+    log = pathlib.Path(hook_env.runtime, "err.log")
+    for _ in range(40):
+        _log_via(hook_env, "stop.sh", env=_stub_bin(tmp_path, "jq"))
+    assert log.exists()
+    assert log.stat().st_size <= 400, "errlog grew past the cap"
+    assert pathlib.Path(str(log) + ".1").exists(), "the previous window was dropped"
+
+
+def test_rotation_can_be_disabled(hook_env, tmp_path):
+    """0 means keep everything — someone mid-investigation may want the full run."""
+    env = {"HERD_ERRLOG_MAX": "0"}
+    env.update(_stub_bin(tmp_path, "jq"))
+    for _ in range(20):
+        _run(hook_env, "stop.sh", json.dumps(GOOD), env=env)
+    assert not pathlib.Path(hook_env.runtime, "err.log.1").exists()

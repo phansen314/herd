@@ -35,8 +35,25 @@ now_pair() {
 }
 
 # ── logging ───────────────────────────────────────────────────────────────
+# Cap the log. A persistent fault logs on EVERY hook fire — a missing jq means six
+# scripts complaining per prompt, and the statusline alone runs ~1/sec/session — so
+# without a cap this grows without bound and buries today's error under weeks of
+# history. One rotation, not a numbered series: the point is a bounded file you can
+# actually read, and .1 keeps the previous window for anything mid-investigation.
+HERD_ERRLOG_MAX="${HERD_ERRLOG_MAX:-1048576}"       # bytes; 0 disables rotation
+
+herd_log_rotate() {
+    local size
+    [ "$HERD_ERRLOG_MAX" -gt 0 ] 2>/dev/null || return 0
+    size=$(wc -c < "$HERD_ERRLOG" 2>/dev/null) || return 0
+    size="${size//[^0-9]/}"                          # wc pads on some platforms
+    [ -n "$size" ] && [ "$size" -gt "$HERD_ERRLOG_MAX" ] || return 0
+    mv -f "$HERD_ERRLOG" "$HERD_ERRLOG.1" 2>/dev/null
+}
+
 herd_log() {
     printf '%s\t%s\t%s\n' "${NOW_ISO:-?}" "${0##*/}" "$*" >> "$HERD_ERRLOG" 2>/dev/null
+    herd_log_rotate
 }
 
 # ── payload parsing ───────────────────────────────────────────────────────
@@ -104,6 +121,7 @@ db() {
     if [ $rc -ne 0 ] && [ -s "$err" ]; then
         { printf '%s\t%s\trc=%d\t' "${NOW_ISO:-?}" "${0##*/}" "$rc"
           tr '\n' ' ' < "$err"; printf '\n'; } >> "$HERD_ERRLOG" 2>/dev/null
+        herd_log_rotate            # db() appends directly, so cap it here too
     fi
     rm -f "$err"
     return $rc

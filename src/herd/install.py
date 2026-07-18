@@ -161,7 +161,11 @@ def service_unit_text():
         "[Unit]\n"
         "Description=herd — Claude Code session tracker (reaper + attention)\n"
         f"Documentation=file://{REPO}\n"
-        "After=default.target\n\n"
+        "After=default.target\n"
+        # [Unit], NOT [Service] — systemd silently ignores it in [Service]
+        # ("Unknown key name ... ignoring") and keeps the 10s default, so a
+        # persistently-failing daemon still latches into `failed`.
+        "StartLimitIntervalSec=0\n\n"
         "[Service]\n"
         "Type=simple\n"
         f"Environment=PYTHONPATH={PKG_SRC}\n"
@@ -172,8 +176,7 @@ def service_unit_text():
         # fault (corrupt DB, full disk) must keep retrying rather than latch the
         # unit into `failed`, where the only symptom is sessions that never leave.
         "Restart=always\n"
-        "RestartSec=5\n"
-        "StartLimitIntervalSec=0\n\n"
+        "RestartSec=5\n\n"
         "[Install]\n"
         "WantedBy=default.target\n"
     )

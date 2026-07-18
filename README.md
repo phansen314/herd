@@ -273,6 +273,7 @@ Read by the hooks and CLI rather than the daemon:
 | `HERD_TOOL_THROTTLE` | `2` | seconds to coalesce `PostToolUse` writes on the hot path |
 | `HERD_CLAUDE_NAME` | `claude` | process name the pid ancestry walk looks for (node-based installs) |
 | `HERD_ERRLOG` | `~/.herd/hook-errors.log` | where hooks log failures (they never print to Claude) |
+| `HERD_ERRLOG_MAX` | `1048576` | bytes before the log rotates to `.1`; `0` keeps everything |
 
 ## Notifications (kitty tab bell)
 
