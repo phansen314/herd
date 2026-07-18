@@ -1327,6 +1327,77 @@ _on = c.execute("SELECT COUNT(*) FROM herd_attention").fetchone()[0]
 check("run() gates attention: core-only writes zero herd_attention, herd mode arms",
       _off == 0 and _on == 1, f"attend=False rows={_off} (want 0); attend=True rows={_on} (want 1)")
 
+print("\n\033[1m═══ T. JUMP / FOCUS (kitty/focus.py + cli.py) ═══\033[0m")
+from herd.kitty.focus import window_for_pid, flatten_windows, focus_session
+from herd import cli as _cli
+
+# pure resolution: the window whose foreground claude carries the pid.
+_wins = [{"id": 1, "foreground_processes": [{"pid": 111, "cmdline": ["bash"]}]},
+         {"id": 42, "foreground_processes": [{"pid": 5000, "cmdline": ["/opt/claude"]},
+                                             {"pid": 5001, "cmdline": ["node"]}]}]
+check("window_for_pid finds the window whose fg claude has the pid",
+      window_for_pid(_wins, 5000) == 42)
+check("window_for_pid ignores a non-claude proc with a matching pid, and misses cleanly",
+      window_for_pid(_wins, 5001) is None and window_for_pid(_wins, 999) is None)
+check("flatten_windows parses the ls tree, returns None on garbage",
+      flatten_windows('[{"tabs":[{"windows":[{"id":9}]}]}]') == [{"id": 9}]
+      and flatten_windows("not json") is None)
+
+def _focus_fixture(win_stored=7, pid=5000, attn=T0):
+    c = fresh()
+    pk = c.execute("INSERT INTO sessions(session_id,pid,cwd,status,started_at,updated_at)"
+                   " VALUES('jz',?,'/code/app','working',?,?)",(pid,T0,T0)).lastrowid
+    c.execute("INSERT INTO herd_sessions(session_pk,kitty_socket,window_id,source,verified_at)"
+              " VALUES(?,?,?,'hook',?)",(pk,SOCK,win_stored,T0))
+    if attn: c.execute("INSERT INTO herd_attention(session_pk,attention_at) VALUES(?,?)",(pk,attn))
+    return c, pk
+
+# re-derive (stored 7 -> real 42), focus, ack the attention, self-heal window_id.
+c, pk = _focus_fixture(win_stored=7)
+calls = []
+ok, msg = focus_session(c, pk, T1,
+                        list_fn=lambda s: [{"id": 42, "foreground_processes":
+                                            [{"pid": 5000, "cmdline": ["claude"]}]}],
+                        focus_fn=lambda s, w: (calls.append((s, w)) or True))
+check("focus_session re-derives by pid, focuses, acks attention, self-heals window_id",
+      ok and calls == [(SOCK, 42)]
+      and c.execute("SELECT window_id FROM herd_sessions WHERE session_pk=?",(pk,)).fetchone()[0] == 42
+      and c.execute("SELECT ack_at FROM herd_attention WHERE session_pk=?",(pk,)).fetchone()[0] == T1,
+      msg)
+
+# pid not visible in kitty -> fall back to the stored window_id.
+c, pk = _focus_fixture(win_stored=7, attn=None)
+calls = []
+ok, _ = focus_session(c, pk, T1, list_fn=lambda s: [], focus_fn=lambda s, w: (calls.append(w) or True))
+check("focus_session falls back to the cached window_id when the pid isn't found",
+      ok and calls == [7])
+
+# a failed kitty focus surfaces as an error, and no session/placement is an error.
+c, pk = _focus_fixture()
+okf, _ = focus_session(c, pk, T1, list_fn=lambda s: [], focus_fn=lambda s, w: False)
+c2 = fresh()
+p2 = c2.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at)"
+                " VALUES('np','/a','working',?,?)",(T0,T0)).lastrowid   # no herd_sessions row
+okn, _ = focus_session(c2, p2, T1, list_fn=lambda s: [], focus_fn=lambda s, w: True)
+check("focus_session errors on kitty failure and on a session with no placement",
+      not okf and not okn)
+
+# cli.resolve: herd id, uuid prefix, cwd substring, exact job.
+c = fresh()
+a = c.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at)"
+              " VALUES('aaa11111','/x/api','working',?,?)",(T0,T0)).lastrowid
+c.execute("INSERT INTO herd_sessions(session_pk,job_name,kitty_socket,window_id,source,verified_at)"
+          " VALUES(?,?,?,?,'spawn',?)",(a,"api",SOCK,1,T0))
+b = c.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at)"
+              " VALUES('bbb22222','/y/web','working',?,?)",(T0,T0)).lastrowid
+ids = lambda ms: sorted(r["id"] for r in ms)
+check("cli.resolve matches by herd id / uuid prefix / cwd / job",
+      ids(_cli.resolve(c, str(a))) == [a] and ids(_cli.resolve(c, "aaa1")) == [a]
+      and ids(_cli.resolve(c, "web")) == [b] and ids(_cli.resolve(c, "api")) == [a]
+      and _cli.resolve(c, "nomatch") == [])
+check("cli.resolve refuses an empty query (never matches all)",
+      _cli.resolve(c, "") == [] and _cli.resolve(c, "   ") == [])
+
 print("\n" + "═"*72)
 if FAILED:
     print(f"\033[31m{len(FAILED)} FAILED:\033[0m " + ", ".join(FAILED)); sys.exit(1)
