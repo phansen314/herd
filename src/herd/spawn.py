@@ -41,28 +41,47 @@ class SpawnSpec:
 
 
 def spawn(conn, spec, socket, now, *, launch_fn=None):
-    """Refuse a taken/invalid job, launch, and record the W1 placeholder rows.
-    Returns (ok, msg, pk). launch_fn(spec, socket) -> window_id|None is injected
-    for tests. Guards run BEFORE any launch, so a rejection never opens a tab."""
+    """Reserve the job name, launch, then stamp the window. Returns (ok, msg, pk).
+    launch_fn(spec, socket) -> window_id|None is injected for tests.
+
+    RESERVE BEFORE LAUNCH. The obvious order (check -> launch -> insert) is a TOCTOU:
+    the launch is a subprocess + kitty socket round trip, so two concurrent spawns of
+    one name both pass the check and both insert. No unique index catches it (see
+    W1 in writes.sql), so the claim has to be atomic in code. Taking the write lock
+    with BEGIN IMMEDIATE before re-checking makes the loser block, then correctly
+    see the winner's row. A rejection still never opens a tab."""
     launch_fn = launch_fn or _launch
     if not valid_job(spec.job):
         return False, f"invalid job name {spec.job!r} (use letters, digits, . _ -)", None
     if not socket:
         return False, "herd spawn needs to run inside kitty (KITTY_LISTEN_ON unset)", None
-    if conn.execute(W["R_job_live"], {"job": spec.job}).fetchone() is not None:
-        return False, f"a live session already holds the job {spec.job!r}", None
 
-    win = launch_fn(spec, socket)
-    if win is None:
-        return False, "kitty launch failed (remote control off, or bad socket?)", None
-
+    # ── phase 1: claim the name, window unknown ──
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if conn.execute(W["R_job_live"], {"job": spec.job}).fetchone() is not None:
+            conn.execute("ROLLBACK")
+            return False, f"a live session already holds the job {spec.job!r}", None
         pk = conn.execute(W["W1_spawn_session"], {"cwd": spec.cwd, "now": now}).lastrowid
         conn.execute(W["W1_spawn_herd"],
-                     {"pk": pk, "job": spec.job, "now": now, "socket": socket, "win": win})
+                     {"pk": pk, "job": spec.job, "now": now, "socket": socket})
         conn.execute("COMMIT")
     except Exception as e:                       # noqa: BLE001 — degrade, never crash the CLI
         conn.execute("ROLLBACK")
-        return False, f"launched window {win} but failed to record it: {e}", None
+        return False, f"could not reserve the job {spec.job!r}: {e}", None
+
+    # ── phase 2: launch, then stamp the placement onto the reservation ──
+    win = launch_fn(spec, socket)
+    if win is None:
+        # drop the reservation, or the name stays taken by a session that never was
+        try:
+            conn.execute(W["W1_spawn_abort"], {"pk": pk})
+        except Exception:                        # noqa: BLE001
+            pass
+        return False, "kitty launch failed (remote control off, or bad socket?)", None
+
+    try:
+        conn.execute(W["W1_spawn_window"], {"pk": pk, "win": win, "now": now})
+    except Exception as e:                       # noqa: BLE001 — the tab IS open; keep it
+        return False, f"launched window {win} but failed to record it: {e}", pk
     return True, f"spawned {spec.job!r} -> #{pk} in window {win}", pk

@@ -156,7 +156,7 @@ Inline comments inside a statement must not contain `;` (both parsers cut there;
 | `W5b_adopt` | Statusline adoption ("Path C"): statusline is a child of claude, inherits `KITTY_*` like a hook, so a reconciled session picks up metrics with no hooks wired. Same liveness JOIN as W2. |
 | `W6a_arm` / `W6b_paged` / `W6c_ack` / `W6d_rearm` / `W6d_rearm_sid` | Attention (see [attention](#attention)). `W6d_rearm_sid` is the UUID-keyed variant a hook needs (hooks lack the surrogate pk) — same keyed-two-ways pattern as W2 vs W2b. |
 | `R1_list` | The TUI's main read: all four tables, attention-first ordering. |
-| `R_job_live` | Spawn-time recyclable-handle check: does a *live* session already hold this job name? By JOIN, no unique index. Checked before the launch, so a rejection never opens a tab. Dead rows keep their `job_name` — reuse is by design, and resolution searches live sessions only. Known gap: the check is not atomic with the insert (TOCTOU), and there is deliberately no unique index to catch a racing double-spawn. |
+| `R_job_live` | Spawn-time recyclable-handle check: does a *live* session already hold this job name? By JOIN, no unique index. Dead rows keep their `job_name` — reuse is by design, and resolution searches live sessions only. Run **inside** `spawn()`'s `BEGIN IMMEDIATE`, not before it: the check must be atomic with the reservation, or two concurrent spawns both pass it across the kitty launch and both insert. See [spawn](#spawn). |
 | `R_statusline` | Render input: feeds only the burn rate (the `prev_cost` pair). One read per fingerprint miss. |
 
 **Routing read, not data read:** in an adopt writer (W2, W5b, W2b_placement) a
@@ -274,6 +274,47 @@ empty fields, shifting every later one). Git branch is a pure-bash walk to
 `.git/HEAD` (zero forks). Burn rate is herd's own addition; the awk guards
 `mktime` returning -1 on an unparseable stamp (else a bogus `$0.00/h`), and
 sub-cent rates are hidden as noise.
+
+---
+
+## Spawn — reserve before launch (`spawn.py`) {#spawn}
+
+`herd spawn` gives a session a name *before* Claude has reported a UUID, so the job
+name is the handle for everything downstream. That makes "one live session per job
+name" a guarantee worth actually holding.
+
+The obvious order is wrong:
+
+    check R_job_live  ->  kitten @ launch  ->  INSERT
+
+The launch is a subprocess plus a socket round trip — tens to hundreds of
+milliseconds of I/O sitting between the check and the write. Two spawns of one name
+started in that window both pass the check and both insert, and you end up with two
+live sessions holding `api`. Nothing corrupts, but the handle is now ambiguous:
+`resolve()` returns two rows, so `herd jump api` opens the picker instead of jumping,
+which is exactly the scriptability the unique-match branch exists to provide.
+
+**No index can catch this.** `job_name` must repeat across dead rows (that is what
+makes names recyclable), so a plain `UNIQUE` is out. The constraint you want is
+unique-among-live, but liveness is `sessions.stopped_at` and the name lives in
+`herd_sessions` — and a SQLite partial index cannot reference another table. The
+`live` denormalized column that would have made it expressible is the one that
+desynced on resume and was removed (see [liveness](#liveness)).
+
+So the claim is made atomic in code instead, in two phases:
+
+1. **Reserve** — `BEGIN IMMEDIATE`, re-check `R_job_live`, insert both rows with
+   `window_id` NULL, `COMMIT`. Taking the write lock *before* the check is the whole
+   trick: a second spawner blocks, then sees the winner's committed row.
+2. **Stamp** — launch, then `W1_spawn_window` records the window id.
+
+A failed launch runs `W1_spawn_abort` (a real `DELETE`, cascading) so the name frees
+immediately — the session never existed and must not linger in history. `sessions.id`
+is `AUTOINCREMENT` precisely so that delete can never cause surrogate reuse.
+
+The intermediate state — reserved, not yet placed — is safe to observe: `window_id`
+NULL is already the "no window to focus yet" case in `focus_session`, and
+`herd_sessions.window_id` is MUTABLE by contract.
 
 ---
 

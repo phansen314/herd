@@ -6,7 +6,16 @@
 -- Inline comments inside a statement must not contain ';'.
 -- ═══════════════════════════════════════════════════════════════════════════
 
--- ── W1. SPAWN (herd/kitty) — job + window known, UUID/pid not yet.
+-- ── W1. SPAWN (herd/kitty) — TWO PHASE, and the order is load-bearing.
+-- Phase 1 (RESERVE, inside BEGIN IMMEDIATE with the R_job_live re-check): claim the
+-- job name with window_id NULL, BEFORE the kitty launch. Phase 2 (W1_spawn_window):
+-- stamp the window once kitten @ launch returns.
+-- Reserving first is what makes the live-job check atomic: the launch is a subprocess
+-- + socket round trip, and checking across it let two concurrent spawns both pass.
+-- No unique index can back this up — job_name must repeat across dead rows, and a
+-- partial "live" index would have to reach into sessions.stopped_at. See
+-- DESIGN.md#liveness. window_id is MUTABLE by contract (herd.sql), and a NULL
+-- placement is already a handled state (focus.py: "no window to focus").
 -- status_source='reconcile' is a white lie (CHECK has no 'spawn'); real
 -- provenance is herd_sessions.source. Driven by `herd spawn` (cli.cmd_spawn).
 -- :name W1_spawn_session
@@ -16,7 +25,18 @@ VALUES(:cwd, 'unknown', 'reconcile', :now, :now);
 INSERT INTO herd_sessions(session_pk, job_name, created_at,
                           kitty_socket, window_id,
                           herd_var, source, verified_at)
-VALUES(:pk, :job, :now, :socket, :win, :job, 'spawn', :now);
+VALUES(:pk, :job, :now, :socket, NULL, :job, 'spawn', :now);
+
+-- W1b: the launch returned — stamp the placement onto the reservation.
+-- :name W1_spawn_window
+UPDATE herd_sessions SET window_id = :win, verified_at = :now WHERE session_pk = :pk;
+
+-- W1c: the launch FAILED — drop the reservation so the job name frees immediately.
+-- DELETE, not stopped_at: this session never existed, so it must not appear in
+-- history. sessions.id is AUTOINCREMENT precisely so a real DELETE never causes
+-- surrogate reuse; herd_sessions/events fall away via ON DELETE CASCADE.
+-- :name W1_spawn_abort
+DELETE FROM sessions WHERE id = :pk;
 
 
 -- ── W2. ADOPT via window_id (session_start.sh). Joins on (socket, window_id)

@@ -14,7 +14,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from helpers import HOOKS, mk_session
+from herd.spawn import SpawnSpec, spawn
+
+from helpers import HOOKS, T0, mk_session
 
 PAY = {"session_id": "s1", "cwd": "/code/herd", "model": {"id": "opus"}}
 NO_THROTTLE = {"HERD_TOOL_THROTTLE": "0"}   # else the 2s coalesce hides the race
@@ -121,3 +123,97 @@ def test_concurrent_statusline_and_hook(hook_env):
     # both writers' effects survive: the statusline never clobbers status, the
     # lifecycle hook never clobbers metrics.
     assert r["status"] == "working" and r["context_percent"] == 42
+
+
+# ── spawn(): the reserve-before-launch race ──────────────────────────────────
+def _spawn_conn(path):
+    """A connection shaped like the CLI's: autocommit, so spawn() drives BEGIN
+    IMMEDIATE itself. Per-thread — sqlite objects are not shareable across threads."""
+    c = sqlite3.connect(str(path), timeout=5)
+    c.isolation_level = None
+    c.execute("PRAGMA foreign_keys=ON")
+    c.row_factory = sqlite3.Row
+    return c
+
+
+def test_concurrent_spawns_of_one_job_name_only_one_wins(fresh, tmp_path):
+    """The TOCTOU: the live-job check used to sit outside the transaction, with a
+    kitty launch (subprocess + socket round trip) between it and the INSERT. Two
+    spawners both passed the check and both inserted, leaving two live sessions
+    holding one job name — and no unique index can catch it, because job_name must
+    repeat across dead rows.
+
+    Fails against check -> launch -> insert; passes with reserve -> launch -> stamp.
+    """
+    fresh(name="race.db").close()               # create + apply schema, then reopen
+    path = tmp_path / "race.db"
+    barrier = threading.Barrier(2)
+
+    def slow_launch(spec, socket):
+        """Stands in for `kitten @ launch` — the real gap is I/O of this order."""
+        time.sleep(0.15)
+        return 99
+
+    def attempt(_):
+        conn = _spawn_conn(path)
+        try:
+            spec = SpawnSpec(job="api", cwd="/code/herd")
+            barrier.wait(timeout=5)             # maximise the overlap
+            return spawn(conn, spec, "unix:/tmp/kitty-1", T0, launch_fn=slow_launch)
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        results = list(ex.map(attempt, range(2)))
+
+    won = [r for r in results if r[0]]
+    lost = [r for r in results if not r[0]]
+    assert len(won) == 1, f"expected exactly one winner, got {results}"
+    assert "already holds the job" in lost[0][1]
+
+    c = _spawn_conn(path)
+    live = c.execute(
+        "SELECT COUNT(*) FROM herd_sessions h JOIN sessions s ON s.id = h.session_pk "
+        "WHERE h.job_name='api' AND s.stopped_at IS NULL").fetchone()[0]
+    c.close()
+    assert live == 1, f"{live} live sessions hold 'api' — the handle is ambiguous"
+
+
+def test_failed_launch_frees_the_reserved_name_immediately(fresh, tmp_path):
+    """Reserving before launching means a failed launch must clean up, or the name
+    stays taken by a session that never existed."""
+    fresh(name="abort.db").close()
+    path = tmp_path / "abort.db"
+    conn = _spawn_conn(path)
+    ok, msg, _ = spawn(conn, SpawnSpec(job="api", cwd="/x"), "unix:/tmp/kitty-1", T0,
+                       launch_fn=lambda s, k: None)
+    assert not ok and "kitty launch failed" in msg
+    assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+
+    ok2, _, _ = spawn(conn, SpawnSpec(job="api", cwd="/x"), "unix:/tmp/kitty-1", T0,
+                      launch_fn=lambda s, k: 7)
+    assert ok2, "the name was still held after a failed launch"
+    conn.close()
+
+
+def test_reservation_is_not_visible_as_a_placement_until_launched(fresh, tmp_path):
+    """Between reserve and stamp, window_id is NULL. focus.py already treats that as
+    'no window to focus yet', so the intermediate state is safe to observe."""
+    fresh(name="reserve.db").close()
+    path = tmp_path / "reserve.db"
+    conn = _spawn_conn(path)
+    seen = {}
+
+    def peek_launch(spec, socket):
+        c2 = _spawn_conn(path)                  # a DIFFERENT connection, mid-spawn
+        seen["row"] = c2.execute(
+            "SELECT job_name, window_id FROM herd_sessions").fetchone()
+        c2.close()
+        return 42
+
+    spawn(conn, SpawnSpec(job="api", cwd="/x"), "unix:/tmp/kitty-1", T0,
+          launch_fn=peek_launch)
+    assert seen["row"]["job_name"] == "api"     # committed: that is what blocks a racer
+    assert seen["row"]["window_id"] is None     # but not yet placed
+    assert conn.execute("SELECT window_id FROM herd_sessions").fetchone()[0] == 42
+    conn.close()
