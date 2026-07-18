@@ -143,7 +143,7 @@ Inline comments inside a statement must not contain `;` (both parsers cut there;
 
 | Statement | Purpose |
 |---|---|
-| `W1_spawn_session` / `W1_spawn_herd` | Spawn a session from herd (job + window known, UUID/pid not). `status_source='reconcile'` is a white lie — the CHECK has no `'spawn'`; real provenance is `herd_sessions.source`. *(spawn path not yet wired to a CLI verb.)* |
+| `W1_spawn_session` / `W1_spawn_herd` | Spawn a session from herd (job + window known, UUID/pid not). `status_source='reconcile'` is a white lie — the CHECK has no `'spawn'`; real provenance is `herd_sessions.source`. Driven by `herd spawn`. |
 | `W2_adopt` | SessionStart adopts herd's placeholder row for this window, joining on `(socket, window_id)` from env. Writes Claude's signals into the core row. Idempotent (`AND session_id IS NULL`). |
 | `W2b_insert` | Fallback when W2 matched nothing: upsert on Claude's UUID. Resume revives a stopped row (`stopped_at=NULL`, fresh pid); `started_at` preserved so duration is total age. |
 | `W2c_pid_claim` | Runs first, own txn: reap any stale live holder of this pid so `idx_sessions_pid_live` is satisfiable. Excludes our own row. NULL pid → no-op. |
@@ -152,11 +152,11 @@ Inline comments inside a statement must not contain `;` (both parsers cut there;
 | `W3e_boot_sweep` | Boot sweep (see [pid](#pid)). |
 | `W4_event` / `W4_event_log` | Lifecycle: status + `last_event_*` in one statement, plus the append-only event. **No status guard** (see [two clocks](#two-clocks)). |
 | `W4_end` | The only hook-driven death (`status_source='hook'` — it *knows*, vs W3d's inference). |
-| `W5_statusline` | Metrics sink, UPDATE only (never creates a row — would resurrect stopped sessions / invent empty cwd). Never touches `last_event_*`. Resets_at arrives as unix epoch, converted to ISO in SQLite (zero date forks); `COALESCE` keeps prior value on NULL. The `prev_cost` pair (burn-rate delta, resampled >300s) is correct as written: an UPDATE's RHS sees the OLD row, so `prev_cost_usd` captures the previous total before this statement overwrites it. |
+| `W5_statusline` | The sink for **every** field the statusLine payload carries — metrics, plus `claude_code_version`, `output_style`, `git_worktree`, `original_cwd` — and `git_branch`, which the hook derives from its own `.git` walk. Nothing else writes these; a field absent from this statement is a column that stays NULL forever (`api_duration_ms` shipped that way: parsed, rendered, never bound). UPDATE only (never creates a row — would resurrect stopped sessions / invent empty cwd). Never touches `last_event_*`. Resets_at arrives as unix epoch, converted to ISO in SQLite (zero date forks); `COALESCE` keeps prior value on NULL. The `prev_cost` pair (burn-rate delta, resampled >300s) is correct as written: an UPDATE's RHS sees the OLD row, so `prev_cost_usd` captures the previous total before this statement overwrites it. |
 | `W5b_adopt` | Statusline adoption ("Path C"): statusline is a child of claude, inherits `KITTY_*` like a hook, so a reconciled session picks up metrics with no hooks wired. Same liveness JOIN as W2. |
 | `W6a_arm` / `W6b_paged` / `W6c_ack` / `W6d_rearm` / `W6d_rearm_sid` | Attention (see [attention](#attention)). `W6d_rearm_sid` is the UUID-keyed variant a hook needs (hooks lack the surrogate pk) — same keyed-two-ways pattern as W2 vs W2b. |
 | `R1_list` | The TUI's main read: all four tables, attention-first ordering. |
-| `R_job_live` | Spawn-time recyclable-handle check: does a *live* session already hold this job name? By JOIN, no unique index. *(unused until the spawn verb lands.)* |
+| `R_job_live` | Spawn-time recyclable-handle check: does a *live* session already hold this job name? By JOIN, no unique index. Checked before the launch, so a rejection never opens a tab. Dead rows keep their `job_name` — reuse is by design, and resolution searches live sessions only. Known gap: the check is not atomic with the insert (TOCTOU), and there is deliberately no unique index to catch a racing double-spawn. |
 | `R_statusline` | Render input: feeds only the burn rate (the `prev_cost` pair). One read per fingerprint miss. |
 
 **Routing read, not data read:** in an adopt writer (W2, W5b, W2b_placement) a
@@ -398,11 +398,12 @@ is a separate actuator, deliberately deferred — this layer maintains the signa
 
 The `pytest` suite under `tests/` is the only CI gate: import-linter can't see
 the tier boundary because that boundary is SQL and the hooks are bash. It applies
-the real schema, loads the real statements through `herd.db`, and execs the
-**real** hooks (directly, not via `bash <path>` — a missing `+x` must fail the
-same way production does) against a per-test throwaway DB.
+the real schema, loads the real statements through `herd.db`, and runs the
+**real** hooks against a per-test throwaway DB. (`conftest.hook_env` invokes them
+as `bash <path>`; the executable bit is covered separately by a source invariant,
+and `install.selftest()` is what execs them the way production does.)
 
-    python3 -m pytest              # whole suite (~1s)
+    python3 -m pytest              # whole suite
     python3 -m pytest tests/test_hooks.py     # one section
     python3 -m pytest -k pid       # by keyword
 
@@ -417,6 +418,6 @@ and an uncommitted setup would be invisible to them.
 
 ## Deferred / not yet built
 
-- `herd new` spawn verb (SQL: `W1_spawn_*`, `R_job_live` — written, unwired).
-- The notifier/pager actuator (`W6b_paged`, `paged_level` escalation).
+- The notifier/pager actuator (`W6b_paged`, `paged_level` escalation). Until it
+  lands, `paged_level` is always `0` and `W6b_paged` has no production caller.
 - A `pid_start_time` column to close the reboot pid-reuse caveat properly.

@@ -10,9 +10,9 @@ are bash + `jq` + `sqlite3` on purpose (a Python cold start on every `SessionSta
 would be felt); the background daemon is stdlib Python.
 
 > **Status: early but usable.** The data model, lifecycle hooks, statusline, the
-> liveness/attention daemon, and the `herd` CLI (`ls` + fzf-powered `jump`) are
-> built, tested, and installed. Still ahead (see [Roadmap](#roadmap)): spawning
-> named sessions (`herd new`) and a lightweight notifier for ambient attention.
+> liveness/attention daemon, and the `herd` CLI (`ls`, `spawn`, fzf-powered `jump`,
+> and the `watch` dashboard) are built, tested, and installed. Still ahead (see
+> [Roadmap](#roadmap)): a lightweight notifier for ambient attention.
 
 ## What it does
 
@@ -69,6 +69,13 @@ Claude has reported its UUID.
 Run herd purely for **core data collection** with `HERD_ATTENTION=0` and build your
 own tooling on the `sessions` table; herd never touches `herd_attention`.
 
+If you do read the DB from your own tool, treat `sessions.status` as an **open set**:
+render any value you don't recognize as `unknown` rather than switching exhaustively.
+The current values are `working`, `waiting`, `needs_approval`, `stopped`, `unknown`,
+and the `CHECK` constraint that enforces them will gain members as Claude Code adds
+lifecycle hooks. Growing that set is additive for readers that degrade gracefully and
+breaking for ones that don't. Same rule for `last_event_type` and `status_source`.
+
 ### Canonical SQL
 
 Every write is a named statement in [`schema/writes.sql`](src/herd/schema/writes.sql).
@@ -79,8 +86,10 @@ quietly rot in a copy.
 
 ## Install
 
-Requires: `bash`, `jq`, `sqlite3`, Python ≥ 3.9, and kitty (for placement). herd is
-run from the source tree — no `pip install` needed.
+Requires: `bash`, `jq`, `sqlite3`, Python ≥ 3.9, and — for `jump`/`watch`/placement —
+`fzf` and kitty. herd is run from the source tree — no `pip install` needed.
+
+An existing `~/.claude/settings.json` is expected; the installer edits it in place.
 
 ```bash
 git clone <repo> ~/code/herd && cd ~/code/herd
@@ -97,12 +106,25 @@ The installer:
 3. **installs the daemon** as a `systemd --user` service (`herd.service`), enabled on
    login with auto-restart. Where `systemctl --user` is unavailable (macOS/headless)
    this step is a graceful no-op — run the daemon yourself.
+4. **symlinks the CLI** — `herd` into `~/.local/bin` and bash completion into
+   `~/.local/share/bash-completion/completions` (WARNs if `~/.local/bin` isn't on
+   your PATH);
+5. **self-tests** — runs the wired hooks against a temp DB and prints PASS/FAIL.
 
-Undo it all — hooks, statusline, and service — with:
+If you use [klawde](https://github.com/wolffiex/klawde), note that the installer
+**unwires it**: any hook command under `/.klawde/` is dropped from `settings.json`
+(the two tools both own the statusline and would fight).
+
+Undo it — hooks, statusline, service, and the CLI symlinks — with:
 
 ```bash
 PYTHONPATH=src python3 -m herd.install --uninstall
 ```
+
+This works by **restoring the most recent `*.herd-bak.<ts>` backup** of each file it
+edited, not by reversing the edits — if those backups are gone it says so and leaves
+the file wired, and you unwire `~/.claude/settings.json` by hand. Your data survives
+either way: `~/.herd/herd.db` is never deleted.
 
 ## Using it
 
@@ -110,10 +132,24 @@ PYTHONPATH=src python3 -m herd.install --uninstall
 
 ```bash
 herd ls                 # live sessions, attention-first, by name
+herd spawn <job>        # launch claude in a new kitty tab, tracked from the start
 herd jump               # fuzzy-pick a session (fzf) with a live preview, and focus it
 herd jump <query>       # herd id, name (/rename), job, uuid, or cwd; unique match jumps
 herd watch              # the picker as a permanent dashboard, for a dedicated tab
 ```
+
+**`herd spawn`** names a session up front, so it has a handle before Claude has even
+reported a UUID:
+
+```bash
+herd spawn api                              # a new tab, cwd here
+herd spawn api --pane                       # a split instead
+herd spawn api --cwd ~/code/x --prompt "review the diff" -- --model opus
+```
+
+Job names are recyclable: `spawn` refuses a name a *live* session already holds, but
+once that session dies the name is free again. Everything after `--` is passed
+through to `claude`.
 
 Sessions show by their recognizable name — Claude's `/rename` name, else herd's job,
 else the uuid. `jump` opens an fzf picker (with a detail preview) unless the query is
@@ -222,7 +258,7 @@ gone quiet) shows separately as the `!` in `herd ls` / the jump picker.
 The whole design is asserted, not narrated, by the `pytest` suite:
 
 ```bash
-python3 -m pytest       # ~160 checks, no install needed, ~1s
+python3 -m pytest       # whole suite, no install needed, a few seconds
 ```
 
 It runs the real bash hooks and the real Python against throwaway databases, and
@@ -246,8 +282,10 @@ src/herd/
   db.py          statement loader + connection policy
   daemon.py      the reaper + attention tick
   install.py     hooks/statusline/service/CLI wiring
-  cli.py         the `herd` CLI (ls, jump, + fzf preview machinery)
+  cli.py         the `herd` CLI (ls, spawn, jump, watch + fzf preview machinery)
+  spawn.py       `herd spawn` — SpawnSpec, the guards, and the W1 placeholder write
   kitty/         focus.py — re-derive a session's window and jump to it
+                 launch.py — `kitten @ launch` for `herd spawn`
 completions/     bash completion   ·   bin/herd — the CLI wrapper
 tests/           pytest suite (helpers.py + conftest.py + test_*.py per concern)
 DESIGN.md        the design rationale
@@ -261,8 +299,6 @@ tab flag (see [Notifications](#notifications-kitty-tab-bell)) — so a dedicated
 a herd-owned notifier are **not planned**; each is handled more cheaply outside herd.
 fzf *is* the TUI: it already lists, navigates, and previews live. What's left:
 
-- **`herd new <job>`** — launch a named kitty tab/pane running Claude, tracked from
-  the start (the one spot that still needs kitty on a write path: `kitten @ launch`).
 - **More CLI verbs** as needed (`herd kill`, `herd dismiss`), each composing with
   `herd jump`'s fzf picker.
 - *(maybe)* a daemon tab-poke for the one case Claude's bell can't cover — a session
