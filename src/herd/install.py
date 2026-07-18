@@ -72,12 +72,13 @@ def backup(path, ts):
 # ── DB bootstrap ───────────────────────────────────────────────────────────
 def bootstrap_db(dry=False):
     if dry:
-        return f"would create {DB} and apply core.sql + herd.sql"
+        return f"would create {DB} and apply core.sql + herd.sql (+ templates dir)"
     HERD_DIR.mkdir(parents=True, exist_ok=True)
+    (HERD_DIR / "templates").mkdir(exist_ok=True)   # spawn presets (herd spawn -t)
     conn = connect(str(DB))
     apply_schema(conn)          # idempotent: CREATE TABLE IF NOT EXISTS
     conn.close()
-    return f"bootstrapped {DB}"
+    return f"bootstrapped {DB} + {HERD_DIR / 'templates'}/"
 
 
 # ── daemon service (reaper + attention) ────────────────────────────────────

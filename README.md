@@ -151,6 +151,36 @@ Job names are recyclable: `spawn` refuses a name a *live* session already holds,
 once that session dies the name is free again. Everything after `--` is passed
 through to `claude`.
 
+**Templates** — a preset for a spawn you run often. Drop a TOML file in
+`~/.herd/templates/` and pass `-t`:
+
+```toml
+# ~/.herd/templates/review.toml
+job    = "review"          # optional — then `herd spawn -t review` needs no name
+cwd    = "~/code/herd"
+type   = "pane"            # tab | pane
+title  = "code review"
+args   = ["--model", "opus"]
+prompt = """
+Review the working diff.
+Focus on correctness; skip style.
+"""
+```
+
+```bash
+herd spawn -t review                 # everything from the template
+herd spawn api -t review --tab       # CLI wins: job=api, type=tab, rest from template
+```
+
+Precedence is **CLI flag > template > built-in default**, so a template is a set of
+defaults you can always override. The one exception is `--`: those args are *appended*
+to the template's `args` rather than replacing them, so a template can carry a base
+set and you add ad-hoc flags on top. `-t` tab-completes.
+
+A multiline `prompt` is the reason the format is TOML. Templates need **Python 3.11+**
+(stdlib `tomllib`); the rest of herd still runs on 3.9. Unknown keys are rejected
+rather than ignored, so a typo tells you instead of silently doing nothing.
+
 Sessions show by their recognizable name — Claude's `/rename` name, else herd's job,
 else the uuid. `jump` opens an fzf picker (with a detail preview) unless the query is
 a unique match, in which case it focuses immediately.
@@ -230,6 +260,14 @@ HERD_ATTENTION=0 PYTHONPATH=src python3 -m herd.daemon   # core-only
 | `HERD_STUCK_SECS` | `300` | silence before a `working` session reads as stuck |
 | `HERD_DB` | `~/.herd/herd.db` | database path |
 
+Read by the hooks and CLI rather than the daemon:
+
+| var | default | meaning |
+|---|---|---|
+| `HERD_TEMPLATES` | `~/.herd/templates` | where `herd spawn -t` looks for `<name>.toml` |
+| `HERD_TOOL_THROTTLE` | `2` | seconds to coalesce `PostToolUse` writes on the hot path |
+| `HERD_CLAUDE_NAME` | `claude` | process name the pid ancestry walk looks for (node-based installs) |
+
 ## Notifications (kitty tab bell)
 
 herd sends no notifications itself — **Claude Code rings the bell, kitty flags the
@@ -283,7 +321,8 @@ src/herd/
   daemon.py      the reaper + attention tick
   install.py     hooks/statusline/service/CLI wiring
   cli.py         the `herd` CLI (ls, spawn, jump, watch + fzf preview machinery)
-  spawn.py       `herd spawn` — SpawnSpec, the guards, and the W1 placeholder write
+  spawn.py       `herd spawn` — SpawnSpec, resolve_spec, reserve-then-launch
+  template.py    ~/.herd/templates/*.toml -> SpawnSpec defaults (herd spawn -t)
   kitty/         focus.py — re-derive a session's window and jump to it
                  launch.py — `kitten @ launch` for `herd spawn`
 completions/     bash completion   ·   bin/herd — the CLI wrapper

@@ -316,6 +316,29 @@ The intermediate state — reserved, not yet placed — is safe to observe: `win
 NULL is already the "no window to focus yet" case in `focus_session`, and
 `herd_sessions.window_id` is MUTABLE by contract.
 
+### Templates {#templates}
+
+`herd spawn -t <name>` loads `~/.herd/templates/<name>.toml` (override:
+`HERD_TEMPLATES`) into a dict of `SpawnSpec` field overrides. A template is just a
+**second source of SpawnSpec defaults** — `template.py` never touches the DB, kitty,
+or `spawn()`; `resolve_spec` merges and hands the result to the same executor a bare
+CLI invocation uses. That keeps the feature entirely in front of the write path.
+
+Precedence is **CLI (non-None) > template > built-in default**, which is why
+`--type` defaults to `None` rather than `"tab"`: the resolver has to distinguish
+"unset" from an explicit `--tab`, or a template's `type` could never win. `args` is
+the one field that concatenates instead of overriding — template args first, then
+the CLI's `-- …` — so a template carries a base set and the CLI adds ad-hoc flags.
+`job` may come from either side, so `herd spawn -t review` with no positional is
+valid; failing to resolve one is a `ValueError`.
+
+TOML, not JSON, for triple-quoted multiline strings — a multiline `prompt` is the
+motivating case. `tomllib` is imported lazily so only *using* a template requires
+Python 3.11; the rest of herd stays on 3.9. Unknown keys raise rather than being
+ignored (a mistyped `promt` should say so, not silently do nothing), and `load_template`
+raises `ValueError` with a friendly message for every failure mode — bad name, missing
+file, bad TOML, wrong type — so the CLI prints `✗ …` instead of a stack trace.
+
 ---
 
 ## Focus / jump (`kitty/focus.py`, `cli.py`)

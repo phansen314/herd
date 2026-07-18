@@ -25,7 +25,8 @@ import sys
 from herd.db import connect, load_statements
 from herd.daemon import DEFAULT_DB, _now_iso
 from herd.kitty.focus import focus_session
-from herd.spawn import SpawnSpec, spawn
+from herd.spawn import resolve_spec, spawn
+from herd.template import load_template, available_templates
 
 _HOME = os.path.expanduser("~")
 
@@ -376,40 +377,56 @@ def _split_dashdash(args):
 
 def cmd_spawn(conn, args):
     """Launch a named claude session in a kitty tab/pane and record its placeholder
-    so the SessionStart hook adopts Claude's UUID onto it. See herd.spawn."""
+    so the SessionStart hook adopts Claude's UUID onto it. A -t/--template preloads
+    SpawnSpec defaults from ~/.herd/templates/<name>.toml; CLI flags override. See
+    herd.spawn / herd.template."""
     herd_args, claude_args = _split_dashdash(args)
     p = argparse.ArgumentParser(prog="herd spawn", add_help=False)
-    p.add_argument("job")
+    p.add_argument("job", nargs="?", default=None)   # optional: a template may supply it
+    p.add_argument("-t", "--template", default=None)
     p.add_argument("--cwd", default=None)
     p.add_argument("--prompt", default=None)
     # --type tab|pane, with --tab / --pane as shorthand. Mutually exclusive so
-    # `--tab --pane` (or --type with either) is a clean usage error, not a
-    # silent last-wins.
+    # `--tab --pane` (or --type with either) is a clean usage error. Default is
+    # None (not "tab") so the resolver can tell "unset" from an explicit --tab and
+    # let a template's `type` win when the flag is absent.
     t = p.add_mutually_exclusive_group()
-    t.add_argument("--type", dest="launch_type", choices=("tab", "pane"), default="tab")
+    t.add_argument("--type", dest="launch_type", choices=("tab", "pane"), default=None)
     t.add_argument("--tab", dest="launch_type", action="store_const", const="tab")
     t.add_argument("--pane", dest="launch_type", action="store_const", const="pane")
     try:
         ns = p.parse_args(herd_args)
     except SystemExit:
-        print("usage: herd spawn <job> [--cwd DIR] [--type tab|pane | --tab | --pane] "
-              "[--prompt TEXT] [-- <claude args...>]")
+        print("usage: herd spawn [<job>] [-t NAME] [--cwd DIR] "
+              "[--tab|--pane|--type tab|pane] [--prompt TEXT] [-- <claude args...>]")
         return 2
-    spec = SpawnSpec(job=ns.job, cwd=ns.cwd or os.getcwd(), launch_type=ns.launch_type,
-                     prompt=ns.prompt, claude_args=claude_args)
+    try:
+        tmpl = load_template(ns.template) if ns.template else {}
+        spec = resolve_spec({"job": ns.job, "cwd": ns.cwd, "launch_type": ns.launch_type,
+                             "prompt": ns.prompt, "claude_args": claude_args}, tmpl)
+    except ValueError as e:
+        print("✗ " + str(e))
+        return 1
     ok, msg, _ = spawn(conn, spec, os.environ.get("KITTY_LISTEN_ON"), _now_iso())
     print(("✓ " if ok else "✗ ") + msg)
     return 0 if ok else 1
 
 
+def cmd_tcomplete(conn, args):
+    """Template-name completion feed for `herd spawn -t` (machinery, hidden)."""
+    print("\n".join(available_templates()))
+    return 0
+
+
 COMMANDS = {"ls": cmd_ls, "jump": cmd_jump, "spawn": cmd_spawn, "watch": cmd_watch,
-            "preview": cmd_preview, "complete": cmd_complete, "rows": cmd_rows,
-            "poke": cmd_poke}
+            "preview": cmd_preview, "complete": cmd_complete, "tcomplete": cmd_tcomplete,
+            "rows": cmd_rows, "poke": cmd_poke}
 # `spawn` writes (W1) and `watch` focuses windows — neither is readonly.
-_READONLY = {"ls", "preview", "complete", "rows", "poke"}
+_READONLY = {"ls", "preview", "complete", "tcomplete", "rows", "poke"}
 # The verbs a user actually types. `preview` (fzf's per-highlight pane), `complete`
-# (tab-completion feed), `rows` (fzf's reload source) and `poke` (watch's refresh
-# child) are machinery — callable, but not advertised in help or tab-completion.
+# / `tcomplete` (tab-completion feeds), `rows` (fzf's reload source) and `poke`
+# (watch's refresh child) are machinery — callable, but not advertised in help or
+# tab-completion.
 USER_COMMANDS = ("ls", "jump", "spawn", "watch")
 
 

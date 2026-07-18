@@ -6,6 +6,7 @@ that yields a SpawnSpec and never touch the DB or this code. Writes go through t
 canonical W1 statements (load_statements), like every other write path.
 See DESIGN.md#write-paths-schemawritessql.
 """
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -38,6 +39,26 @@ class SpawnSpec:
     def __post_init__(self):
         if self.title is None:
             self.title = self.job
+
+
+def resolve_spec(cli, tmpl):
+    """Merge CLI overrides over template defaults into a SpawnSpec. Precedence:
+    CLI flag (non-None) > template value > built-in default. claude_args is the one
+    list field — template args come first, CLI `-- args` append after (the template
+    is the base, the CLI adds ad-hoc). Raises ValueError if no job resolves."""
+    def pick(field, default=None):
+        v = cli.get(field)
+        return v if v is not None else tmpl.get(field, default)
+
+    job = pick("job")
+    if not job:
+        raise ValueError("a job name is required (positional argument or template 'job')")
+    cwd = os.path.abspath(os.path.expanduser(pick("cwd") or os.getcwd()))
+    claude_args = list(tmpl.get("claude_args") or []) + list(cli.get("claude_args") or [])
+    return SpawnSpec(job=job, cwd=cwd,
+                     launch_type=pick("launch_type") or "tab",
+                     title=pick("title"), prompt=pick("prompt"),
+                     claude_args=claude_args, vars=dict(tmpl.get("vars") or {}))
 
 
 def spawn(conn, spec, socket, now, *, launch_fn=None):
