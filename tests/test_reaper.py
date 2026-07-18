@@ -1,5 +1,6 @@
 """R — the liveness reaper (daemon.py): ps-driven death, boot sweep, and the
 pure proc-table / _dead helpers."""
+import sqlite3
 import subprocess
 
 import herd.daemon as daemon
@@ -153,3 +154,53 @@ def test_sweep_never_touches_an_adopted_session(fresh):
     nopid = mk_session(c, session_id="hook-row-no-pid", started_at=T0)
     assert daemon.sweep_stranded(c, T2, max_age=60) == 0
     assert stopped_at(c, live) is None and stopped_at(c, nopid) is None
+
+
+# ── the tick must survive its own failures ──────────────────────────────────
+def test_a_failing_tick_is_logged_and_the_daemon_keeps_going(fresh, tmp_path, capsys, monkeypatch):
+    """Every statement is its own autocommit txn against a WAL five hook scripts and
+    a per-session statusline are also writing, so `database is locked` is routine.
+    It used to exit the process: a restart loop into systemd's start limit, or — on
+    macOS/headless where the service install is a documented no-op — silent-death
+    reaping simply stopping, with nothing to notice.
+
+    Crashing was also the de-facto recovery for a BROKEN HANDLE (systemd restarted
+    us with a fresh one), so surviving means reopening the connection ourselves."""
+    fresh(name="loop.db").close()
+    db = str(tmp_path / "loop.db")
+    ticks = {"n": 0}
+
+    def fails_once(conn, procs, now):
+        ticks["n"] += 1
+        if ticks["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return 0
+
+    monkeypatch.setattr(daemon, "reap_once", fails_once)
+    monkeypatch.setattr(daemon, "read_proc_table", lambda: {})
+
+    daemon.run(interval=0, db_path=db, once=True, attend=False)      # tick 1 raises
+    err = capsys.readouterr().err
+    assert "tick failed" in err and "database is locked" in err      # and says so
+
+    daemon.run(interval=0, db_path=db, once=True, attend=False)      # tick 2 works
+    assert ticks["n"] == 2, "the daemon stopped ticking after one failure"
+
+
+def test_a_tick_failure_still_reaps_once_the_fault_clears(fresh, tmp_path, monkeypatch):
+    """The point of surviving: work that failed this tick lands on the next one."""
+    c = fresh(name="recover.db")
+    dead = _live(c, "gone", 5000)
+    c.close()
+    db = str(tmp_path / "recover.db")
+    monkeypatch.setattr(daemon, "read_proc_table", lambda: {})       # 5000 is absent
+
+    real = daemon.sweep_stranded
+    monkeypatch.setattr(daemon, "sweep_stranded",
+                        lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("locked")))
+    daemon.run(interval=0, db_path=db, once=True, attend=False)
+    monkeypatch.setattr(daemon, "sweep_stranded", real)
+    daemon.run(interval=0, db_path=db, once=True, attend=False)
+
+    c = sqlite3.connect(db); c.row_factory = sqlite3.Row
+    assert c.execute("SELECT stopped_at FROM sessions WHERE id=?", (dead,)).fetchone()[0]

@@ -162,8 +162,13 @@ def service_unit_text():
         f"Environment=PYTHONPATH={PKG_SRC}\n"
         f"Environment=HERD_DB={DB}\n"
         f"ExecStart={_service_python()} -m herd.daemon\n"
-        "Restart=on-failure\n"
-        "RestartSec=5\n\n"
+        # always, not on-failure: a clean exit still means nothing is reaping silent
+        # deaths. StartLimitIntervalSec=0 disables the burst limit — a persistent
+        # fault (corrupt DB, full disk) must keep retrying rather than latch the
+        # unit into `failed`, where the only symptom is sessions that never leave.
+        "Restart=always\n"
+        "RestartSec=5\n"
+        "StartLimitIntervalSec=0\n\n"
         "[Install]\n"
         "WantedBy=default.target\n"
     )

@@ -25,6 +25,33 @@ from herd.db import connect, load_statements
 
 W = load_statements()
 
+
+def _now_iso():
+    """ISO-UTC with millis, matching the hooks' NOW_ISO and sessions.started_at."""
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _log(msg):
+    """Daemon diagnostics -> stderr. systemd captures that into the journal, which
+    is where README sends you (`journalctl --user -u herd`); a foreground daemon
+    shows it inline. The hooks' HERD_ERRLOG is theirs, not ours."""
+    print(f"{_now_iso()} herd.daemon: {msg}", file=sys.stderr, flush=True)
+
+
+def _int_env(name, default):
+    """A malformed threshold must not take down every herd command. These are read
+    at IMPORT time and cli.py imports this module, so `HERD_WAIT_SECS=fast herd ls`
+    used to be a ValueError traceback with no hint which variable was at fault."""
+    raw = os.environ.get(name, "")
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        _log(f"{name}={raw!r} is not an integer — using {default}")
+        return default
+
+
 # Same identity anchor as claude_pid(); a node-based install overrides both via
 # HERD_CLAUDE_NAME so hook and reaper stay consistent.
 CLAUDE_NAME = os.environ.get("HERD_CLAUDE_NAME", "claude")
@@ -33,15 +60,15 @@ CLAUDE_NAME = os.environ.get("HERD_CLAUDE_NAME", "claude")
 # (now - last_event_at), never stored. Thresholds in seconds, env-overridable.
 # Statuses not listed are never page-worthy. See DESIGN.md#attention.
 ATTENTION_SECS = {
-    "waiting":        int(os.environ.get("HERD_WAIT_SECS", "30")),
-    "needs_approval": int(os.environ.get("HERD_APPROVAL_SECS", "15")),
-    "working":        int(os.environ.get("HERD_STUCK_SECS", "300")),
+    "waiting":        _int_env("HERD_WAIT_SECS", 30),
+    "needs_approval": _int_env("HERD_APPROVAL_SECS", 15),
+    "working":        _int_env("HERD_STUCK_SECS", 300),
 }
 
 
 # Grace before a pid-NULL spawn reservation is swept as stranded. Must comfortably
 # exceed a kitty launch round trip + claude's startup to its first hook.
-STRANDED_SECS = int(os.environ.get("HERD_STRANDED_SECS", "120"))
+STRANDED_SECS = _int_env("HERD_STRANDED_SECS", 120)
 
 
 def _attention_enabled():
@@ -51,11 +78,6 @@ def _attention_enabled():
 
 # Matches common.sh: HERD_DB or ~/.herd/herd.db.
 DEFAULT_DB = os.environ.get("HERD_DB", str(pathlib.Path.home() / ".herd" / "herd.db"))
-
-
-def _now_iso():
-    """ISO-UTC with millis, matching the hooks' NOW_ISO and sessions.started_at."""
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 # ── IO (swappable in tests) ──────────────────────────────────────────────────
@@ -236,21 +258,61 @@ def attention_tick(conn, now):
 
 
 # ── driver ───────────────────────────────────────────────────────────────────
+def _drop(conn):
+    """Close a connection we no longer trust, and return None so the next tick
+    reopens. Never raises — this runs on the failure path."""
+    try:
+        if conn is not None:
+            conn.close()
+    except Exception:                                 # noqa: BLE001
+        pass
+    return None
+
+
 def run(interval=2.0, db_path=None, once=False, attend=None):
     """CORE reaper every tick; HERD attention tick only when enabled (attend, or
-    HERD_ATTENTION when attend is None)."""
+    HERD_ATTENTION when attend is None).
+
+    A TICK MAY FAIL WITHOUT ENDING THE DAEMON. Every statement here is its own
+    autocommit transaction taking the WAL write lock, against five hook scripts and
+    a per-session statusline doing the same, so `database is locked` is a normal
+    event, not a fatal one. It used to exit the process: under systemd that meant a
+    restart loop into the default start limit and a `failed` unit; on macOS or
+    headless, where install_service is a documented no-op, it meant silent-death
+    reaping simply stopped with nothing to notice.
+
+    Crashing was also the de-facto recovery for a BROKEN HANDLE (systemd restarted
+    us with a fresh one), so surviving a failure means we have to reopen the
+    connection ourselves — otherwise a dead handle would fail every tick forever and
+    reap nothing, which is the same silence with none of the restart.
+    """
     if attend is None:
         attend = _attention_enabled()
-    conn = connect(db_path or DEFAULT_DB)   # one RW connection: busy_timeout + WAL
-    boot_sweep(conn, _now_iso(), boot_time_iso())
+    db = db_path or DEFAULT_DB
+    conn = None
+    swept = False                                     # boot sweep runs once, when we
+    fails = 0                                         # first hold a usable connection
     while True:
         now = _now_iso()
-        procs = read_proc_table()
-        if procs is not None:                         # tier 1 — always, unless ps
-            reap_once(conn, procs, now)               # is untrustworthy this tick
-        sweep_stranded(conn, now)                     # tier 1 — needs no proc table
-        if attend:
-            attention_tick(conn, now)                 # tier 2 — herd's opinion
+        try:
+            if conn is None:
+                conn = connect(db)                    # RW: busy_timeout + WAL
+                if fails:
+                    _log("reconnected")
+            if not swept:
+                boot_sweep(conn, now, boot_time_iso())
+                swept = True
+            procs = read_proc_table()
+            if procs is not None:                     # tier 1 — always, unless ps
+                reap_once(conn, procs, now)           # is untrustworthy this tick
+            sweep_stranded(conn, now)                 # tier 1 — needs no proc table
+            if attend:
+                attention_tick(conn, now)             # tier 2 — herd's opinion
+            fails = 0
+        except Exception as e:                        # noqa: BLE001 — a daemon outlives its errors
+            fails += 1
+            _log(f"tick failed ({type(e).__name__}: {e}) — {fails} in a row, retrying")
+            conn = _drop(conn)                        # force a fresh handle next tick
         if once:
             return
         time.sleep(interval)

@@ -55,8 +55,18 @@ def test_service_unit_is_well_formed():
     assert "-m herd.daemon" in u
     assert f"Environment=PYTHONPATH={inst.PKG_SRC}" in u
     assert f"Environment=HERD_DB={inst.DB}" in u
-    assert "Restart=on-failure" in u and "WantedBy=default.target" in u
+    assert "WantedBy=default.target" in u
     assert inst.PKG_SRC.name == "src"
+
+
+def test_service_unit_retries_forever():
+    """The daemon is the only reaper of silent deaths, so a stopped unit is
+    invisible: sessions just never leave `herd ls`. on-failure ignores a clean
+    exit, and the default start limit latches a persistently-failing unit into
+    `failed` — both leave nothing reaping with nothing to notice."""
+    u = inst.service_unit_text()
+    assert "Restart=always" in u
+    assert "StartLimitIntervalSec=0" in u
 
 
 def test_cli_paths_resolve_and_completion_ships():
