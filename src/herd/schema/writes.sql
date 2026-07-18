@@ -284,7 +284,7 @@ WHERE id = (SELECT h.session_pk FROM herd_sessions h
   AND stopped_at IS NULL;
 
 
--- ── W6. PAGER (herd/pager, TUI tick) ──────────────────────────────────────
+-- ── W6. ATTENTION / PAGER (herd/daemon.py) ────────────────────────────────
 -- W6a: arm — the silence rule tripped for the first time.
 -- :name W6a_arm
 INSERT INTO herd_attention(session_pk, attention_at, paged_level)
