@@ -49,7 +49,7 @@ CREATE INDEX IF NOT EXISTS idx_herd_job
 -- persist (else a 1s poll re-decides 60x/min). See DESIGN.md#attention.
 -- The signal is BINARY: armed or acked. Escalation rungs (paged_at/paged_level)
 -- were cut — herd owns no actuator, so there was nothing to escalate. See
--- DECISIONS.md#the-pager-actuator-is-not-coming-back.
+-- DECISIONS.md#pager.
 -- Kept out of herd_sessions: it's the only row written every tick (isolate the
 -- write path), and DELETE-the-row is a meaningful "re-evaluate everything".
 -- WRITER: the daemon's tick — NOT hooks (hooks can't detect silence). This makes
@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS herd_attention (
     session_pk   INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
 
     attention_at TEXT,    -- the EDGE: when the silence rule first tripped (not last_event_at's age).
-    ack_at       TEXT     -- implicit (focus) or explicit (dismiss). Ack means "seen THIS silence":
+    ack_at       TEXT     -- written by a jump (the only ack path). Means "seen THIS silence":
                           -- the CLI stops rendering '!' while it is set, and the row STAYS armed.
                           -- It is also the timer restart: the daemon re-notifies once the status
                           -- threshold of silence has passed since the ack (W6d, then a fresh W6a).

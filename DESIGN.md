@@ -421,7 +421,8 @@ Statuses not listed (`stopped`, `unknown`) are never page-worthy.
 
 - `attention_at` is the **edge**: when the rule first tripped (not the same as
   `last_event_at`'s age). `W6a_arm` uses `COALESCE` to preserve it across ticks.
-- `W6c_ack` (implicit via focus, or explicit dismiss) guards on `attention_at <=
+- `W6c_ack` (written by a jump — acking is implicit, there is no dismiss verb and
+  none is wanted) guards on `attention_at <=
   focus_started_at`, closing a race where a hook raising a *new* attention
   mid-jump would be acked unseen.
 - `W6d_rearm` deletes the whole row — a `DELETE` is a meaningful "shut up and

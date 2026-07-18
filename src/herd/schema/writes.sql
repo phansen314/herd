@@ -225,7 +225,7 @@ ON CONFLICT(session_pk) DO UPDATE SET attention_at = COALESCE(attention_at, :now
 -- (no W6b: there is no page action to record. herd owns no actuator, so the
 -- signal is binary — armed or acked. See DECISIONS.md.)
 
--- W6c: ack (implicit focus / explicit dismiss). The attention_at<=focus_started_at
+-- W6c: ack — written by focus_session(), the only caller. The attention_at<=focus_started_at
 -- guard closes a race where a NEW attention raised mid-jump would be acked unseen.
 -- :name W6c_ack
 UPDATE herd_attention SET ack_at = :now

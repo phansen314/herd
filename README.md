@@ -373,8 +373,9 @@ tab flag (see [Notifications](#notifications-kitty-tab-bell)) — so a dedicated
 a herd-owned notifier are **not planned**; each is handled more cheaply outside herd.
 fzf *is* the TUI: it already lists, navigates, and previews live. What's left:
 
-- **More CLI verbs** as needed (`herd kill`, `herd dismiss`), each composing with
-  `herd jump`'s fzf picker.
+- **More CLI verbs** as needed (`herd kill`), each composing with `herd jump`'s fzf
+  picker. Not `herd dismiss` — a jump already acks, and an ack you have to type is
+  one more thing to forget.
 - *(maybe)* a daemon tab-poke for the one case Claude's bell can't cover — a session
   gone **silently stuck** in `working` (it isn't "done", so it never bells). This is
   the only thing that would put kitty back on the daemon's path, so it stays opt-in.
