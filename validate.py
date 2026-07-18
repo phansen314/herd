@@ -1398,6 +1398,24 @@ check("cli.resolve matches by herd id / uuid prefix / cwd / job",
 check("cli.resolve refuses an empty query (never matches all)",
       _cli.resolve(c, "") == [] and _cli.resolve(c, "   ") == [])
 
+# fzf picker pieces (pure): the herd id is a hidden first field for parse + preview.
+_pline = _cli._row_line({"id": 3, "session_id": "abc12345", "status": "waiting",
+                         "job_name": "api", "total_cost_usd": 1.5, "cwd": "/x/api", "attn": 1})
+check("cli._row_line prefixes the herd id as a hidden tab field",
+      _pline.split("\t", 1)[0] == "3" and all(s in _pline for s in ("abc12345", "waiting", "/x/api")))
+_prows = [{"id": 3}, {"id": 9}]
+check("cli._parse_pick maps fzf's chosen line back to its row, and fails safe",
+      _cli._parse_pick(_prows, "3\t #3 …")["id"] == 3
+      and _cli._parse_pick(_prows, "") is None
+      and _cli._parse_pick(_prows, "x\t") is None
+      and _cli._parse_pick(_prows, "99\t") is None)
+_pv = _cli._preview_text({"id": 3, "session_id": "abc12345", "status": "waiting",
+                          "status_source": "hook", "cwd": "/x/api", "total_cost_usd": 1.5,
+                          "context_percent": 42, "attention_at": "2026-07-15T10:00:00.000Z"})
+check("cli._preview_text renders the session detail block (incl. live attention)",
+      all(s in _pv for s in ("abc12345", "waiting", "/x/api", "42%", "$1.50", "needs attention")),
+      _pv.replace(chr(10), " ⏎ "))
+
 print("\n" + "═"*72)
 if FAILED:
     print(f"\033[31m{len(FAILED)} FAILED:\033[0m " + ", ".join(FAILED)); sys.exit(1)
