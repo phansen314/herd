@@ -1,18 +1,13 @@
-"""Jump to a session's kitty window — the focus path, reusable by the CLI and the
-future TUI.
+"""Jump to a session's kitty window — reusable by the CLI and the future TUI.
 
-The hooks store placement (kitty_socket, window_id), but window_id is a CACHE. Before
-focusing we RE-DERIVE the window from `kitten @ ls` and confirm the window's
-foreground claude carries the session's stored pid — so we never focus a window that
-was reused after our session's window closed. We fall back to the stored window_id
-when the pid can't be located, and self-heal the stored value when it has drifted.
+Placement (kitty_socket, window_id) is a CACHE. Before focusing we RE-DERIVE the
+window from `kitten @ ls` and confirm its foreground claude carries the session's
+stored pid, so we never focus a window reused after ours closed. Fall back to the
+stored window_id when the pid can't be located; self-heal when it drifted.
 
-kitty's own `--match pid:N` matches the WINDOW's pid (the login shell), NEVER the
-foreground claude (measured: claude's pid matches nothing, the shell's matches the
-window). So we resolve pid -> window ourselves and focus by `--match id:`.
-
-IO (list_fn / focus_fn) is injected so the logic is testable without a live kitty —
-the same discipline as daemon.py and hooks/common.sh.
+kitty's `--match pid:N` matches the WINDOW's pid (the login shell), never the
+foreground claude — so we resolve pid -> window ourselves and focus by `--match
+id:`. IO (list_fn/focus_fn) is injected for testability. See DESIGN.md#focus--jump-kittyfocuspy-clipy.
 """
 import json
 import os
@@ -59,9 +54,9 @@ def window_for_pid(windows, pid):
 
 # ── the jump ─────────────────────────────────────────────────────────────────
 def focus_session(conn, session_pk, now, *, list_fn=None, focus_fn=None):
-    """Focus a live session's kitty window by its surrogate pk. Re-derives the
-    window from ps-in-kitty, focuses it, acks its attention (a jump means "I've seen
-    it"), and self-heals a drifted window_id. Returns (ok, message)."""
+    """Focus a live session's kitty window by its surrogate pk: re-derive the
+    window from ps-in-kitty, focus it, ack its attention (a jump means "I've seen
+    it"), self-heal a drifted window_id. Returns (ok, message)."""
     list_fn = list_fn or (lambda s: flatten_windows(_ls(s)))
     focus_fn = focus_fn or _focus
     row = conn.execute(

@@ -1,18 +1,14 @@
 -- ═══════════════════════════════════════════════════════════════════════════
--- herd — canonical write paths. These are the ONLY statements that write.
+-- herd — canonical write paths. The ONLY statements that write.
+-- Loaded by herd.db.load_statements() (python) AND common.sh stmt() (bash);
+-- both cut at the first ';', and validate.py asserts they agree char-for-char.
+-- Rationale + a per-statement table: DESIGN.md#write-paths-schemawritessql.
+-- Inline comments inside a statement must not contain ';'.
 -- ═══════════════════════════════════════════════════════════════════════════
 
--- ── W1. SPAWN (herd/kitty) ────────────────────────────────────────────────
--- After `kitten @ launch --var HERD_JOB=<job> --tab-title <job> --cwd <cwd> claude`
--- returns a window_id. We know: job, window, tab, cwd. We do NOT know:
--- session_id (Claude hasn't told us) or pid (not yet).
---
--- herd launches TABS and PANES only, never OS windows. That is why the focus
--- path never has to ask a compositor to raise anything.
---
--- status_source='reconcile' is a white lie: the CHECK has no 'spawn' value.
--- Provenance lives in herd_sessions.source, which does. Don't read
--- status_source as provenance.
+-- ── W1. SPAWN (herd/kitty) — job + window known, UUID/pid not yet.
+-- status_source='reconcile' is a white lie (CHECK has no 'spawn'); real
+-- provenance is herd_sessions.source. Not yet wired to a CLI verb.
 -- :name W1_spawn_session
 INSERT INTO sessions(cwd, status, status_source, started_at, updated_at)
 VALUES(:cwd, 'unknown', 'reconcile', :now, :now);
@@ -23,38 +19,17 @@ INSERT INTO herd_sessions(session_pk, job_name, created_at,
 VALUES(:pk, :job, :now, :socket, :win, :job, 'spawn', :now);
 
 
--- ── W2. ADOPT via window_id (core/session_start.sh) ───────────────────────
--- The hook runs INSIDE the kitty window, so $KITTY_WINDOW_ID is free from env
--- (klawde's kitty_start.sh does exactly this — zero forks). A kitty window has
--- exactly one LIVE claude in it, so (socket, window_id) + liveness is an exact
--- join key.
--- This sidesteps pid entirely for the spawn path: SPIKE-1 is NOT blocking here.
--- Idempotent: `AND session_id IS NULL` makes a re-fire a no-op.
---
--- The liveness JOIN (`s.stopped_at IS NULL` inside the subquery) IS LOAD-BEARING.
--- A window outlives the claude in it, so a DEAD predecessor row still owns this
--- window_id. Without the filter the subquery matches it and binds Claude's UUID
--- to the stopped row while the live session stays unadopted — R1 and W5 both
--- filter `stopped_at IS NULL`, so that session goes invisible and collects no
--- metrics, silently. Filtering by the session's own stopped_at (not a stored
--- herd flag) is the whole point of the decouple: one source of truth.
---
--- ROUTING READ, NOT A DATA READ. The herd_sessions subquery only selects WHICH
--- session row to adopt (the placeholder herd created at spawn). Every value
--- WRITTEN into the core row is a Claude signal (:session_id, :cwd, :model, …) —
--- no tier-2 value ever enters a core column. validate.py enforces this: in a
--- core writer, herd_ may appear only after WHERE (routing), never in the SET
--- list. Same for W3a_discover and W5b_adopt.
+-- ── W2. ADOPT via window_id (session_start.sh). Joins on (socket, window_id)
+-- from env; idempotent (AND session_id IS NULL). The subquery's stopped_at IS
+-- NULL is load-bearing — a dead predecessor still owns this window. Routing read
+-- only: herd_ appears after WHERE, never in SET. See DESIGN.md#write-paths-schemawritessql.
 -- :name W2_adopt
 UPDATE sessions
 SET session_id      = :session_id,
     cwd             = :cwd,
     model           = :model,
     transcript_path = :transcript,
-    pid             = :pid,          -- claude's own pid (claude_pid ppid-walk). The
-                                     -- SessionStart hook is a live descendant of
-                                     -- claude, so this is exact. W2c_pid_claim has
-                                     -- already freed any stale holder of it.
+    pid             = :pid,          -- claude's own pid (W2c_pid_claim freed any stale holder)
     status          = 'working',
     status_source   = 'hook',
     last_event_at   = :now,
@@ -67,8 +42,9 @@ WHERE id = (SELECT h.session_pk FROM herd_sessions h
   AND session_id IS NULL
   AND stopped_at IS NULL;
 
--- W2b. Fallback when W2 matched nothing (no herd_sessions row: hooks wired but
--- herd never saw this window). Plain upsert on Claude's own key.
+-- W2b. Fallback when W2 matched nothing: upsert on Claude's own key. Resume
+-- revives a stopped row (stopped_at=NULL, fresh pid); started_at preserved so
+-- duration is total age.
 -- :name W2b_insert
 INSERT INTO sessions(session_id, cwd, model, transcript_path, pid, status,
                      status_source, last_event_at, last_event_type,
@@ -81,58 +57,27 @@ ON CONFLICT(session_id) DO UPDATE SET
     model           = COALESCE(excluded.model, sessions.model),
     status          = 'working',
     stopped_at      = NULL,          -- resume revives a stopped session
-    pid             = excluded.pid,  -- ...with the RESUMED process's own pid. The
-                                     -- SessionStart hook re-walks to claude on every
-                                     -- (re)start, so the fresh pid replaces the dead
-                                     -- old one directly (no null-and-wait). W2c_pid_
-                                     -- claim already reaped any stale holder of it,
-                                     -- so idx_sessions_pid_live cannot reject this.
+    pid             = excluded.pid,  -- with the resumed process's own pid
     last_event_at   = excluded.last_event_at,
     last_event_type = excluded.last_event_type,
     updated_at      = excluded.updated_at;
-    -- NOTE: started_at deliberately preserved. Resume = same session, fresh
-    -- location; Duration reflects total age. (klawde's semantics — correct.)
 
--- W2c_pid_claim. Runs at SessionStart BEFORE the pid is written, in its own txn, so
--- idx_sessions_pid_live (one LIVE row per pid) is clear before W2_adopt/W2b_insert
--- stamp :pid. Reaps any OTHER live row still holding this pid — provably stale: the
--- hook runs AS a descendant of the claude that owns :pid RIGHT NOW, so a different
--- live row claiming it died silently (no SessionEnd) and its pid was recycled to us.
--- Without this, that stale row would make the new session's pid write fail the
--- UNIQUE index, and the error-swallowing hook would drop the session silently.
---
--- Excludes our own row (session_id match) so a resume doesn't reap itself. When the
--- walk failed, :pid binds NULL and `pid = NULL` matches nothing — a clean no-op.
--- status_source='pid' (death inferred from liveness, like W3d); NEVER last_event_*.
+-- W2c. Runs at SessionStart BEFORE the pid is written, own txn: reap any OTHER
+-- live row holding this pid (provably stale — the hook is a descendant of the
+-- claude that owns :pid now) so idx_sessions_pid_live is satisfiable. Excludes
+-- our own row; NULL pid -> no-op. See DESIGN.md#pid.
 -- :name W2c_pid_claim
 UPDATE sessions SET status = 'stopped', status_source = 'pid',
                     stopped_at = :now, updated_at = :now
 WHERE pid = :pid AND stopped_at IS NULL
   AND (session_id IS NULL OR session_id IS NOT :session_id);
 
--- W2b_placement. The tier-2 half of the W2b fallback. W2b_insert writes the
--- session row (tier 1); this records the kitty window the hook is STANDING IN, so
--- a user-started `claude` (never spawned/discovered by herd) gets a placement row
--- like every other tracked session. Without it that session has no (socket,
--- window_id) -> pk mapping, so reconcile can neither fill its pid (W3c) nor avoid
--- inserting a DUPLICATE live row (W3a's NOT EXISTS is vacuously true). This is the
--- ONLY writer of source='hook' — the value the CHECK reserved for exactly this.
---
--- The hook holds BOTH identity keys at once — Claude's UUID (payload) and the
--- window (env) — which no other actor does: hooks route by UUID, reconcile by
--- window, and this is where the two are welded onto one row.
---
--- pk via a SELECT on session_id, NOT last_insert_rowid(): after W2b_insert's
--- ON CONFLICT DO UPDATE, last_insert_rowid() returns the last INSERTed row, not
--- the updated one. Same keyed-off-tier-1 shape as W6d_rearm_sid. Run inside the
--- SAME run_tx as W2b_insert, so this SELECT sees that row uncommitted.
---
--- job_name / created_at are ABSENT by the mutability contract (herd.sql:25): a
--- hook session has no job, and a resumed SPAWNED session must not have its job
--- erased. source is NOT in the SET list, so a 'spawn'/'reconcile' row whose W2
--- missed is not downgraded to 'hook'. herd_var is omitted — the hook cannot know
--- it from env; W3b (or spawn) owns it. The trailing WHERE is the same no-op
--- suppressor as W3b: a re-fired hook in an unchanged window writes zero rows.
+-- W2b_placement. Tier-2 half of the W2b fallback: record the window the hook
+-- stands in, so a user-started `claude` is first-class. Only writer of
+-- source='hook'. pk via SELECT on session_id (NOT last_insert_rowid(), which
+-- returns the INSERTed not the ON-CONFLICT-updated row). Run in the SAME run_tx
+-- as W2b_insert. Omits job_name/created_at + keeps source unchanged per the
+-- mutability contract. Trailing WHERE = no-op suppressor for an unchanged re-fire.
 -- :name W2b_placement
 INSERT INTO herd_sessions(session_pk, kitty_socket, window_id, source, verified_at)
 SELECT id, :socket, :win, 'hook', :now FROM sessions WHERE session_id = :session_id
@@ -144,54 +89,28 @@ WHERE herd_sessions.kitty_socket IS NOT excluded.kitty_socket
    OR herd_sessions.window_id    IS NOT excluded.window_id;
 
 
--- ── W3. LIVENESS REAPER (herd/daemon.py) ──────────────────────────────────
--- What "reconcile" shrank to. Hooks own identity, placement, and pid now, so the
--- old `kitten @ ls` discovery (W3a), per-tick placement refresh (W3b) and pid-fill
--- (W3c) are gone. What remains is silent-death detection: a session killed with
--- -9 / crashed / whose terminal closed fires no SessionEnd, so its row would sit
--- live forever. The daemon polls the PROCESS TABLE and reaps.
---
--- LIVENESS COMES FROM THE PROCESS TABLE, NEVER FROM kitty. Absence from a kitty
--- `ls` is evidence about PLACEMENT: a socket blip, an `ls` timeout,
--- allow_remote_control off, or a missed socket would each mass-reap every live row
--- at once. When a claude really dies, `ps` says so within a tick. daemon._dead()
--- also treats state 'Z' as dead (a zombie still passes kill -0) and a recycled pid
--- (comm != claude) as dead. See src/herd/daemon.py.
+-- ── W3. LIVENESS REAPER (daemon.py). Silent-death detection: a -9/crash/closed
+-- terminal fires no SessionEnd, so the row would sit live forever. Liveness from
+-- the PROCESS TABLE, never kitty. See DESIGN.md#liveness.
 
--- W3d: reap one session whose pid the daemon found dead. Setting stopped_at makes
--- every liveness JOIN see it dead -> its window and job free automatically (no
--- trigger). status_source='pid' records that death was inferred, not hook-reported.
+-- W3d: reap one session the daemon found dead. status_source='pid' (inferred).
 -- :name W3d_reap
 UPDATE sessions SET status = 'stopped', status_source = 'pid',
                     stopped_at = :now, updated_at = :now
 WHERE id = :pk AND stopped_at IS NULL;
 
--- W3e: BOOT SWEEP. Run once at startup. After a reboot, rows are still
--- stopped_at IS NULL and their pids may have been recycled by unrelated
--- processes — so W3d's liveness check can read a dead session as alive AND
--- idx_sessions_pid_live can silently reject the new session's INSERT. Closes
--- that without a pid_start_time column.
+-- W3e: BOOT SWEEP (once at startup). After a reboot, pids may be recycled, so
+-- W3d's liveness check can read a dead session as alive. See DESIGN.md#pid.
 -- :name W3e_boot_sweep
 UPDATE sessions SET status = 'stopped', status_source = 'pid',
                     stopped_at = :now, updated_at = :now
 WHERE stopped_at IS NULL AND started_at < :boot_time;
 
 
--- ── W4. LIFECYCLE HOOKS (core) ────────────────────────────────────────────
--- Every lifecycle hook writes last_event_* in the SAME statement as its event
--- insert. One extra column write on a fork we already pay for.
---
--- THERE IS NO `AND status IS NOT :status` GUARD HERE, AND THERE MUST NEVER BE.
--- It looks like a free no-op suppressor and is in fact the whole thesis
--- failing: post_tool_use.sh is the hot path and always passes status='working',
--- so once status is already 'working' the guard suppresses the ENTIRE update —
--- including last_event_at. Measured: 5 consecutive tool calls matched 0 rows
--- and last_event_at never moved. A session actively running tools then reads as
--- silent, herd's silence rule trips, and it PAGES YOU about a busy session.
--- W4_event_log is unguarded, so events/ would record all 5 while sessions
--- disagreed — and the TUI reads only sessions.
--- klawde's idle column reads ~0s forever; this reads infinity. Same bug, mirrored.
--- Any suppressor must gate on nothing that carries a clock.
+-- ── W4. LIFECYCLE HOOKS. Status + last_event_* in the SAME statement as the
+-- event insert. NO `AND status IS NOT :status` GUARD, EVER — it freezes
+-- last_event_at on the hot path (post_tool_use always 'working'), making a busy
+-- session read silent and paging you about it. See DESIGN.md#two-clocks.
 -- :name W4_event
 UPDATE sessions
 SET status          = :status,
@@ -205,19 +124,8 @@ INSERT INTO events(session_pk, event_type, source, timestamp, raw_json)
 SELECT id, :etype, 'hook', :now, :raw FROM sessions WHERE session_id = :session_id;
 -- post_tool_use.sh passes :raw = NULL — it fires per tool call.
 
--- W4b: SESSION END. The only hook-driven death, and distinct from W3d_reap:
--- this one KNOWS (status_source='hook'), where reconcile only INFERS from the
--- process table ('pid'). Setting stopped_at makes every liveness JOIN see the
--- session as dead — job name and window slot free automatically, no trigger.
---
--- session_end.sh MUST be registered BLOCKING, never async. An async hook can be
--- killed when the session exits, leaving stopped_at NULL and the session
--- appearing live until reconcile notices. On `/clear` Claude emits SessionEnd
--- then SessionStart for the NEW session in the SAME window: if the end hasn't
--- landed first, two sessions read as live in one window — harmless now (the
--- JOIN + reconcile's rebuild resolve it), but the death should still land
--- promptly. klawde's own live settings.json still has the async bug its commit
--- message warns against.
+-- W4b: SESSION END — the only hook-driven death. status_source='hook' (it KNOWS,
+-- vs W3d's inference). session_end.sh MUST be registered BLOCKING.
 -- :name W4_end
 UPDATE sessions
 SET status          = 'stopped',
@@ -229,11 +137,12 @@ SET status          = 'stopped',
 WHERE session_id = :session_id AND stopped_at IS NULL;
 
 
--- ── W5. STATUSLINE (core) — UPDATE ONLY ───────────────────────────────────
--- Fires ~1/sec per session. Guarded upstream by the fingerprint diff-cache
--- (tmpfs file per session) so an unchanged payload costs ZERO sqlite3 forks.
--- MUST NOT: create rows (would resurrect stopped sessions / invent empty cwd),
---           touch last_event_* (that is the whole idle-signal thesis).
+-- ── W5. STATUSLINE — UPDATE ONLY (never creates a row: would resurrect stopped
+-- sessions / invent empty cwd). NEVER touches last_event_*. Fires ~1/sec, guarded
+-- upstream by the fingerprint diff-cache. resets_at arrives as unix epoch,
+-- converted to ISO in SQLite; COALESCE keeps the prior value on NULL. The
+-- prev_cost pair captures the OLD row's total (an UPDATE's RHS sees the old row) —
+-- correct as written, don't "fix" it. See DESIGN.md#write-paths-schemawritessql.
 -- :name W5_statusline
 UPDATE sessions SET
     model                = COALESCE(:model, model),
@@ -241,11 +150,6 @@ UPDATE sessions SET
     context_percent      = COALESCE(CAST(:ctx AS INTEGER), context_percent),
     total_cost_usd       = COALESCE(:cost, total_cost_usd),
     git_branch           = COALESCE(:branch, git_branch),
-    -- rate limits: payload gives resets_at as a UNIX EPOCH, converted to ISO in
-    -- SQLite (zero date forks). NULL-safe -- bind() emits NULL for an absent
-    -- value, strftime(...,NULL,...) yields NULL, COALESCE keeps the prior value.
-    -- NB inline comments must not contain a statement terminator char, since
-    -- both statement parsers cut at the first one they see.
     rate_limit_5h_percent   = COALESCE(:rl5, rate_limit_5h_percent),
     rate_limit_5h_resets_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%SZ', :rl5reset, 'unixepoch'),
                                        rate_limit_5h_resets_at),
@@ -260,19 +164,12 @@ UPDATE sessions SET
                              OR (strftime('%s','now')
                                  - strftime('%s', prev_cost_sampled_at)) > 300
                             THEN updated_at ELSE prev_cost_sampled_at END,
-    updated_at           = :now       -- NOT last_event_at.
+    updated_at           = :now       -- NOT last_event_at
 WHERE session_id = :session_id AND stopped_at IS NULL;
--- The prev_cost pair is correct as written: in SQLite an UPDATE's RHS sees the
--- OLD row, so prev_cost_usd captures the previous total before this statement
--- overwrites it. Don't "fix" it.
 
--- W5b: statusline ADOPTION (Path C). The statusline script is a child of
--- claude, so it inherits $KITTY_WINDOW_ID / $KITTY_LISTEN_ON exactly as a hook
--- does — it never needed them in the payload. That lets a reconciled session
--- pick up metrics with no hooks wired.
--- Still an UPDATE of an existing row: statusline never creates one.
--- Same liveness JOIN as W2: bind the LIVE row in this window, never a dead
--- predecessor that still owns the same (socket, window_id).
+-- W5b: statusline ADOPTION (Path C). statusline is a child of claude, inherits
+-- $KITTY_* like a hook, so a reconciled session picks up metrics with no hooks
+-- wired. Same liveness JOIN as W2. Still UPDATE only.
 -- :name W5b_adopt
 UPDATE sessions
 SET session_id = :session_id, updated_at = :now
@@ -284,20 +181,20 @@ WHERE id = (SELECT h.session_pk FROM herd_sessions h
   AND stopped_at IS NULL;
 
 
--- ── W6. ATTENTION / PAGER (herd/daemon.py) ────────────────────────────────
--- W6a: arm — the silence rule tripped for the first time.
+-- ── W6. ATTENTION (daemon.py). "Needs attention" is derived each tick; only the
+-- action/edge persists here. See DESIGN.md#attention.
+-- W6a: arm — the rule tripped. COALESCE preserves the edge across ticks.
 -- :name W6a_arm
 INSERT INTO herd_attention(session_pk, attention_at, paged_level)
 VALUES(:pk, :now, 0)
 ON CONFLICT(session_pk) DO UPDATE SET attention_at = COALESCE(attention_at, :now);
 
--- W6b: page fired — record the action + rung.
+-- W6b: page fired — record action + rung.
 -- :name W6b_paged
 UPDATE herd_attention SET paged_at = :now, paged_level = :level WHERE session_pk = :pk;
 
--- W6c: ack. Implicit (focus) or explicit (dismiss).
--- The attention_at guard closes a real race: a hook raising a NEW attention
--- while you are mid-jump for a previous one would otherwise be acked unseen.
+-- W6c: ack (implicit focus / explicit dismiss). The attention_at<=focus_started_at
+-- guard closes a race where a NEW attention raised mid-jump would be acked unseen.
 -- :name W6c_ack
 UPDATE herd_attention SET ack_at = :now
 WHERE session_pk = :pk
@@ -305,49 +202,34 @@ WHERE session_pk = :pk
   AND attention_at IS NOT NULL
   AND attention_at <= :focus_started_at;
 
--- W6d: RE-ARM. A new semantic event clears the whole row, so the rule may trip
--- fresh. This is what makes ack mean "I've seen THIS silence" rather than
--- "never bother me about this session again".
+-- W6d: RE-ARM. A new semantic event clears the row so the rule may trip fresh —
+-- this is what makes ack mean "I've seen THIS silence".
 -- :name W6d_rearm
 DELETE FROM herd_attention WHERE session_pk = :pk;
 
--- W6d_sid: same re-arm, keyed by Claude's UUID instead of the surrogate pk.
--- The pager (python) works from R1 and holds :pk; a HOOK only has session_id,
--- so stop.sh needs this variant. Without it the hook would inline its own
--- DELETE — a write path outside this file, invisible to the check-47 drift
--- guard, re-introducing the hand-quoting bind() exists to kill. Same
--- keyed-two-ways pattern as W2_adopt (socket,window) vs W2b_insert (session_id).
+-- W6d_sid: same re-arm keyed by Claude's UUID (a hook lacks the surrogate pk).
+-- Keeping it here (not inlined in stop.sh) preserves the single-write-path guard.
 -- :name W6d_rearm_sid
 DELETE FROM herd_attention
 WHERE session_pk = (SELECT id FROM sessions WHERE session_id = :session_id);
 
 
--- ── R_statusline. RENDER INPUT (core/statusline.sh) ───────────────────────
--- Feeds ONLY the burn rate (the prev_cost pair W5 maintains) — pure TIER-1, no
--- herd_sessions. The ⬢ name on the line is Claude's session_name, taken straight
--- from the payload, so the render reads no tier-2 data. One read per fingerprint
--- MISS; unchanged ticks print the cached line and never run this. `|`-joined for a
--- single-field bash read.
+-- ── R_statusline. RENDER INPUT (statusline.sh): feeds only the burn rate (the
+-- prev_cost pair). One read per fingerprint miss. '|'-joined for a single bash read.
 -- :name R_statusline
 SELECT COALESCE(s.prev_cost_usd,'') || '|' || COALESCE(s.prev_cost_sampled_at,'')
 FROM sessions s WHERE s.session_id = :session_id;
 
 
--- ── R_job_live. RECYCLABLE-HANDLE CHECK (herd/kitty spawn) ─────────────────
--- Job names are recyclable handles: `herd new api` must work again tomorrow
--- after today's `api` died. There is no UNIQUE index enforcing this anymore
--- (that needed the `live` denormalization, which was the resume-desync bug).
--- Instead spawn asks: does a LIVE session already hold this name? Liveness is
--- the session's own stopped_at, by JOIN — recyclability falls out for free,
--- history is retained (dead rows keep their job_name). Returns a row iff taken.
+-- ── R_job_live. Recyclable-handle check (spawn): does a LIVE session already
+-- hold this job name? By JOIN, no unique index. Unused until the spawn verb lands.
 -- :name R_job_live
 SELECT h.session_pk FROM herd_sessions h
 JOIN sessions s ON s.id = h.session_pk
 WHERE h.job_name = :job AND s.stopped_at IS NULL;
 
 
--- ── R1. THE TUI's MAIN READ ───────────────────────────────────────────────
--- One query, all four tables. Attention-first ordering.
+-- ── R1. The TUI's main read: all four tables, attention-first ordering.
 -- :name R1_list
 SELECT s.id, s.session_id, s.pid, s.cwd, s.status, s.model, s.session_name,
        s.context_percent, s.total_cost_usd, s.git_branch,

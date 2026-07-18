@@ -1,16 +1,9 @@
 #!/bin/bash
-# Notification. Only permission_prompt means "needs approval".
+# Notification — only notification_type=permission_prompt means 'needs_approval'.
+# idle_prompt is ignored: stop.sh already owns 'waiting'. See DESIGN.md#per-hook-notes.
 #
-# notification_type is an enum: permission_prompt, idle_prompt, auth_success,
-# elicitation_*, agent_needs_input, agent_completed. klawde must also treat
-# idle_prompt carefully because it has no Stop hook; herd does, so idle_prompt
-# is redundant here and is ignored outright — Stop already owns 'waiting'.
-# Resolve our own directory. ${BASH_SOURCE%/*} returns the string UNCHANGED
-# when invoked with no directory component (`bash session_start.sh`), which
-# yields "session_start.sh/common.sh: Not a directory", leaves every helper
-# undefined, and — because hooks exit 0 — makes the hook a SILENT no-op that
-# reports success. Fail loudly instead: exit 1 is a non-blocking error whose
-# stderr shows in the transcript. Never exit 2; that would block Claude.
+# ${BASH_SOURCE%/*} unchanged with no dir component -> silent no-op; fail loud
+# (exit 1, non-blocking). Never exit 2.
 __d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."
 . "$__d/common.sh" || { echo "herd: cannot source $__d/common.sh" >&2; exit 1; }
 
