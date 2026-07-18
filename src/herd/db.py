@@ -6,6 +6,7 @@ connection correctly, nothing about what the statements mean. See DESIGN.md#tier
 import pathlib
 import re
 import sqlite3
+import urllib.parse
 
 PKG = pathlib.Path(__file__).resolve().parent
 SCHEMA_DIR = PKG / "schema"
@@ -46,7 +47,11 @@ def connect(path, readonly=False):
     optional on ANY connection (incl. the bash hooks): WAL serialises writers, so
     without it a hook fails the moment the daemon/TUI holds the write lock, on
     claude's tool loop where the user feels it."""
-    uri = f"file:{path}?mode=ro" if readonly else f"file:{path}"
+    # The path goes into a URI, so `?` starts a query and `#` a fragment — an
+    # unescaped HERD_DB containing either silently opened the WRONG file (or
+    # failed obscurely). quote() leaves ordinary paths untouched.
+    safe = urllib.parse.quote(str(path))
+    uri = f"file:{safe}?mode=ro" if readonly else f"file:{safe}"
     conn = sqlite3.connect(uri, uri=True, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=3000")

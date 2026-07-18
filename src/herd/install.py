@@ -19,6 +19,7 @@ nonzero. Reuses herd.db for the DB bootstrap. Leaves klawde's repo and
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -434,15 +435,23 @@ def rewire_settings(data, wrapper_exists=False, hooks_dir=None):
 
 
 # ── statusline wrapper ─────────────────────────────────────────────────────
+# The invocation token on a wrapper line: a quoted or bare path ending in
+# statusline.sh. Substituting just this token keeps the REST of the line — the
+# whole line used to be replaced by the path alone, silently dropping `exec`,
+# `"$@"`, redirects and anything chained after it. A wrapper written as
+# `exec "$HOME/.klawde/statusline.sh" "$@"` lost both exec and its arguments.
+_SL_TOKEN = re.compile(r'"[^"\n]*statusline\.sh"|\'[^\'\n]*statusline\.sh\'|\S*statusline\.sh')
+
+
 def rewire_wrapper(text, hooks_dir=None):
-    """Swap the klawde statusline invocation for herd's. Idempotent."""
+    """Point the wrapper's statusline invocation at herd's, leaving the rest of
+    each line intact. Idempotent."""
     sl = statusline_cmd(hooks_dir)
     out = []
     replaced = False
     for line in text.splitlines():
-        if ".klawde/statusline.sh" in line or sl in line or "/herd/hooks/statusline.sh" in line:
-            indent = line[:len(line) - len(line.lstrip())]
-            out.append(f'{indent}"{sl}"')
+        if _SL_TOKEN.search(line):
+            out.append(_SL_TOKEN.sub(lambda _: f'"{sl}"', line))
             replaced = True
         else:
             out.append(line)

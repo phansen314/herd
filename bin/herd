@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 # herd CLI wrapper — runs from the source tree, no pip install needed.
 # Resolve through a possible PATH symlink (~/.local/bin/herd) to the real bin/herd.
-SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+#
+# `readlink -f` is GNU-only: macOS shipped no -f until 12.3, where SELF comes back
+# EMPTY, HERE resolves to the wrong directory and the import fails. herd claims
+# macOS support (README, DESIGN.md#the-hooks-hookssh "bash 3.2", daemon.py's
+# "Portable Linux+macOS"), so the wrapper has to hold up there too. Walk the
+# symlink chain by hand — POSIX, no coreutils, bash 3.2.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+    LINK="$(ls -ld -- "$SELF" 2>/dev/null)"; LINK="${LINK#*" -> "}"
+    case "$LINK" in
+        /*) SELF="$LINK" ;;                       # absolute: take it as-is
+        *)  SELF="$(dirname "$SELF")/$LINK" ;;    # relative: resolve against its dir
+    esac
+done
 HERE="$(cd "$(dirname "$SELF")/.." && pwd)"
 PYTHONPATH="$HERE/src${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m herd.cli "$@"

@@ -149,3 +149,19 @@ def test_cmd_spawn_cli_overrides_template(templates, monkeypatch, fresh):
 def test_cmd_spawn_no_job_anywhere_errors(monkeypatch, fresh):
     _capture(monkeypatch)
     assert cli.cmd_spawn(fresh(), []) == 1        # no positional, no template job
+
+
+@pytest.mark.parametrize("key,value", [
+    ("job", 42), ("cwd", 42), ("title", 42), ("prompt", 42),
+    ("job", True), ("cwd", ["/a"]),
+])
+def test_a_non_string_key_is_a_friendly_error(tmp_path, monkeypatch, key, value):
+    """args/vars were type-checked and the string keys were not, so `job = 42`
+    reached valid_job() as a TypeError traceback out of `herd spawn` — from a file
+    the user hand-wrote, which is what this validation exists to prevent."""
+    monkeypatch.setenv("HERD_TEMPLATES", str(tmp_path))
+    rendered = value if not isinstance(value, list) else '["/a"]'
+    (tmp_path / "t.toml").write_text(
+        f"{key} = {str(rendered).lower() if isinstance(value, bool) else rendered}\n")
+    with pytest.raises(ValueError, match="must be a string"):
+        load_template("t")

@@ -3,6 +3,7 @@ systemd unit, CLI paths, and the terminal-bell opt-in. Pure functions."""
 import json
 import os
 import pathlib
+import subprocess
 
 import pytest
 from types import SimpleNamespace
@@ -456,3 +457,40 @@ def test_uninstall_cli_leaves_a_foreign_link_alone(monkeypatch, tmp_path):
     monkeypatch.setattr(inst, "COMPLETION_LINK", tmp_path / "comp" / "herd")
     inst.uninstall_cli()
     assert foreign.is_symlink()                          # untouched
+
+
+def test_wrapper_rewrite_keeps_the_rest_of_the_line():
+    """The whole line used to be replaced by the path alone, dropping exec, "$@"
+    and any redirect — a wrapper written the obvious way lost its arguments."""
+    w = 'exec "$HOME/.klawde/statusline.sh" "$@" 2>/dev/null\n'
+    out, rep = inst.rewire_wrapper(w)
+    assert rep
+    assert out.startswith("exec ") and '"$@"' in out and "2>/dev/null" in out
+    assert ".klawde" not in out and inst.statusline_cmd() in out
+
+
+def test_wrapper_rewrite_preserves_a_composed_line():
+    w = 'CAV=$(bash caveman); printf "%s ┃ " "$CAV"; "$HOME/.klawde/statusline.sh"\n'
+    out, _ = inst.rewire_wrapper(w)
+    assert "bash caveman" in out and "printf" in out and inst.statusline_cmd() in out
+
+
+def test_wrapper_rewrite_is_still_idempotent():
+    w = 'exec "$HOME/.klawde/statusline.sh" "$@"\n'
+    once, _ = inst.rewire_wrapper(w)
+    assert inst.rewire_wrapper(once)[0] == once
+
+
+def test_bin_herd_resolves_symlinks_without_readlink_f(tmp_path):
+    """`readlink -f` is GNU-only and herd claims macOS support; there SELF came
+    back empty and the wrapper resolved to the wrong directory."""
+    direct = tmp_path / "direct"
+    direct.symlink_to(inst.CLI_SRC)                      # absolute
+    nested = tmp_path / "d"
+    nested.mkdir()
+    chained = nested / "chained"
+    chained.symlink_to(pathlib.Path("..") / "direct")    # relative, to a symlink
+    for entry in (inst.CLI_SRC, direct, chained):
+        r = subprocess.run(["bash", str(entry), "ls"], capture_output=True, text=True)
+        assert r.returncode == 0, f"{entry}: {r.stderr}"
+        assert "readlink" not in r.stderr

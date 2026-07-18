@@ -68,4 +68,14 @@ def load_template(name, *, dir=None):
     if "vars" in out and not (isinstance(out["vars"], dict)
                               and all(isinstance(v, str) for v in out["vars"].values())):
         raise ValueError(f"template {name!r}: [vars] must have string values")
+    # The string-typed keys were unchecked while args/vars were validated, so
+    # `job = 42` sailed through to valid_job() and raised TypeError: expected
+    # string or bytes-like object — a raw traceback out of `herd spawn`, from a
+    # file the user hand-wrote, which is the exact failure this validation exists
+    # to prevent. cmd_spawn catches ValueError only.
+    for key, label in (("job", "job"), ("cwd", "cwd"),
+                       ("title", "title"), ("prompt", "prompt")):
+        if key in out and not isinstance(out[key], str):
+            raise ValueError(f"template {name!r}: {label} must be a string, "
+                             f"got {type(out[key]).__name__}")
     return out

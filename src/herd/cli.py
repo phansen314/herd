@@ -18,6 +18,7 @@ layer would only be a second rendering path to keep in sync with `ls`. See cmd_w
 """
 import argparse
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -156,7 +157,10 @@ def _fzf_run(rows, query, extra=()):
     Capture ONLY stdout (the selection). fzf draws its UI to stderr/the tty — piping
     stderr (capture_output=True) makes the picker invisible and looks like a hang.
     """
-    preview = f"{sys.executable} -m herd.cli preview {{1}}"   # {1} = the hidden id
+    # fzf runs preview/reload strings through `sh -c`, so the interpreter path
+    # needs shell quoting: a venv under a directory with a space silently broke
+    # the preview pane and ctrl-r refresh.
+    preview = f"{shlex.quote(sys.executable)} -m herd.cli preview {{1}}"  # {1} = hidden id
     p = subprocess.run(
         ["fzf", "--delimiter", "\t", "--with-nth", "2..", "--reverse",
          "--height", "60%", "--query", query, "--prompt", "jump ▸ ",
@@ -246,7 +250,7 @@ def cmd_rows(conn, args):
 
 
 # ── watch: the picker as a permanent dashboard (fzf IS the TUI — see DESIGN.md) ──
-_ROWS_CMD = f"{sys.executable} -m herd.cli rows"
+_ROWS_CMD = f"{shlex.quote(sys.executable)} -m herd.cli rows"   # -> sh -c, see _fzf_run
 _POKE_INTERVAL = 2.0
 _POKE_GRACE = 10                            # ticks to let fzf bind before giving up
 
@@ -360,7 +364,15 @@ def cmd_watch(conn, args):
             if not empty:                   # print once, not every tick
                 print("  (no live sessions — waiting)")
                 empty = True
-            time.sleep(_POKE_INTERVAL)
+            # THE one place ctrl-c arrives as a signal. While the picker is up
+            # fzf's raw mode disables ISIG, so ctrl-c is a KEY there (hence
+            # _QUIT_KEYS) and this handler cannot fire — the opposite of what the
+            # comment on it used to claim. Unguarded, waiting on an empty herd and
+            # pressing ctrl-c gave a traceback.
+            try:
+                time.sleep(_POKE_INTERVAL)
+            except KeyboardInterrupt:
+                return 130
             continue
         empty = False
         port = _free_port()
@@ -368,10 +380,8 @@ def cmd_watch(conn, args):
         try:
             out = _fzf_run(rows, "", _watch_flags(port))
         except KeyboardInterrupt:
-            return 130                      # only reachable from the sleep above:
-                                            # fzf's raw mode disables ISIG, so while
-                                            # the picker is up ctrl-c is a KEY, never
-                                            # a signal — hence _QUIT_KEYS.
+            return 130                      # belt-and-braces: a ctrl-c that lands
+                                            # before fzf has taken the terminal
         finally:
             poker.terminate()               # one poker per picker, always reaped
         key, sel = _parse_expect(out)

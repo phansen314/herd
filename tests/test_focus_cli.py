@@ -461,3 +461,18 @@ def test_jump_without_kitten_installed_is_a_message_not_a_traceback(tmp_path, mo
     monkeypatch.setenv("PATH", str(tmp_path))          # no kitten anywhere
     assert focus._ls("unix:/tmp/nope") == ""
     assert focus._focus("unix:/tmp/nope", 7) is False
+
+
+def test_fzf_command_strings_survive_an_interpreter_path_with_a_space(monkeypatch):
+    """fzf hands --preview and reload(...) to `sh -c`. Unquoted, a venv under a
+    directory with a space broke the preview pane and ctrl-r refresh."""
+    import shlex
+    monkeypatch.setattr(cli.sys, "executable", "/opt/My Tools/venv/bin/python3")
+    seen = {}
+    monkeypatch.setattr(cli.subprocess, "run",
+                        lambda argv, **k: seen.update(argv=argv) or
+                        __import__("types").SimpleNamespace(stdout=""))
+    cli._fzf_run([], "")
+    preview = seen["argv"][seen["argv"].index("--preview") + 1]
+    # the interpreter must survive a round trip through the shell's own lexer
+    assert shlex.split(preview)[0] == "/opt/My Tools/venv/bin/python3"

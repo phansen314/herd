@@ -59,3 +59,19 @@ def test_tier2_applies_standalone_but_inert(tmp_path):
         with_parent_missing = True
     assert with_parent_missing
     c2.close()
+
+
+def test_a_db_path_with_uri_metacharacters_opens_the_right_file(tmp_path):
+    """The path goes into a file: URI, so `?` starts a query and `#` a fragment —
+    unescaped, HERD_DB containing either opened the wrong file or failed
+    obscurely. Legal in a filename, so reachable via HERD_DB."""
+    from herd.db import connect, apply_schema
+    weird = tmp_path / "herd?v=2#tmp.db"
+    c = connect(str(weird)); apply_schema(c)
+    c.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at) "
+              "VALUES('s','/x','working','t','t')")
+    c.close()
+    assert weird.exists(), "wrote to a different path than requested"
+    ro = connect(str(weird), readonly=True)
+    assert ro.execute("SELECT session_id FROM sessions").fetchone()[0] == "s"
+    ro.close()
