@@ -6,9 +6,10 @@
 -- ── HERD_SESSIONS — merged placement + job, one row per known session.
 -- Liveness is NOT stored here: it lives in sessions.stopped_at, read by JOIN.
 -- A `live` column here once desynced permanently on resume. See DESIGN.md#liveness.
--- Mutability contract (enforced by discipline, the test suite section D):
---   IMMUTABLE (set at spawn): job_name, created_at
---   MUTABLE  (hook re-fire may overwrite): kitty_socket, window_id, herd_var, source, verified_at
+-- Mutability contract (discipline + test_mutability.py::test_refire_mutability_contract):
+--   IMMUTABLE: job_name, created_at (set at spawn); herd_var (a hook can't know the
+--              spawn var); source (provenance must not decay to 'hook')
+--   MUTABLE  (hook re-fire may overwrite): kitty_socket, window_id, verified_at
 -- Placement is a CACHE re-derived on the focus path, not a fact. See DESIGN.md#focus--jump-kittyfocuspy-clipy.
 CREATE TABLE IF NOT EXISTS herd_sessions (
     session_pk   INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
@@ -27,7 +28,7 @@ CREATE TABLE IF NOT EXISTS herd_sessions (
                                   -- liveness. Match values are unanchored regex; anchor them.
     source       TEXT NOT NULL CHECK (source IN ('spawn','hook')),
                               -- 'spawn' (W1) or 'hook' (W2b_placement).
-    verified_at  TEXT NOT NULL    -- staleness made explicit; TUI renders old placement as degraded.
+    verified_at  TEXT NOT NULL    -- staleness made explicit; re-stamped when focus re-derives.
 );
 
 -- PLAIN, non-unique lookups. Uniqueness ("one live session per window",

@@ -1,6 +1,6 @@
 -- herd TIER 1: Claude Code session facts. See DESIGN.md#tiers.
 -- INVARIANT: nothing here may mention herd (table/column/index/trigger).
--- Enforced by the test suite check A. Direction: tier2->tier1 writes ok,
+-- Enforced by test_source_invariants.py (tier boundary). Direction: tier2->tier1 writes ok,
 -- tier1->tier2 forbidden.
 --
 -- WRITERS: session_start.sh (adopt/insert), session_end.sh (stopped_at),

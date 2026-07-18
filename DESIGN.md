@@ -1,11 +1,13 @@
 # herd — design
 
-Rationale that used to live in source comments. Inline comments now carry one
-load-bearing line and point here with `DESIGN.md#anchor`. If you're about to
-write an essay in the code, write it here instead.
+How herd works and which invariants hold. Source comments carry one load-bearing
+line and point here with `DESIGN.md#anchor`; if you're about to write an essay in
+the code, write it here instead.
 
-Source of truth for behaviour is `schema/writes.sql` (the write paths) and
-`the test suite` (the checks). This doc explains *why* those look the way they do.
+Source of truth for behaviour is `schema/writes.sql` (the write paths) and the
+`pytest` suite under `tests/` (the checks). This doc says what is true **now**;
+[DECISIONS.md](DECISIONS.md) records what was tried, measured, or removed to get
+here — check it before undoing something that looks redundant.
 
 ---
 
@@ -17,9 +19,10 @@ The schema splits along a strict, one-way boundary:
 
 - **Tier 1 — `sessions`** (`schema/core.sql`): facts that would be
   true whether or not herd existed — a Claude process with this pid, cwd,
-  status. `core.sql` may **never** mention `herd_*`. Enforced by `the test suite`
-  (check A scans comment-stripped DDL; another check applies `core.sql`
-  standalone).
+  status. `core.sql` may **never** mention `herd_*`. Enforced by
+  `test_source_invariants.py::test_core_has_no_herd_tables` (scans comment-stripped
+  DDL) and `test_schema.py::test_tier1_applies_standalone` (a herd-less install is
+  a working install).
 - **Tier 2 — `herd_sessions`, `herd_attention`** (`schema/herd.sql`): herd's
   *relationship* to a session — the job name it was spawned with, its kitty
   placement, whether herd decided it needs you.
@@ -40,7 +43,7 @@ maintained, `herd_attention` is never touched, build your own tooling on top).
 
 `sessions.id` is a surrogate `INTEGER PRIMARY KEY AUTOINCREMENT`. Tier 2 FKs
 reference **this**, never `session_id`. That is what lets a session exist — with
-a job, a placement, pager state — *before* Claude Code has reported its UUID.
+a job and a placement — *before* Claude Code has reported its UUID.
 Adoption is then a plain `UPDATE` of the nullable `session_id` column: no PK
 rewrite, no cascade.
 
@@ -50,7 +53,7 @@ ignores NULLs, so many unadopted rows coexist.
 `AUTOINCREMENT`, not a bare rowid alias: a bare rowid recycles the highest id
 after a delete. Sessions are soft-deleted today (`stopped_at`), so it never
 bites — but the moment a prune job adds a real `DELETE`, a recycled id could
-reattach to a stale `:pk` held mid-tick by the TUI/pager. `sqlite_sequence`
+reattach to a stale `:pk` held mid-tick by the daemon or a picker. `sqlite_sequence`
 makes the surrogate strictly monotonic. Cost is one sequence write per insert,
 immaterial at the session insert rate.
 
@@ -62,40 +65,26 @@ immaterial at the session insert rate.
 The *gap* between them is herd's attention signal. `statusline.sh` MUST NOT
 touch `last_event_at`.
 
-Two mirrored failure modes, both fatal:
+**Any suppressor must gate on nothing that carries a clock.** This is why
+`W4_event` has no status guard: gating the hot path's `UPDATE` on the status
+*changing* freezes `last_event_at` for a busy session, which then reads as silent.
+Both ways to destroy this signal were hit for real — see
+[DECISIONS.md#clocks](DECISIONS.md#clocks).
 
-1. If statusline ages `updated_at` and you render *that* as idle (the predecessor
-   did), the column reads ~0s forever because statusline stamps it constantly —
-   the signal is worthless.
-2. If a lifecycle hook's `UPDATE` is gated on the status *changing*, a busy
-   session emitting the same status repeatedly stops advancing `last_event_at`
-   and reads as **silent**. `post_tool_use.sh` is the hot path and always passes
-   `status='working'`, so an `AND status IS NOT :status` guard suppresses the
-   entire update — including `last_event_at`. Measured: 5 consecutive tool calls
-   matched 0 rows, `last_event_at` never moved, the silence rule then pages you
-   about a *busy* session. **Any suppressor must gate on nothing that carries a
-   clock.** This is why `W4_event` has no status guard.
-
-There is **one** lifecycle write — `W4_event` on `sessions`. herd used to also
-append every event to an `events` table, but nothing read it (the signal is
-`sessions.last_event_at`), so it was write-only clutter — removed. Its removal
-also killed a hazard: with two writes, a guard on one and not the other would let
-`events` and `sessions` silently disagree, and only `sessions` is read. One write,
-one source of truth: the only rule left is that `W4_event` must not freeze
-`last_event_at` (no status guard). Historical/analytics needs are served ad-hoc by
-parsing the per-session JSONL transcript (`sessions.transcript_path`).
+There is **one** lifecycle write — `W4_event` on `sessions`. Historical/analytics
+needs are served ad-hoc by parsing the per-session JSONL transcript
+(`sessions.transcript_path`); an `events` table existed for this and was removed as
+write-only ([DECISIONS.md#events](DECISIONS.md#events)).
 
 ### Liveness = `sessions.stopped_at`, from `ps`, one source {#liveness}
 
 `stopped_at IS NULL` means live. It is read by JOIN everywhere; there is **no**
-denormalized `live` column. There used to be one, maintained by a trigger on
-`sessions` — it produced a permanent desync on resume (the trigger fired on
-death, nothing reset it when a resume revived the session) and it was the *only*
-reason tier 2 reached into tier 1. Removed. "Is this window/job held by a live
-session?" is a JOIN to `sessions.stopped_at`. Recyclability of window/job handles
-falls out for free (a dead row and a live row may share a `(socket, window_id)`
-or a `job_name`; the JOIN tells them apart; dead rows keep their placement as
-history). This is why the lookup indexes are plain, non-unique.
+denormalized `live` column, and no trigger ([DECISIONS.md#live-column](DECISIONS.md#live-column)).
+"Is this window/job held by a live session?" is a JOIN to `sessions.stopped_at`.
+Recyclability of window/job handles falls out for free (a dead row and a live row
+may share a `(socket, window_id)` or a `job_name`; the JOIN tells them apart; dead
+rows keep their placement as history). This is why the lookup indexes are plain,
+non-unique.
 
 **Liveness comes from the process table, NEVER from kitty.** Absence from a
 `kitten @ ls` is evidence about *placement*: a socket blip, an `ls` timeout,
@@ -109,12 +98,12 @@ hook to the first ancestor with `comm == claude` (`claude_pid()` /
 `_walk_claude()` in `common.sh`). Not the window shell — that outlives claude and
 would make the row immortal.
 
-This overturns SPIKE-1 (which concluded pid must come from `kitten @ ls`): the
-**blocking** SessionStart hook is a live descendant of claude, so exactly one
+The **blocking** SessionStart hook is a live descendant of claude, so exactly one
 claude is an ancestor (other sessions' claudes and claude's own MCP children are
 siblings, never on the upward path) — first-match-walking-up wins with no ppid
 cross-check. Meaningful **only from a blocking hook**: an async hook can be
-reparented to init (ppid → 1), breaking the chain.
+reparented to init (ppid → 1), breaking the chain. Verified live against an earlier
+conclusion that it had to come from kitty ([DECISIONS.md#spike1](DECISIONS.md#spike1)).
 
 `idx_sessions_pid_live` (`UNIQUE(pid) WHERE stopped_at IS NULL AND pid IS NOT
 NULL`) keeps at most one live row per pid, making the identity merge safe by
@@ -136,17 +125,21 @@ boot. A `pid_start_time` column would close it properly; deliberately deferred.
 
 These named `-- :name X` blocks are the **only** statements that write. Both
 `herd.db.load_statements()` (python) and `common.sh`'s `stmt()` (awk) extract
-them the same way, terminating at the first `;`; `the test suite` asserts the two
-agree character-for-character, so bash and python cannot drift. Nothing may keep
-its own transcription of a write path — the predecessor re-typed statements
-inline and four defects survived 40 checks that way.
+them the same way, terminating at the first `;`;
+`test_hooks.py::test_bash_and_python_extract_same` asserts the two agree once
+whitespace is normalized, so bash and python cannot drift. Nothing may keep its own
+transcription of a write path ([DECISIONS.md#transcription](DECISIONS.md#transcription)),
+enforced by `test_source_invariants.py::test_no_hook_inlines_dml`.
 
 Inline comments inside a statement must not contain `;` (both parsers cut there;
-`sqlite3.complete_statement()` in the suite catches truncation).
+`test_source_invariants.py::test_every_statement_is_complete` catches truncation
+via `sqlite3.complete_statement()`).
 
 | Statement | Purpose |
 |---|---|
-| `W1_spawn_session` / `W1_spawn_herd` | Spawn a session from herd (job + window known, UUID/pid not). `status_source='reconcile'` is a white lie — the CHECK has no `'spawn'`; real provenance is `herd_sessions.source`. Driven by `herd spawn`. |
+| `W1_spawn_session` / `W1_spawn_herd` | Phase 1 of a spawn: reserve the job name (UUID/pid/window not yet known). `status_source='reconcile'` is a white lie — the CHECK has no `'spawn'`; real provenance is `herd_sessions.source`. Driven by `herd spawn`. |
+| `W1_spawn_window` | Phase 2: stamp the launched window onto the reservation. See [spawn](#spawn). |
+| `W1_spawn_abort` | A failed launch drops the reservation — a real `DELETE` (cascading), so the name frees immediately and a session that never existed leaves no history. |
 | `W2_adopt` | SessionStart adopts herd's placeholder row for this window, joining on `(socket, window_id)` from env. Writes Claude's signals into the core row. Idempotent (`AND session_id IS NULL`). |
 | `W2b_insert` | Fallback when W2 matched nothing: upsert on Claude's UUID. Resume revives a stopped row (`stopped_at=NULL`, fresh pid); `started_at` preserved so duration is total age. |
 | `W2c_pid_claim` | Runs first, own txn: reap any stale live holder of this pid so `idx_sessions_pid_live` is satisfiable. Excludes our own row. NULL pid → no-op. |
@@ -155,29 +148,37 @@ Inline comments inside a statement must not contain `;` (both parsers cut there;
 | `W3e_boot_sweep` | Boot sweep (see [pid](#pid)). |
 | `W4_event` | Lifecycle: status + `last_event_*` in one statement — the single lifecycle write. **No status guard** (see [two clocks](#two-clocks)). |
 | `W4_end` | The only hook-driven death (`status_source='hook'` — it *knows*, vs W3d's inference). |
-| `W5_statusline` | The sink for **every** field the statusLine payload carries — metrics, plus `claude_code_version`, `output_style`, `git_worktree`, `original_cwd` — and `git_branch`, which the hook derives from its own `.git` walk. Nothing else writes these; a field absent from this statement is a column that stays NULL forever (`api_duration_ms` shipped that way: parsed, rendered, never bound). UPDATE only (never creates a row — would resurrect stopped sessions / invent empty cwd). Never touches `last_event_*`. Resets_at arrives as unix epoch, converted to ISO in SQLite (zero date forks); `COALESCE` keeps prior value on NULL. The `prev_cost` pair (burn-rate delta, resampled >300s) is correct as written: an UPDATE's RHS sees the OLD row, so `prev_cost_usd` captures the previous total before this statement overwrites it. |
+| `W5_statusline` | The sink for **every** field the statusLine payload carries — metrics, plus `claude_code_version`, `output_style`, `git_worktree`, `original_cwd` — and `git_branch`, which the hook derives from its own `.git` walk. Nothing else writes these; a field absent from this statement is a column that stays NULL forever. UPDATE only (never creates a row — would resurrect stopped sessions / invent empty cwd). Never touches `last_event_*`. Resets_at arrives as unix epoch, converted to ISO in SQLite (zero date forks); `COALESCE` keeps prior value on NULL. The `prev_cost` pair (burn-rate delta, resampled >300s) is correct as written: an UPDATE's RHS sees the OLD row, so `prev_cost_usd` captures the previous total before this statement overwrites it. |
 | `W5b_adopt` | Statusline adoption ("Path C"): statusline is a child of claude, inherits `KITTY_*` like a hook, so a reconciled session picks up metrics with no hooks wired. Same liveness JOIN as W2. |
 | `W6a_arm` / `W6b_paged` / `W6c_ack` / `W6d_rearm` / `W6d_rearm_sid` | Attention (see [attention](#attention)). `W6d_rearm_sid` is the UUID-keyed variant a hook needs (hooks lack the surrogate pk) — same keyed-two-ways pattern as W2 vs W2b. |
-| `R1_list` | The TUI's main read: all four tables, attention-first ordering. |
+| `R1_list` | The **one** live-session read: `sessions` + `herd_sessions` + `herd_attention`, attention-first ordering. `ls`, the picker, `rows` and the preview all go through it. |
 | `R_job_live` | Spawn-time recyclable-handle check: does a *live* session already hold this job name? By JOIN, no unique index. Dead rows keep their `job_name` — reuse is by design, and resolution searches live sessions only. Run **inside** `spawn()`'s `BEGIN IMMEDIATE`, not before it: the check must be atomic with the reservation, or two concurrent spawns both pass it across the kitty launch and both insert. See [spawn](#spawn). |
 | `R_statusline` | Render input: feeds only the burn rate (the `prev_cost` pair). One read per fingerprint miss. |
 
 **Routing read, not data read:** in an adopt writer (W2, W5b, W2b_placement) a
 `herd_*` reference may appear only *after* `WHERE` (to pick which row), never in
-the SET list. No tier-2 value ever enters a core column. `the test suite` enforces
-this structurally.
+the SET list. No tier-2 value ever enters a core column.
+`test_source_invariants.py::test_core_writers_take_no_tier2_value` enforces this
+structurally: it splits each `sessions` writer at the first `WHERE` and greps only
+the value region.
 
 The liveness JOIN inside the adopt subquery (`s.stopped_at IS NULL`) is
 load-bearing: a window outlives the claude in it, so a dead predecessor row still
 owns the `(socket, window_id)`. Without the filter, adoption binds Claude's UUID
 to the stopped row while the live session stays unadopted and invisible.
 
-**`herd_sessions` mutability contract:** `job_name`, `created_at` are immutable
-(set once at spawn); `kitty_socket`, `window_id`, `herd_var`, `source`,
-`verified_at` may be rewritten by a hook re-fire (e.g. resume in a new window).
-Enforced by discipline — name columns in the UPDATE, never blanket-overwrite.
-`W2b_placement` omits `job_name`/`created_at` and keeps `source='spawn'` so a
-resumed spawned session never loses its job identity (`the test suite` section D).
+**`herd_sessions` mutability contract:**
+
+| immutable (set once at spawn) | mutable (a hook re-fire may rewrite) |
+|---|---|
+| `job_name`, `created_at` — the job identity | `kitty_socket`, `window_id` — placement moves |
+| `herd_var` — a hook cannot know the spawn var | `verified_at` — re-derivation stamp |
+| `source` — provenance must not decay to `'hook'` | |
+
+Enforced by discipline — name columns in the UPDATE, never blanket-overwrite — and
+asserted by `test_mutability.py::test_refire_mutability_contract`, which re-fires
+the hook from a *new* window and checks each column above. `W2b_placement` omits
+the immutable set, so a resumed spawned session never loses its job identity.
 
 ---
 
@@ -195,10 +196,8 @@ whose stderr shows in the transcript.)
 
 **Config via default-expansion only** (`${X:-...}`), never unconditional
 assignment: `HERD_DB=/tmp/x ./hook.sh` must write where told, or the tests can't
-redirect the program's state and end up testing the machine. (`HERD_RUNTIME`
-earned this the hard way — written once as `${XDG_RUNTIME_DIR:-/tmp}`, it ignored
-the test's override and wrote throttle state into the real `/run`, so a check
-passed on first run and failed on every run after.)
+redirect the program's state and end up testing the machine
+([DECISIONS.md#runtime](DECISIONS.md#runtime)).
 
 **`BASH_SOURCE%/*` footgun:** it returns the string *unchanged* when the script
 is invoked with no directory component (`bash stop.sh`), which would leave every
@@ -213,11 +212,10 @@ hook guards: `__d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."`
   — half-committing before the failure while still exiting nonzero. With `-bail`
   it stops at the error, never reaches COMMIT, and the open transaction rolls
   back on exit. `busy_timeout` is not optional: WAL serialises writers, and
-  without it a hook fails outright the moment the daemon/TUI holds the write lock.
-- **`stmt()`** extracts one `-- :name X` block, stopping at the first `;`.
-  Stopping there also matters because prose after a statement contains things
-  like `:pid MUST be ...` that `bind()` would try to substitute. An awk fork
-  (0.7ms) beats the pure-bash equivalent (1.6ms) — measured.
+  without it a hook fails outright the moment the daemon holds the write lock.
+- **`stmt()`** extracts one `-- :name X` block, stopping at the first `;` —
+  which also keeps prose like `:pid MUST be ...` away from `bind()`. The awk fork
+  is the measured-faster implementation ([DECISIONS.md#awk](DECISIONS.md#awk)).
 - **`bind()`** expands `:name` params from `HERD_P_<name>` env vars in a **single
   pass**. Not sqlite3's `.param set`: its dot-command parser uses shell-like
   quoting, so a correct SQL escape (`o''brien`) mis-tokenizes, the param is left
@@ -227,12 +225,11 @@ hook guards: `__d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."`
   travel via the environment, so no shell quoting is involved. Empty value →
   `NULL`; unknown param → hard failure (nonzero exit), never a silent NULL.
 - **`run_tx`** wraps N statements in one `BEGIN IMMEDIATE ... COMMIT`, one fork,
-  one WAL commit — its live use is `stop.sh` landing the status change (`W4_event`)
-  and the attention re-arm (`W6d_rearm_sid`) atomically. `BEGIN IMMEDIATE`, never
-  plain `BEGIN`: a deferred txn
-  upgrades to a write lock lazily and can throw `SQLITE_BUSY_SNAPSHOT` which the
-  busy timeout cannot retry away. All binding happens before any SQL runs, so an
-  unbound param aborts with nothing executed.
+  one WAL commit. Two callers: `stop.sh` (status change + attention re-arm) and
+  `session_start.sh` (`W2b_insert` + `W2b_placement`). `BEGIN IMMEDIATE`, never
+  plain `BEGIN`: a deferred txn upgrades to a write lock lazily and can throw
+  `SQLITE_BUSY_SNAPSHOT`, which the busy timeout cannot retry away. All binding
+  happens before any SQL runs, so an unbound param aborts with nothing executed.
 - **`valid_sid()`** — a `session_id` becomes a filename (throttle/cache); reject
   anything with `/` or `..` so a payload can't escape `$HERD_RUNTIME`.
 - **`now_pair()`** emits ISO + epoch from a *single* `date` fork (the throttle
@@ -287,25 +284,10 @@ sub-cent rates are hidden as noise.
 name is the handle for everything downstream. That makes "one live session per job
 name" a guarantee worth actually holding.
 
-The obvious order is wrong:
-
-    check R_job_live  ->  kitten @ launch  ->  INSERT
-
-The launch is a subprocess plus a socket round trip — tens to hundreds of
-milliseconds of I/O sitting between the check and the write. Two spawns of one name
-started in that window both pass the check and both insert, and you end up with two
-live sessions holding `api`. Nothing corrupts, but the handle is now ambiguous:
-`resolve()` returns two rows, so `herd jump api` opens the picker instead of jumping,
-which is exactly the scriptability the unique-match branch exists to provide.
-
-**No index can catch this.** `job_name` must repeat across dead rows (that is what
-makes names recyclable), so a plain `UNIQUE` is out. The constraint you want is
-unique-among-live, but liveness is `sessions.stopped_at` and the name lives in
-`herd_sessions` — and a SQLite partial index cannot reference another table. The
-`live` denormalized column that would have made it expressible is the one that
-desynced on resume and was removed (see [liveness](#liveness)).
-
-So the claim is made atomic in code instead, in two phases:
+The claim cannot be made by an index: `job_name` must repeat across dead rows (that
+is what makes names recyclable), and unique-among-live would need a partial index
+referencing another table, which SQLite cannot do. So it is made atomic in code, in
+two phases ([DECISIONS.md#toctou](DECISIONS.md#toctou) for the race this closes):
 
 1. **Reserve** — `BEGIN IMMEDIATE`, re-check `R_job_live`, insert both rows with
    `window_id` NULL, `COMMIT`. Taking the write lock *before* the check is the whole
@@ -315,6 +297,10 @@ So the claim is made atomic in code instead, in two phases:
 A failed launch runs `W1_spawn_abort` (a real `DELETE`, cascading) so the name frees
 immediately — the session never existed and must not linger in history. `sessions.id`
 is `AUTOINCREMENT` precisely so that delete can never cause surrogate reuse.
+
+Phase 1's error handler rolls back only when a transaction is actually open:
+`BEGIN IMMEDIATE` is itself the statement most likely to fail, and an unconditional
+`ROLLBACK` then raises out of `spawn()` and crashes the CLI it exists to protect.
 
 The intermediate state — reserved, not yet placed — is safe to observe: `window_id`
 NULL is already the "no window to focus yet" case in `focus_session`, and
@@ -334,7 +320,9 @@ Precedence is **CLI (non-None) > template > built-in default**, which is why
 the one field that concatenates instead of overriding — template args first, then
 the CLI's `-- …` — so a template carries a base set and the CLI adds ad-hoc flags.
 `job` may come from either side, so `herd spawn -t review` with no positional is
-valid; failing to resolve one is a `ValueError`.
+valid; failing to resolve one is a `ValueError`. A `[vars]` table adds kitty user
+vars to the launched window alongside the `HERD_JOB` var herd sets itself; it has no
+CLI flag, template-only.
 
 TOML, not JSON, for triple-quoted multiline strings — a multiline `prompt` is the
 motivating case. `tomllib` is imported lazily so only *using* a template requires
@@ -356,10 +344,10 @@ it has drifted. A kitty restart invalidates every `window_id`; re-derivation
 makes that invisible rather than fatal.
 
 kitty's `--match pid:N` matches the *window's* pid (the login shell), never the
-foreground claude — measured. So resolve pid → window ourselves and focus by
-`--match id:`. `(socket, window_id)` is the whole jump key: `focus-window --match
-id:N` on a window in a background tab activates that tab and returns 0, so no
-`tab_id`/`os_window_id` is needed.
+foreground claude, so herd resolves pid → window itself and focuses by `--match id:`
+([DECISIONS.md#kitty-match](DECISIONS.md#kitty-match)). `(socket, window_id)` is the
+whole jump key: `focus-window --match id:N` on a window in a background tab
+activates that tab and returns 0, so no `tab_id`/`os_window_id` is needed.
 
 User vars (`--var HERD_JOB=x`, matched `--match var:HERD_JOB=^x$`) are
 window-scoped, sticky, and survive claude exiting — they identify a *window*,
@@ -372,10 +360,8 @@ without a live kitty — the same discipline as `daemon.py` and `common.sh`.
 There is exactly one live-session read: `R1_list`, loaded from `writes.sql` like
 every other shipping statement. `cli._live()` *is* that statement, and `ls`, the
 picker, `rows` and the preview pane all go through it — `preview` filters it by
-id in Python rather than issuing a second query. It was briefly two hand-written
-transcriptions instead, which is precisely the rot `load_statements()` exists to
-prevent: `R1_list` sat unused while the CLI's private copy missed the
-`idx_sessions_live` plan the query test had been guarding all along.
+id in Python rather than issuing a second query
+([DECISIONS.md#transcription](DECISIONS.md#transcription)).
 
 `cli` surface: `ls`, `jump` and `watch` are the user verbs; `preview` (fzf's
 per-highlight pane), `complete` (tab-completion feed), `rows` (fzf's reload
@@ -400,34 +386,20 @@ is something you cannot accidentally fall out of. `ctrl-q` and `ctrl-c` are the
 way out.
 
 Both quit keys go through `--expect`, which prints the pressed key as stdout's
-first line, because **every other exit collapses into Esc's outcome**: `abort`
-exits 130 with empty stdout, so a `ctrl-q:abort` bind is indistinguishable from a
-cancel and `watch` just loops. That shipped broken. ctrl-c is worse than it looks
-— fzf puts the terminal in raw mode, which disables ISIG, so ctrl-c never becomes
-a SIGINT; fzf reads the raw `0x03` itself. `cmd_watch` still catches
+first line — every other exit collapses into Esc's outcome, and ctrl-c never
+reaches Python because fzf's raw mode disables ISIG
+([DECISIONS.md#expect](DECISIONS.md#expect)). `cmd_watch` still catches
 `KeyboardInterrupt`, but that only covers the "no live sessions" sleep, where no
-fzf is running and the terminal is in normal mode. `--expect` is the only route
-for ctrl-c here — 0.44.1 has no `print(...)` action.
+fzf is running and the terminal is in normal mode.
 
 *The poker.* Only the row list needs refreshing, and fzf cannot refresh it on a
 timer, so `cmd_poke` runs alongside and POSTs `reload` to fzf's `--listen` port.
 It is stdlib `urllib`, not `curl` — herd ships no runtime deps, and the poker is
-long-lived so there is no cold start to pay.
-
-Three things about the poker were measured, not assumed:
-
-- **`--listen=0` is not usable here.** fzf's `start` event does not reliably see
-  `$FZF_PORT`, so a `start:execute-silent(… poke &)` bind spawned the poker on one
-  picker and not the next — auto-refresh worked intermittently. `watch` picks the
-  port itself (`_free_port`), which also makes it the poker's parent, so it can
-  reap it in a `finally` instead of orphaning one per jump.
-- **Reload only on change.** An unconditional 2s reload redraws the pane for
-  nothing; the poker diffs the row text first.
-- **But contact fzf every tick anyway** (`data=None` → a liveness GET). A poker
-  that only spoke on change could not notice its fzf had exited while the herd was
-  quiet. The first failures are tolerated (`_POKE_GRACE`): `watch` spawns the poker
-  before fzf has bound the port, and treating that startup window as death killed
-  auto-refresh outright.
+long-lived so there is no cold start to pay. `watch` chooses the port itself
+(`_free_port`) and so is the poker's parent; the poker diffs the row text and
+reloads only on change, but contacts fzf every tick regardless so it notices an fzf
+that exited while the herd was quiet. Early failures are tolerated (`_POKE_GRACE`).
+All three were measured ([DECISIONS.md#poker](DECISIONS.md#poker)).
 
 ---
 
@@ -487,8 +459,10 @@ mean the daemon polling `kitten @ ls` for the focused window, which breaks
 [liveness comes from ps, never kitty](#liveness). Left open on purpose; revisit with
 the notifier.
 
-Actually *notifying* you (notify-send / TUI badge / escalation via `paged_level`)
-is a separate actuator, deliberately deferred — this layer maintains the signal.
+Actually *notifying* you (notify-send, a kitty tab poke, escalation via
+`paged_level`) is a separate actuator, deliberately deferred — this layer maintains
+the signal. Ambient attention is currently Claude's terminal bell plus kitty's tab
+flag, which is outside herd entirely.
 
 ---
 
@@ -516,6 +490,12 @@ and an uncommitted setup would be invisible to them.
 
 ## Deferred / not yet built
 
-- The notifier/pager actuator (`W6b_paged`, `paged_level` escalation). Until it
-  lands, `paged_level` is always `0` and `W6b_paged` has no production caller.
+- **The pager actuator.** `W6b_paged`, `herd_attention.paged_at` and `paged_level`
+  are schema and SQL with **no production caller** — only `tests/test_pager.py`
+  executes them, so `paged_level` is structurally always `0` and the `(rung N)` in
+  the preview can only ever print `0`. A herd-owned notifier is *not planned*
+  (ambient attention is Claude's bell + kitty's tab flag), so this surface is
+  currently unbuilt machinery for a feature with no owner — either it gets a caller
+  or it gets deleted.
 - A `pid_start_time` column to close the reboot pid-reuse caveat properly.
+- Reaching a session without `herd jump` writes no ack — see [ack](#ack).

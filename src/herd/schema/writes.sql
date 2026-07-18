@@ -1,7 +1,8 @@
 -- ═══════════════════════════════════════════════════════════════════════════
 -- herd — canonical write paths. The ONLY statements that write.
 -- Loaded by herd.db.load_statements() (python) AND common.sh stmt() (bash);
--- both cut at the first ';', and the test suite asserts they agree char-for-char.
+-- both cut at the first ';'; test_hooks.py::test_bash_and_python_extract_same asserts
+-- they agree (whitespace-normalized).
 -- Rationale + a per-statement table: DESIGN.md#write-paths-schemawritessql.
 -- Inline comments inside a statement must not contain ';'.
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -263,7 +264,8 @@ JOIN sessions s ON s.id = h.session_pk
 WHERE h.job_name = :job AND s.stopped_at IS NULL;
 
 
--- ── R1. The TUI's main read: all four tables, attention-first ordering.
+-- ── R1. The ONE live-session read: sessions + herd_sessions + herd_attention,
+-- attention-first ordering. ls, the picker, rows and preview all go through it.
 -- :name R1_list
 SELECT s.id, s.session_id, s.pid, s.cwd, s.status, s.status_source, s.model, s.session_name,
        s.context_percent, s.total_cost_usd, s.git_branch,

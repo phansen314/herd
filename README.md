@@ -11,8 +11,9 @@ would be felt); the background daemon is stdlib Python.
 
 > **Status: early but usable.** The data model, lifecycle hooks, statusline, the
 > liveness/attention daemon, and the `herd` CLI (`ls`, `spawn`, fzf-powered `jump`,
-> and the `watch` dashboard) are built, tested, and installed. Still ahead (see
-> [Roadmap](#roadmap)): a lightweight notifier for ambient attention.
+> and the `watch` dashboard) are built, tested, and installed. Ambient attention is
+> Claude's terminal bell plus kitty's tab flag rather than a herd-owned notifier —
+> see [Notifications](#notifications-kitty-tab-bell) and [Roadmap](#roadmap).
 
 ## What it does
 
@@ -113,6 +114,9 @@ prompt = """
 Review the working diff.
 Focus on correctness; skip style.
 """
+
+[vars]                     # optional — extra kitty user vars on the new window
+PROJECT = "herd"           # (herd sets HERD_JOB itself)
 ```
 
 ```bash
@@ -125,9 +129,10 @@ defaults you can always override. The one exception is `--`: those args are *app
 to the template's `args` rather than replacing them, so a template can carry a base
 set and you add ad-hoc flags on top. `-t` tab-completes.
 
-A multiline `prompt` is the reason the format is TOML. Templates need **Python 3.11+**
-(stdlib `tomllib`); the rest of herd still runs on 3.9. Unknown keys are rejected
-rather than ignored, so a typo tells you instead of silently doing nothing.
+Templates need **Python 3.11+** (stdlib `tomllib`); the rest of herd still runs on
+3.9. Unknown keys are rejected rather than ignored, so a typo tells you instead of
+silently doing nothing. (Why TOML, and how precedence is resolved:
+[DESIGN.md#templates](DESIGN.md#templates).)
 
 ### `herd watch` — the dashboard
 
@@ -166,7 +171,8 @@ launch bash -l -i -c 'herd watch; exec bash'
 
 Enter jumps to a session, `ctrl-r` forces a refresh, `ctrl-q` / `ctrl-c` quit. Esc
 re-opens the picker rather than exiting — it's a tab you can't accidentally fall out
-of, so after jumping away, the same key brings you back to a live list.
+of, so after jumping away, the same key brings you back to a live list. (Why fzf and
+not a curses TUI: [DESIGN.md#watch](DESIGN.md#watch).)
 
 ### Reading the database directly
 
@@ -197,7 +203,9 @@ value you don't recognize as `unknown` rather than switching exhaustively. The c
 values are `working`, `waiting`, `needs_approval`, `stopped`, `unknown`, and the
 `CHECK` constraint that enforces them will gain members as Claude Code adds lifecycle
 hooks. Growing that set is additive for readers that degrade gracefully and breaking
-for ones that don't. Same rule for `last_event_type` and `status_source`.
+for ones that don't. Same rule for `status_source` (also `CHECK`-constrained:
+`hook`, `reconcile`, `pid`) and for `last_event_type`, which carries no `CHECK` at
+all — today it is `start|tool|stop|notify|end`.
 
 ### The daemon
 
@@ -281,7 +289,7 @@ design. Errors go to `~/.herd/hook-errors.log` (`HERD_ERRLOG`); the daemon's go 
 |---|---|
 | `herd: command not found` | `~/.local/bin` not on PATH (the installer WARNs about this), or an open shell that hasn't rehashed — `hash -r` |
 | statusline blank or missing | the hook scripts lost `+x`. `python3 -m herd.install` re-runs the selftest, which reports exactly this |
-| no sessions ever appear | the daemon isn't running (`systemctl --user status herd`), or `~/.claude/settings.json` wasn't rewired — re-run the installer |
+| no sessions ever appear | `~/.claude/settings.json` wasn't rewired — re-run the installer. Rows come from the hooks and `herd spawn`, never from the daemon, so this is not a daemon problem |
 | sessions appear but never go away | the daemon is down; only it reaps silent deaths. Live rows are `stopped_at IS NULL` |
 | `herd spawn` → "needs to run inside kitty" | `KITTY_LISTEN_ON` is unset. kitty needs `allow_remote_control yes` **and** `listen_on unix:/tmp/kitty` |
 | `herd spawn -t` → "templates need Python 3.11+" | `tomllib` is 3.11+. Only templates need it; the rest of herd runs on 3.9 |
@@ -311,7 +319,8 @@ Two data sources, two directions:
 
 Everything else — the tier boundary, the identity spine, the two clocks behind the
 attention signal, and why every write is a named statement in one canonical SQL file
-— is in [DESIGN.md](DESIGN.md).
+— is in [DESIGN.md](DESIGN.md). What was tried and rejected along the way, and what
+would break if you undid it, is in [DECISIONS.md](DECISIONS.md).
 
 ## Development
 
@@ -326,10 +335,12 @@ proves the invariants the design rests on — the tier boundary, the identity mo
 the two-clocks attention thesis, the reaper's liveness rules, that every hook exits 0
 under every degradation, and that the hooks and daemon load the same canonical SQL.
 New behavior is added test-first (red before green); the suite is the project's only
-CI gate.
+CI gate. (Fixture layout and why it runs the real hooks:
+[DESIGN.md#testing](DESIGN.md#testing).)
 
-The design rationale lives in [`DESIGN.md`](DESIGN.md); source comments carry a
-one-line summary and point there. Start with the schema —
+How it works lives in [`DESIGN.md`](DESIGN.md) and why it works that way in
+[`DECISIONS.md`](DECISIONS.md); source comments carry a one-line summary and point
+there. Start with the schema —
 [`schema/core.sql`](src/herd/schema/core.sql) (tier 1),
 [`schema/herd.sql`](src/herd/schema/herd.sql) (tier 2), and
 [`schema/writes.sql`](src/herd/schema/writes.sql) (every write path).
@@ -350,7 +361,8 @@ src/herd/
                  launch.py — `kitten @ launch` for `herd spawn`
 completions/     bash completion   ·   bin/herd — the CLI wrapper
 tests/           pytest suite (helpers.py + conftest.py + test_*.py per concern)
-DESIGN.md        the design rationale
+DESIGN.md        how it works — invariants + current state
+DECISIONS.md     why it works that way — what was tried, measured, removed
 ```
 
 ## Roadmap

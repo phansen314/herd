@@ -2,7 +2,8 @@
 # bash 3.2 compatible. Rationale + gotchas: DESIGN.md#the-hooks-hookssh.
 #
 # NOTHING HERE MAY BLOCK CLAUDE — every hook exits 0. The SQL lives in
-# schema/writes.sql and is NOT copied here (the test suite guards bash/python drift).
+# schema/writes.sql and is NOT copied here (test_source_invariants.py forbids inline
+# DML; test_hooks.py guards bash/python drift).
 #
 # Config is default-expansion (${X:-...}) ONLY, never unconditional assignment,
 # so tests can redirect state (HERD_RUNTIME earned this — see DESIGN.md).
@@ -84,7 +85,7 @@ db() {
 
 # ── statement extraction ──────────────────────────────────────────────────
 # Pull one `-- :name X` block out of writes.sql, stopping at the first `;`
-# (mirrors herd.db.load_statements(); the test suite asserts they agree). Stopping
+# (mirrors herd.db.load_statements(); test_hooks.py asserts they agree). Stopping
 # at `;` also keeps bind() from substituting `:name` mentions in trailing prose.
 # awk (0.7ms) beats pure-bash (1.6ms) — measured.
 stmt() {
