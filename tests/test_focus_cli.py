@@ -302,11 +302,11 @@ def test_only_watch_expects_keys(fresh):
 def test_cli_hides_machinery():
     from herd import install as inst
     completion = inst.COMPLETION_SRC.read_text()
-    assert cli.USER_COMMANDS == ("ls", "jump", "watch")
+    assert cli.USER_COMMANDS == ("ls", "jump", "spawn", "watch")
     assert {"preview", "complete", "rows", "poke"} <= set(cli.COMMANDS)
     for m in ("preview", "complete", "rows", "poke"):
         assert m not in cli.USER_COMMANDS
-    assert 'compgen -W "ls jump watch"' in completion
+    assert 'compgen -W "ls jump spawn watch"' in completion
     assert "preview" not in completion and "poke" not in completion
 
 

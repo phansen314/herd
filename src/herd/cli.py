@@ -3,6 +3,7 @@
     herd ls                 # list live sessions
     herd jump               # fuzzy-pick a session (fzf) and focus its kitty window
     herd jump <query>       # query = herd id, name (/rename), job, uuid, or cwd
+    herd spawn <job>        # launch a named claude session in a kitty tab/pane
     herd watch              # the picker as a permanent dashboard (dedicated tab)
     herd preview <id>       # session detail (used by the fzf preview pane)
 
@@ -15,6 +16,7 @@ There is deliberately NO TUI. `watch` is the whole dashboard: fzf already render
 list, navigates it, and shows live per-session detail in its preview pane, so a curses
 layer would only be a second rendering path to keep in sync with `ls`. See cmd_watch.
 """
+import argparse
 import os
 import shutil
 import subprocess
@@ -23,6 +25,7 @@ import sys
 from herd.db import connect, load_statements
 from herd.daemon import DEFAULT_DB, _now_iso
 from herd.kitty.focus import focus_session
+from herd.spawn import SpawnSpec, spawn
 
 _HOME = os.path.expanduser("~")
 
@@ -362,15 +365,46 @@ def cmd_preview(conn, args):
     return 0
 
 
-COMMANDS = {"ls": cmd_ls, "jump": cmd_jump, "watch": cmd_watch,
+def _split_dashdash(args):
+    """Split argv on the first standalone '--': (herd_flags, claude_args). Without
+    a '--', everything is herd flags and claude_args is empty."""
+    if "--" in args:
+        i = args.index("--")
+        return args[:i], args[i + 1:]
+    return list(args), []
+
+
+def cmd_spawn(conn, args):
+    """Launch a named claude session in a kitty tab/pane and record its placeholder
+    so the SessionStart hook adopts Claude's UUID onto it. See herd.spawn."""
+    herd_args, claude_args = _split_dashdash(args)
+    p = argparse.ArgumentParser(prog="herd spawn", add_help=False)
+    p.add_argument("job")
+    p.add_argument("--cwd", default=None)
+    p.add_argument("--type", dest="launch_type", choices=("tab", "pane"), default="tab")
+    p.add_argument("--prompt", default=None)
+    try:
+        ns = p.parse_args(herd_args)
+    except SystemExit:
+        print("usage: herd spawn <job> [--cwd DIR] [--type tab|pane] "
+              "[--prompt TEXT] [-- <claude args...>]")
+        return 2
+    spec = SpawnSpec(job=ns.job, cwd=ns.cwd or os.getcwd(), launch_type=ns.launch_type,
+                     prompt=ns.prompt, claude_args=claude_args)
+    ok, msg, _ = spawn(conn, spec, os.environ.get("KITTY_LISTEN_ON"), _now_iso())
+    print(("✓ " if ok else "✗ ") + msg)
+    return 0 if ok else 1
+
+
+COMMANDS = {"ls": cmd_ls, "jump": cmd_jump, "spawn": cmd_spawn, "watch": cmd_watch,
             "preview": cmd_preview, "complete": cmd_complete, "rows": cmd_rows,
             "poke": cmd_poke}
-# `watch` focuses windows (via _do_focus), so it is NOT readonly.
+# `spawn` writes (W1) and `watch` focuses windows — neither is readonly.
 _READONLY = {"ls", "preview", "complete", "rows", "poke"}
 # The verbs a user actually types. `preview` (fzf's per-highlight pane), `complete`
 # (tab-completion feed), `rows` (fzf's reload source) and `poke` (watch's refresh
 # child) are machinery — callable, but not advertised in help or tab-completion.
-USER_COMMANDS = ("ls", "jump", "watch")
+USER_COMMANDS = ("ls", "jump", "spawn", "watch")
 
 
 def main(argv=None):
