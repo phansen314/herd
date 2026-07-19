@@ -315,9 +315,27 @@ def plist_text():
 
 
 def _launchctl(*args):
-    """launchctl, never raising and never hanging. Returns the CompletedProcess."""
-    return subprocess.run(["launchctl", *args], check=False,
-                          capture_output=True, text=True, timeout=LAUNCHCTL_TIMEOUT)
+    """launchctl, never raising and never hanging. Returns a CompletedProcess.
+
+    `check=False` only suppresses CalledProcessError — `timeout=` still RAISES
+    TimeoutExpired, which is the one case this bound exists for: a wedged launchd.
+    install() calls install_service() *after* rewriting settings.json and the
+    statusline wrapper, so an escaping exception left the config changed, no daemon
+    installed, and a traceback where the summary should be. Up to five launchctl
+    calls run per install, so that was up to 75s of hang before the crash.
+
+    A failure is reported the way a nonzero exit already is, so every caller's
+    `returncode != 0` handling covers it with no new branch.
+    """
+    try:
+        return subprocess.run(["launchctl", *args], check=False,
+                              capture_output=True, text=True,
+                              timeout=LAUNCHCTL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args, 124, "", f"launchctl {args[0]} timed out after {LAUNCHCTL_TIMEOUT}s")
+    except OSError as e:                      # launchctl vanished mid-install, fork limit
+        return subprocess.CompletedProcess(args, 127, "", f"launchctl: {e}")
 
 
 def _gui_target():

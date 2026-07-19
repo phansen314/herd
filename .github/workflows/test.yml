@@ -11,14 +11,27 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # 3.9 is the floor pyproject DECLARES (requires-python = ">=3.9"). Testing
-        # only a modern interpreter would let that claim rot silently — the floor is
-        # a promise to anyone installing on an older distro.
-        python: ["3.9", "3.13"]
+        # Explicit combinations, not a cross product. 3.9 is the floor pyproject
+        # DECLARES (requires-python = ">=3.9") and testing only a modern interpreter
+        # lets that claim rot. macOS is here because herd now ships a launchd
+        # service, BSD `date` fallbacks and sun_path-length workarounds — all of
+        # which are asserted by stubs on Linux and were, until this ran, verified on
+        # the platform they exist for exactly never.
+        #
+        # 3.9 is not paired with macos-latest on purpose: the arm64 runners have no
+        # 3.9 build, and pinning macos-13 to get one would test an x86 image nobody
+        # uses. The floor is a Python claim, not a platform one, so Linux carries it.
+        include:
+          - os: ubuntu-latest
+            python: "3.9"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: macos-latest
+            python: "3.13"
     steps:
       - uses: actions/checkout@v4
 
@@ -27,16 +40,28 @@ jobs:
           python-version: ${{ matrix.python }}
 
       # The hooks shell out to these, and most of the suite execs the REAL hooks.
-      # Installed explicitly rather than trusted to the runner image: if a future
-      # image drops one, the suite would still "pass" by SKIPPING the tests that
-      # matter, which is the failure this job exists to prevent.
-      - name: install the hook toolchain
+      # Verified present rather than assumed: if a runner image drops one, the suite
+      # would still "pass" by SKIPPING the tests that matter.
+      - name: install the hook toolchain (linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq sqlite3
+
+      - name: install the hook toolchain (macos)
+        if: runner.os == 'macOS'
+        run: |
+          # jq and sqlite3 ship with the image; install only what is missing so a
+          # green run never depends on brew being reachable.
+          command -v jq >/dev/null || brew install jq
+          command -v sqlite3 >/dev/null || brew install sqlite
+
+      - name: show the toolchain
+        run: |
           for t in bash jq sqlite3; do
             printf '%-9s %s\n' "$t" "$(command -v "$t" || echo MISSING)"
           done
+          bash --version | head -1     # macOS ships bash 3.2 — herd's stated target
           jq --version
           sqlite3 --version
 
@@ -47,13 +72,9 @@ jobs:
         run: python -m pytest -q --junitxml=results.xml
 
       # A GREEN RUN MUST MEAN THE HOOK TESTS RAN. conftest skips them when bash/jq/
-      # sqlite3 are absent — right on a contributor's machine, dangerous here, where
+      # sqlite3 are missing — right on a contributor's machine, dangerous here, where
       # "0 failures" looks identical to a run that skipped them. Dropping jq alone
-      # skips 159 of 648, and nothing in a green summary would say so.
-      #
-      # The JUnit skipped count is the signal, NOT a grep of pytest's output: the
-      # skip banner is suppressed by -q, so the obvious `pytest -q | grep MISSING`
-      # check can never match and is pure decoration. Measured, after writing it.
+      # skips 159 of 665, and nothing in a green summary would say so.
       - name: a green run must not be a skipped run
         run: |
           for t in bash jq sqlite3; do
@@ -62,8 +83,9 @@ jobs:
           python .github/check-skips.py results.xml
 
       # Advisory only: the hooks target bash 3.2 and shellcheck has opinions herd
-      # has deliberately overruled, so this reports without gating the build.
+      # has deliberately overruled. Linux-only — one report is enough.
       - name: shellcheck the hooks (advisory)
+        if: runner.os == 'Linux'
         continue-on-error: true
         run: |
           sudo apt-get install -y -qq shellcheck

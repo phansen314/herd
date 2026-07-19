@@ -32,10 +32,50 @@ def _now_iso():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+# Cap for a stderr that is a FILE. journald rotates and a terminal scrolls, but
+# launchd's StandardErrorPath is a plain file nothing ever truncates — and
+# KeepAlive restarts the daemon on ANY exit, including the exit(1) it takes when
+# another instance holds the lock. Running the daemon by hand (which README still
+# documents) alongside the LaunchAgent is therefore a permanent 5s restart loop
+# writing one line each time: ~17k lines/day, forever, into the file README points
+# you at. 0 disables. See DECISIONS.md#launchd-log.
+# (value set below, once _int_env exists — _log resolves it at call time)
+
+
+def _stderr_is_a_regular_file():
+    try:
+        import stat
+        return stat.S_ISREG(os.fstat(sys.stderr.fileno()).st_mode)
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _truncate_stderr_if_huge():
+    """Truncate rather than rotate, in place. launchd holds the file open in append
+    mode, so RENAMING it would leave the daemon writing to an unlinked inode and the
+    visible log permanently empty — the opposite of the intent. With O_APPEND a
+    truncate simply sends the next write to offset 0."""
+    if not DAEMON_LOG_MAX or not _stderr_is_a_regular_file():
+        return False
+    try:
+        if os.fstat(sys.stderr.fileno()).st_size <= DAEMON_LOG_MAX:
+            return False
+        os.ftruncate(sys.stderr.fileno(), 0)
+        return True
+    except OSError:
+        return False
+
+
 def _log(msg):
     """Daemon diagnostics -> stderr. systemd captures that into the journal, which
     is where README sends you (`journalctl --user -u herd`); a foreground daemon
-    shows it inline. The hooks' HERD_ERRLOG is theirs, not ours."""
+    shows it inline. The hooks' HERD_ERRLOG is theirs, not ours.
+
+    Bounded when stderr is a file (launchd) — see DAEMON_LOG_MAX. A no-op under
+    systemd and in a terminal, where stderr is not a regular file."""
+    if _truncate_stderr_if_huge():
+        print(f"{_now_iso()} herd.daemon: log exceeded {DAEMON_LOG_MAX} bytes — truncated",
+              file=sys.stderr, flush=True)
     print(f"{_now_iso()} herd.daemon: {msg}", file=sys.stderr, flush=True)
 
 
@@ -82,6 +122,9 @@ ATTENTION_SECS = {
 # Grace before a pid-NULL spawn reservation is swept as stranded. Must comfortably
 # exceed a kitty launch round trip + claude's startup to its first hook.
 STRANDED_SECS = _int_env("HERD_STRANDED_SECS", 120)
+
+# Bound for a stderr that is a FILE — see _truncate_stderr_if_huge. 0 disables.
+DAEMON_LOG_MAX = _int_env("HERD_DAEMON_LOG_MAX", 1048576)
 
 # One tick's `ps` must not outlive the tick. Generous — a loaded box can be slow —
 # but finite, because a hung ps freezes the reaper while the process stays alive,

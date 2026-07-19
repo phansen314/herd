@@ -337,3 +337,50 @@ def test_a_negative_stranded_secs_does_not_sweep_an_inflight_reservation(fresh, 
     pk = c.execute(W["W1_spawn_session"], {"cwd": "/x", "now": now}).lastrowid
     c.execute(W["W1_spawn_herd"], {"pk": pk, "job": "inflight", "now": now, "socket": SOCK})
     assert daemon.sweep_stranded(c, now, daemon._int_env("HERD_STRANDED_SECS", 120)) == 0
+
+
+# ── the daemon log is bounded when stderr is a FILE (launchd) ────────────────
+def test_daemon_log_truncates_a_file_stderr_that_grew_too_big(tmp_path, monkeypatch):
+    """launchd's StandardErrorPath is a plain file nothing rotates, and KeepAlive
+    restarts the daemon on ANY exit — including the exit(1) it takes when another
+    instance holds the lock. That is a permanent 5s loop appending one line each
+    time: ~17k lines/day into the file README tells you to tail."""
+    log = tmp_path / "daemon.err.log"
+    monkeypatch.setattr(daemon, "DAEMON_LOG_MAX", 200)
+    with open(log, "a") as fh:
+        monkeypatch.setattr(daemon.sys, "stderr", fh)
+        fh.write("x" * 5000)
+        fh.flush()
+        daemon._log("after the cap")
+    text = log.read_text()
+    assert len(text) < 5000, "log was not truncated"
+    assert "truncated" in text and "after the cap" in text
+
+
+def test_daemon_log_leaves_a_small_file_alone(tmp_path, monkeypatch):
+    log = tmp_path / "daemon.err.log"
+    monkeypatch.setattr(daemon, "DAEMON_LOG_MAX", 1_000_000)
+    with open(log, "a") as fh:
+        monkeypatch.setattr(daemon.sys, "stderr", fh)
+        fh.write("keep me\n")
+        daemon._log("second line")
+    assert "keep me" in log.read_text()
+
+
+def test_daemon_log_does_not_touch_a_non_file_stderr(monkeypatch):
+    """A no-op under systemd and in a terminal — journald rotates, a tty scrolls,
+    and truncating either is meaningless or harmful."""
+    import io
+    monkeypatch.setattr(daemon.sys, "stderr", io.StringIO())
+    assert daemon._truncate_stderr_if_huge() is False
+
+
+def test_daemon_log_bound_can_be_disabled(tmp_path, monkeypatch):
+    log = tmp_path / "daemon.err.log"
+    monkeypatch.setattr(daemon, "DAEMON_LOG_MAX", 0)
+    with open(log, "a") as fh:
+        monkeypatch.setattr(daemon.sys, "stderr", fh)
+        fh.write("y" * 5000)
+        fh.flush()
+        daemon._log("still appended")
+    assert len(log.read_text()) > 5000

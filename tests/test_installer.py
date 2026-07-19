@@ -992,3 +992,43 @@ def test_uninstall_refuses_conflicting_flags(monkeypatch, argv):
     been told to touch nothing. uninstall() has no dry mode to honour."""
     rc, called = _main_never_installs(monkeypatch, argv)
     assert rc == 2 and called == []
+
+
+# ── _launchctl must degrade, not raise (DECISIONS.md#launchd-log) ────────────
+def _fake_launchctl_bin(tmp_path, body):
+    d = tmp_path / "bin"
+    d.mkdir(exist_ok=True)
+    p = d / "launchctl"
+    p.write_text(f"#!/bin/sh\n{body}\n")
+    p.chmod(0o755)
+    return d
+
+
+def test_launchctl_never_raises_on_a_wedged_launchd(tmp_path, monkeypatch):
+    """`check=False` suppresses CalledProcessError; `timeout=` still RAISES
+    TimeoutExpired — in exactly the case LAUNCHCTL_TIMEOUT exists for. install()
+    calls install_service() AFTER rewriting settings.json and the wrapper, so an
+    escaping exception left the config changed, no daemon, and a traceback."""
+    monkeypatch.setenv("PATH", f"{_fake_launchctl_bin(tmp_path, 'sleep 30')}:{os.environ['PATH']}")
+    monkeypatch.setattr(inst, "LAUNCHCTL_TIMEOUT", 1)
+    r = inst._launchctl("print", "gui/501/x")        # must not raise
+    assert r.returncode != 0 and "timed out" in r.stderr
+
+
+def test_launchctl_never_raises_when_the_binary_is_gone(tmp_path, monkeypatch):
+    """_has_launchd() gates the normal path, but the binary can vanish between that
+    check and the five calls an install makes."""
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    r = inst._launchctl("print", "gui/501/x")
+    assert r.returncode != 0 and "launchctl" in r.stderr
+
+
+def test_a_wedged_launchd_reports_instead_of_crashing_the_install(tmp_path, monkeypatch):
+    """The whole point: the installer finishes and SAYS what went wrong."""
+    monkeypatch.setattr(inst, "PLIST", tmp_path / "herd.plist")
+    monkeypatch.setattr(inst, "HERD_DIR", tmp_path)
+    monkeypatch.setattr(inst, "_launchctl",
+                        lambda *a: subprocess.CompletedProcess(a, 124, "", "timed out"))
+    msg = inst.install_launchd()
+    assert "FAILED" in msg and "launchctl bootstrap" in msg   # names the manual fix
+    assert (tmp_path / "herd.plist").exists()                 # plist still written

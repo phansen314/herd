@@ -10,7 +10,7 @@ current behaviour that would break if the decision were undone.
 
 **By topic:** [the pager](#pager) · [attention/ack](#ack) · [reaper robustness](#ps-floor) ·
 [spawn TOCTOU](#toctou) · [the events table](#events) · [statement
-transcription](#transcription) · [ctrl-q](#expect) · [the poker](#poker) · [rows handoff](#rows-handoff) ·
+transcription](#transcription) · [ctrl-q](#expect) · [the poker](#poker) · [rows handoff](#rows-handoff) · [launchd log](#launchd-log) ·
 [pid ancestry](#spike1) · [the `live` column](#live-column) · [two clocks](#clocks) ·
 [HERD_RUNTIME](#runtime) · [awk vs bash](#awk) · [kitty match semantics](#kitty-match)
 
@@ -474,6 +474,45 @@ sessions" sleep, where no fzf is running. fzf 0.44.1 has no `print(...)` action,
 
 **Protects:** both quit keys going through `--expect`. A bind-based "simplification"
 makes the dashboard unquittable.
+
+## 2026-07-19 — launchd needs a bounded log and a launchctl that cannot raise {#launchd-log}
+
+Two gaps found reviewing the macOS port. Both are places where the launchd half is
+not yet equal to the systemd half it deliberately mirrors.
+
+**`_launchctl` claimed it could not raise, and could.** `check=False` suppresses
+`CalledProcessError`; `timeout=` still raises `TimeoutExpired` — in exactly the case
+`LAUNCHCTL_TIMEOUT` was added for, a wedged launchd. It matters because of *where*:
+`install()` calls `install_service()` AFTER settings.json and the statusline wrapper
+have been rewritten, so the exception left the config changed, no daemon installed,
+and a traceback where the summary belongs. Up to five launchctl calls run per
+install, so worst case was ~75s of hang first. It now returns a nonzero
+`CompletedProcess` (124 timeout, 127 OSError), which every caller's existing
+`returncode != 0` handling already covers.
+
+**The launchd log had no bound, and a realistic way to fill it.** `KeepAlive: true`
+restarts the daemon on ANY exit — including the `exit(1)` it takes when another
+instance holds the lock. README still documents running the daemon by hand, so doing
+that alongside the LaunchAgent is a permanent 5s restart loop appending one line
+each time: **~17k lines/day, forever**, into `~/.herd/daemon.err.log` — the file
+README tells you to tail. journald rotates and a terminal scrolls; a
+`StandardErrorPath` file is the one sink nothing truncates, and the hooks' own
+errlog has had a cap since day one.
+
+`KeepAlive: true` stays: the alternatives restart on strictly fewer conditions, and
+a reaper that stopped is invisible (sessions just never leave `herd ls`). So the
+bound goes on the log instead. `_log` truncates when stderr is a REGULAR FILE and
+over `DAEMON_LOG_MAX` — a no-op under systemd and in a terminal, where stderr is a
+socket or a tty.
+
+**Truncate in place, never rename.** launchd holds the file open in append mode, so
+renaming it would leave the daemon writing to an unlinked inode and the visible log
+permanently empty — the exact opposite of the intent. With `O_APPEND` a truncate
+sends the next write to offset 0.
+
+**Protects:** `test_launchctl_never_raises` and the daemon log-bound tests. Note
+what is NOT protected: nothing verifies any of this on macOS itself until the CI
+matrix runs there — which is why that landed with it.
 
 ## 2026-07-18 — fzf reloads from a file, not a second interpreter {#rows-handoff}
 
