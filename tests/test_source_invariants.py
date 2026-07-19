@@ -213,3 +213,13 @@ def test_preview_reads_live_sessions_only_through_r1_list():
 def test_every_hook_is_executable(shf):
     """settings.json execs these paths directly; a missing +x is a silent no-op."""
     assert os.access(shf, os.X_OK), f"{shf.name} is not executable"
+
+
+def test_every_statement_is_documented():
+    """DESIGN.md's write-paths table is the map for these statements, and a
+    statement missing from it is invisible to anyone reading the design rather than
+    the SQL. Two of the three gaps this caught were added the same day the table
+    was last edited — the omission is easy and silent, so it gets a check."""
+    design = (ROOT / "DESIGN.md").read_text()
+    missing = sorted(n for n in W if n not in design)
+    assert not missing, f"statements absent from DESIGN.md: {missing}"
