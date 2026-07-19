@@ -115,10 +115,17 @@ WHERE herd_sessions.kitty_socket IS NOT excluded.kitty_socket
 -- the PROCESS TABLE, never kitty. See DESIGN.md#liveness.
 
 -- W3d: reap one session the daemon found dead. status_source='pid' (inferred).
+-- :pid is NOT redundant with the caller's SELECT — it is what makes this statement
+-- self-validating. reap_once reads (id, pid), forks `ps` (up to PS_TIMEOUT), then
+-- writes. A resume landing in that window sets a NEW pid and clears stopped_at, and
+-- keyed on id alone this reaped a live process it had never observed. Re-asserting
+-- the pid the decision was made about turns the race into a 0-row no-op. Every other
+-- statement acting on a prior read (W3f, W2c_pid_claim, W2_adopt, W6c_ack) does the
+-- same. This one was the outlier.
 -- :name W3d_reap
 UPDATE sessions SET status = 'stopped', status_source = 'pid',
                     stopped_at = :now, updated_at = :now
-WHERE id = :pk AND stopped_at IS NULL;
+WHERE id = :pk AND stopped_at IS NULL AND pid = :pid;
 
 -- W3f: STRANDED RESERVATION SWEEP. A phase-1 spawn reservation whose claude never
 -- reached SessionStart: the launcher raised, claude died before its first hook, or
@@ -135,10 +142,20 @@ WHERE stopped_at IS NULL AND pid IS NULL AND session_id IS NULL
 
 -- W3e: BOOT SWEEP (once at startup). After a reboot, pids may be recycled, so
 -- W3d's liveness check can read a dead session as alive. See DESIGN.md#pid.
+-- started_at ALONE IS NOT EVIDENCE OF DEATH. W2b_insert's ON CONFLICT branch
+-- deliberately preserves started_at (so duration is total age) while setting a
+-- fresh pid and clearing stopped_at, so a RESUMED session carries a pre-boot
+-- started_at with a live post-boot process. Sweeping on started_at alone reaped it
+-- — and because boot_time is fixed, re-reaped it on every subsequent daemon start,
+-- undoing any manual recovery.
+-- last_event_at is the honest liveness signal here. Every hook advances it, so a
+-- session that has done anything since boot is spared, and a genuine pre-boot
+-- corpse (last_event_at older than boot, or never set) is still swept.
 -- :name W3e_boot_sweep
 UPDATE sessions SET status = 'stopped', status_source = 'pid',
                     stopped_at = :now, updated_at = :now
-WHERE stopped_at IS NULL AND started_at < :boot_time;
+WHERE stopped_at IS NULL AND started_at < :boot_time
+  AND (last_event_at IS NULL OR last_event_at < :boot_time);
 
 
 -- ── W4. LIFECYCLE HOOKS. The single lifecycle write: status + last_event_* on
@@ -147,6 +164,15 @@ WHERE stopped_at IS NULL AND started_at < :boot_time;
 -- silent and paging you about it. sessions.last_event_at is the ONLY event signal
 -- anything reads — there is no second (events-log) write to keep in sync anymore.
 -- See DESIGN.md#two-clocks.
+-- The stopped_at guard is what every other live-row write already carries (W4_end,
+-- W5_statusline, W2_adopt, W5b_adopt). Its absence here was the reason a wrongly
+-- reaped session could never recover. The hooks keep firing, but this statement
+-- cannot clear stopped_at, and R1_list filters on it — so the session stayed
+-- invisible for the rest of its life instead of healing on the next tool call. It
+-- also produced rows that were status='working' AND stopped, a combination the
+-- CHECK permits and no reader expects.
+-- NOT the forbidden `status IS NOT :status` guard — that one would break the
+-- attention timer. Liveness is a different predicate.
 -- :name W4_event
 UPDATE sessions
 SET status          = :status,
@@ -154,7 +180,7 @@ SET status          = :status,
     last_event_at   = :now,
     last_event_type = :etype,
     updated_at      = :now
-WHERE session_id = :session_id;
+WHERE session_id = :session_id AND stopped_at IS NULL;
 
 -- W4b: SESSION END — the only hook-driven death. status_source='hook' (it KNOWS,
 -- vs W3d's inference). session_end.sh MUST be registered BLOCKING.
@@ -284,6 +310,23 @@ FROM sessions s WHERE s.session_id = :session_id;
 SELECT h.session_pk FROM herd_sessions h
 JOIN sessions s ON s.id = h.session_pk
 WHERE h.job_name = :job AND s.stopped_at IS NULL;
+
+-- Is there an unadopted reservation in this window — i.e. something for statusline
+-- Path C to adopt later? Exactly W2_adopt's target predicate, as a read.
+--
+-- session_start.sh needs this to tell two very different situations apart after a
+-- FAILED W2_adopt: a spawn reservation waiting to be claimed (deferring is right,
+-- Path C will get it) versus nothing at all, which is every user-started claude
+-- (deferring loses the session permanently — Path C only ever UPDATEs, so with no
+-- row there is nothing to adopt and SessionStart never fires again).
+--
+-- A read answers even while the write lock is held: WAL readers do not block on a
+-- writer. So this is reliable in precisely the case that made W2_adopt fail.
+-- :name R_window_unadopted
+SELECT 1 FROM herd_sessions h
+JOIN sessions s ON s.id = h.session_pk
+WHERE h.kitty_socket = :socket AND h.window_id = :win
+  AND s.stopped_at IS NULL AND s.session_id IS NULL;
 
 
 -- ── R1. The ONE live-session read: sessions + herd_sessions + herd_attention,

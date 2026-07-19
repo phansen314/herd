@@ -41,12 +41,29 @@ fi
 # spawn reservation kept the job_name, so the live session was left unnamed and
 # `herd jump <job>` could never find it again.
 #
-# Deferring is safe: statusline Path C (W5b_adopt) retries adoption on the same
-# (socket, window_id) about once a second, and claims the reservation as soon as
-# the lock clears — long before W3f's stranded sweep would reclaim it.
+# But deferring unconditionally was worse than the bug it fixed. Path C only ever
+# UPDATEs an existing reservation, so it can rescue a SPAWNED session and nothing
+# else. For a user-started claude there is no row at all: W5_statusline matches
+# nothing, W5b_adopt has nothing to adopt, and SessionStart never fires again — so
+# one transient SQLITE_BUSY made that session invisible to herd for its entire life.
+#
+# So ask which situation this is. R_window_unadopted is a READ, and WAL readers do
+# not block on a writer, meaning it answers reliably in exactly the case that made
+# the write fail. A reservation exists -> defer, Path C has it. Nothing there ->
+# insert, because an unnamed-but-visible session beats a lost one.
 if [ "$W2_RC" -ne 0 ]; then
-    herd_log "W2_adopt failed (rc=$W2_RC) — deferring to statusline adoption"
-    exit 0
+    DEFER=1
+    if [ "$IN_KITTY" = "1" ]; then
+        [ -n "$(run R_window_unadopted 2>/dev/null)" ] || DEFER=0
+    else
+        DEFER=0            # no window, so no reservation could ever exist
+    fi
+    if [ "$DEFER" = "1" ]; then
+        herd_log "W2_adopt failed (rc=$W2_RC) — reservation present, deferring to statusline"
+        exit 0
+    fi
+    herd_log "W2_adopt failed (rc=$W2_RC) — no reservation to adopt, inserting"
+    ADOPTED=0
 fi
 
 # W2 missed: insert the session (+ its placement when in kitty) in ONE txn.

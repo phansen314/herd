@@ -166,8 +166,11 @@ def reap_once(conn, procs, now):
     ).fetchall()
     for r in rows:
         if _dead(r["pid"], procs):
-            conn.execute(W["W3d_reap"], {"pk": r["id"], "now": now})
-            reaped += 1
+            # Pass the pid we JUDGED, not the row's current one — W3d_reap re-asserts
+            # it, so a resume that landed since the SELECT is a 0-row no-op instead of
+            # a live session reaped on evidence about a pid it no longer holds.
+            reaped += conn.execute(
+                W["W3d_reap"], {"pk": r["id"], "now": now, "pid": r["pid"]}).rowcount
     return reaped
 
 

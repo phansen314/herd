@@ -252,6 +252,56 @@ could not read, states that nothing changed, prints usage, and exits 2. `--help`
 **Protects:** `test_installer.py::test_unreadable_argv_installs_nothing` and
 `test_known_flags_still_route`.
 
+## 2026-07-18 — Four ways a LIVE session could vanish {#lost-sessions}
+
+An audit found four defects that share one shape: herd concluding a session was
+dead, or never recording it at all, on evidence that did not support the
+conclusion. All four are reproduced in the suite.
+
+**A failed adopt threw away every user-started session.** `session_start.sh`
+deferred to statusline Path C whenever `W2_adopt` failed (a locked DB being the
+common case). But Path C is an `UPDATE` — it can only rescue a session that has a
+spawn *reservation* to adopt. A user-started `claude` has no row at all, so there
+was nothing to adopt and SessionStart never fires again. Verified: with the write
+lock held across the hook, **0 rows**, and that session stayed invisible to
+`herd ls` for its entire life. One transient `SQLITE_BUSY` was enough.
+
+The fix is to tell the two situations apart with `R_window_unadopted`, a read.
+WAL readers do not block on a writer, so the read answers reliably in exactly the
+case that made the write fail. Reservation present → defer, Path C has it. Nothing
+there → insert, because an unnamed-but-visible session beats a lost one.
+
+**`W3e_boot_sweep` reaped resumed sessions.** It swept on `started_at < boot_time`
+with no liveness predicate, and `W2b_insert`'s ON CONFLICT branch deliberately
+preserves `started_at` while installing a fresh pid — so a resumed session looks
+pre-boot forever. `boot_time` is fixed, so it re-killed on every daemon restart,
+undoing manual recovery. Now also requires `last_event_at` to predate boot, which
+is the honest signal: every hook advances it.
+
+**`W3d_reap` reaped pids it never observed.** It keyed on `id` alone while the
+decision was made from a `(id, pid)` SELECT plus a `ps` fork of up to 5s. A resume
+landing in that window was reaped on evidence about a pid the row no longer held.
+Now re-asserts `AND pid = :pid`, making the race a 0-row no-op — the same
+self-validation `W3f`, `W2c_pid_claim`, `W2_adopt` and `W6c_ack` already had.
+
+**`W4_event` wrote to dead rows.** The only live-row write without a
+`stopped_at IS NULL` guard, so a stopped session's hooks produced rows that were
+`status='working'` AND stopped — a combination the CHECK permits and no reader
+expects.
+
+Worth being precise about that last one, because the first instinct is wrong: the
+guard does **not** make a wrongly-stopped session recover. It makes the row
+*consistent*. Recovery only ever comes from `W2b_insert`'s ON CONFLICT clearing
+`stopped_at` on resume. The reason wrong reaps were permanent is fixed at source
+by the three defects above, not here.
+
+**Protects:** `test_failed_adopt_with_no_reservation_inserts_rather_than_deferring`
+and its two siblings, `test_boot_sweep_spares_a_resumed_session`,
+`test_reap_does_not_fire_when_the_pid_changed_since_the_select`,
+`test_w4_event_does_not_resurrect_metadata_on_a_stopped_row`. Deleting the
+deferral's read-check reinstates the duplicate-row bug it replaced, so the two
+adopt tests must be kept as a pair.
+
 ## 2026-07-18 — Two preview formatters, pinned byte-for-byte {#preview-twins}
 
 The picker's `--preview` is re-run by fzf on **every highlight change**. Measured:

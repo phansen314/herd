@@ -1,6 +1,7 @@
 """N (47-57b) — the hooks end to end: the real bash scripts run against a temp DB.
 Nothing but this exercises the bash + writes.sql seam."""
 import os
+import pathlib
 import subprocess
 
 import pytest
@@ -362,3 +363,82 @@ def test_db_errfile_is_reaped_on_signal_death(hook_env, sig):
     os.killpg(os.getpgid(p.pid), getattr(signal, f"SIG{sig}"))
     p.wait(timeout=10)
     assert not errfile.exists(), f"errfile leaked on SIG{sig}"
+
+
+# ── a wrongly-stopped session must heal, and a failed adopt must not lose one ──
+def test_w4_event_does_not_resurrect_metadata_on_a_stopped_row(hook_env):
+    """W4_event was the only live-row write with no stopped_at guard. It could not
+    clear stopped_at, so a wrongly reaped session stayed invisible to R1_list for the
+    rest of its life while its hooks kept firing — and it left rows that were
+    status='working' AND stopped, which no reader expects."""
+    c = hook_env.conn()
+    pk = mk_session(c, session_id="s1", cwd="/x", status="working")
+    c.execute("UPDATE sessions SET stopped_at=?, status='stopped' WHERE id=?", (T0, pk))
+    hook_env.run("post_tool_use.sh", {"session_id": "s1"})
+    r = c.execute("SELECT status,stopped_at FROM sessions WHERE id=?", (pk,)).fetchone()
+    assert r["stopped_at"] == T0 and r["status"] == "stopped"
+
+
+def test_w4_event_still_writes_a_live_row(hook_env):
+    c = hook_env.conn()
+    pk = mk_session(c, session_id="s1", cwd="/x", status="waiting")
+    hook_env.run("post_tool_use.sh", {"session_id": "s1"})
+    r = c.execute("SELECT status,last_event_type FROM sessions WHERE id=?", (pk,)).fetchone()
+    assert r["status"] == "working" and r["last_event_type"] == "tool"
+
+
+def _readonly_db(hook_env):
+    """Make every WRITE fail while READS still succeed — the shape of a locked DB,
+    but deterministic and instant instead of a 3s busy_timeout."""
+    os.chmod(hook_env.path, 0o444)
+    return lambda: os.chmod(hook_env.path, 0o644)
+
+
+def test_failed_adopt_with_no_reservation_inserts_rather_than_deferring(hook_env):
+    """THE bug: deferring to statusline Path C only works for a SPAWNED session.
+    Path C is an UPDATE, so with no reservation there is nothing to adopt — and
+    SessionStart never fires again. One transient SQLITE_BUSY made a user-started
+    claude invisible to herd for its entire life."""
+    restore = _readonly_db(hook_env)
+    try:
+        hook_env.run("session_start.sh",
+                     {"session_id": "user-started", "cwd": "/x", "model": "m",
+                      "source": "startup", "transcript_path": "/t"},
+                     {"KITTY_WINDOW_ID": "5", "KITTY_LISTEN_ON": SOCK})
+    finally:
+        restore()
+    log = pathlib.Path(hook_env.runtime, "err.log").read_text()
+    assert "no reservation to adopt, inserting" in log, log
+    assert "deferring" not in log
+
+
+def test_failed_adopt_with_a_reservation_present_still_defers(hook_env):
+    """The other half — deferring is correct when there IS something for Path C to
+    claim. Losing this would reinstate the duplicate-row bug that created the
+    deferral: a second row for the window while the reservation keeps the job_name."""
+    c = hook_env.conn()
+    pk = mk_session(c, session_id=None, cwd="/x", status="unknown")   # reservation
+    mk_herd(c, pk, job_name="api", window_id=5, kitty_socket=SOCK)
+    restore = _readonly_db(hook_env)
+    try:
+        hook_env.run("session_start.sh",
+                     {"session_id": "spawned", "cwd": "/x", "model": "m",
+                      "source": "startup", "transcript_path": "/t"},
+                     {"KITTY_WINDOW_ID": "5", "KITTY_LISTEN_ON": SOCK})
+    finally:
+        restore()
+    log = pathlib.Path(hook_env.runtime, "err.log").read_text()
+    assert "reservation present, deferring" in log, log
+
+
+def test_failed_adopt_outside_kitty_always_inserts(hook_env):
+    """No window means no reservation can exist, so there is nothing to defer to."""
+    restore = _readonly_db(hook_env)
+    try:
+        hook_env.run("session_start.sh",
+                     {"session_id": "nokitty", "cwd": "/x", "model": "m",
+                      "source": "startup", "transcript_path": "/t"})
+    finally:
+        restore()
+    log = pathlib.Path(hook_env.runtime, "err.log").read_text()
+    assert "no reservation to adopt, inserting" in log, log

@@ -9,7 +9,7 @@ import sys
 import herd.daemon as daemon
 from herd.daemon import reap_once, boot_sweep, _parse_proc_table, _dead, read_proc_table
 
-from helpers import T0, T1, T2, mk_session, stopped_at
+from helpers import T0, T1, T2, W, mk_session, stopped_at
 
 SRC = pathlib.Path(__file__).resolve().parent.parent / "src"
 
@@ -250,3 +250,58 @@ def test_the_lock_dies_with_its_holder(tmp_path):
         holder.kill()
         holder.wait()
     assert daemon.acquire_single_instance(str(lock)) is True        # released by -9
+
+
+# ── the reaper must not kill sessions it never observed as dead ───────────────
+def test_boot_sweep_spares_a_resumed_session(fresh):
+    """W2b_insert's ON CONFLICT deliberately preserves started_at, so a RESUMED
+    session carries a pre-boot started_at with a live post-boot process. Sweeping on
+    started_at alone reaped it — and since boot_time is fixed, re-reaped it on every
+    later daemon start, undoing any manual recovery."""
+    c = fresh()
+    pre_boot, boot, after = "2026-07-14T08:00:00.000Z", "2026-07-15T09:00:00.000Z", "2026-07-15T09:30:00.000Z"
+    c.execute(W["W2b_insert"], {"session_id": "abc", "cwd": "/x", "model": "m",
+                                "transcript": "/t", "pid": 4242, "now": pre_boot})
+    c.execute(W["W2b_insert"], {"session_id": "abc", "cwd": "/x", "model": "m",
+                                "transcript": "/t", "pid": 9999, "now": after})   # resume
+    r = c.execute("SELECT started_at,last_event_at FROM sessions").fetchone()
+    assert r["started_at"] == pre_boot and r["last_event_at"] == after   # the trap
+    boot_sweep(c, "2026-07-15T10:00:00.000Z", boot)
+    assert stopped_at(c, 1) is None, "reaped a live resumed session"
+    assert len(c.execute(W["R1_list"]).fetchall()) == 1
+
+
+def test_boot_sweep_still_reaps_a_genuine_pre_boot_corpse(fresh):
+    """The guard must not defang the sweep: a row that has done nothing since boot
+    is exactly what it exists to clear."""
+    c = fresh()
+    mk_session(c, session_id="old", pid=4242, started_at="2026-07-14T08:00:00.000Z",
+               last_event_at="2026-07-14T08:05:00.000Z")
+    boot_sweep(c, "2026-07-15T10:00:00.000Z", "2026-07-15T09:00:00.000Z")
+    assert stopped_at(c, 1) is not None
+
+
+def test_boot_sweep_reaps_a_row_that_never_had_an_event(fresh):
+    c = fresh()
+    mk_session(c, session_id="never", pid=4242, started_at="2026-07-14T08:00:00.000Z",
+               last_event_at=None)
+    boot_sweep(c, "2026-07-15T10:00:00.000Z", "2026-07-15T09:00:00.000Z")
+    assert stopped_at(c, 1) is not None
+
+
+def test_reap_does_not_fire_when_the_pid_changed_since_the_select(fresh):
+    """reap_once reads (id, pid), forks `ps` (up to 5s), then writes. A resume in
+    that window installs a new pid and clears stopped_at; keyed on id alone the
+    daemon reaped a live process it had never observed."""
+    c = fresh()
+    c.execute(W["W2b_insert"], {"session_id": "abc", "cwd": "/x", "model": "m",
+                                "transcript": "/t", "pid": 4242, "now": T0})
+    pk = c.execute("SELECT id FROM sessions").fetchone()[0]
+    # the daemon judged pid 4242 dead; meanwhile the row moved to 7777
+    c.execute(W["W2b_insert"], {"session_id": "abc", "cwd": "/x", "model": "m",
+                                "transcript": "/t", "pid": 7777, "now": T1})
+    n = c.execute(W["W3d_reap"], {"pk": pk, "now": T2, "pid": 4242}).rowcount
+    assert n == 0
+    assert stopped_at(c, pk) is None
+    # and the ordinary case still reaps
+    assert c.execute(W["W3d_reap"], {"pk": pk, "now": T2, "pid": 7777}).rowcount == 1
