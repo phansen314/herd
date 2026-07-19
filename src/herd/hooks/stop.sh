@@ -7,7 +7,7 @@
 __d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."
 . "$__d/common.sh" || { echo "herd: cannot source $__d/common.sh" >&2; exit 1; }
 
-INPUT=$(cat)
+read_input
 SID=$(jq_in -r '.session_id // empty')
 valid_sid "$SID" || exit 0
 now_pair

@@ -227,3 +227,108 @@ def test_session_start_leaves_pid_null_when_no_claude_ancestor(hook_env):
                  {"HERD_CLAUDE_NAME": "definitely-not-a-real-process-name"})
     pid = c.execute("SELECT pid FROM sessions WHERE session_id='nopid-uuid'").fetchone()[0]
     assert pid is None
+
+
+# ── fork-reduction refactor: the merged paths must equal the paths they replaced ──
+def _sh(script, env=None, stdin=""):
+    e = dict(os.environ)
+    if env:
+        e.update(env)
+    return subprocess.run(["bash", "-c", f'. "{HOOKS}/common.sh"; {script}'],
+                          input=stdin, capture_output=True, text=True, env=e)
+
+
+@pytest.mark.parametrize("name", sorted(W))
+def test_stmt_bind_equals_stmt_then_bind(name):
+    """run()/run_tx() extract-and-bind in ONE awk fork now. stmt() and bind() still
+    exist as the separately-tested halves, so the merged path is a SECOND copy of
+    the substitution rule unless the two are pinned together — which is exactly the
+    drift this repo guards everywhere else.
+
+    Bound with a full param environment so the comparison exercises real
+    substitution rather than two identical 'unbound' outputs."""
+    env = {f"HERD_P_{p}": f"v-{p}" for p in (
+        "session_id", "now", "status", "etype", "pk", "cutoff", "boot_time", "job",
+        "socket", "win", "cwd", "model", "sname", "ctx", "cost", "branch", "pid",
+        "rl5", "rl5reset", "rl7", "rl7reset", "ctxsize", "ocwd", "ladd", "ldel",
+        "tokin", "tokout", "ver", "gwt", "exc200", "ostyle", "apims", "id",
+        "transcript", "source", "created_at", "verified_at", "herd_var")}
+    merged = _sh(f'stmt_bind {name}', env)
+    composed = _sh(f'bind "$(stmt {name})"', env)
+    assert merged.stdout == composed.stdout, f"{name}: merged != composed"
+    assert (merged.returncode == 0) == (composed.returncode == 0)
+
+
+def test_stmt_bind_reports_unbound_like_bind_does():
+    """An unbound param must still fail the statement rather than sending `:name`
+    to sqlite as a literal."""
+    r = _sh('stmt_bind W4_event', {"HERD_P_session_id": "s"})   # :now/:status unbound
+    assert r.returncode != 0
+    assert "unbound param" in r.stderr
+
+
+def test_stmt_bind_cuts_on_the_raw_semicolon_not_a_bound_value():
+    """The `;` that ends a statement is found on the RAW line. A bound VALUE may
+    contain one — a cwd or a /rename can — and cutting there would ship a truncated
+    statement to sqlite."""
+    r = _sh('stmt_bind W4_event', {"HERD_P_session_id": "a;DROP TABLE sessions;--",
+                                   "HERD_P_now": "n", "HERD_P_status": "working",
+                                   "HERD_P_etype": "tool"})
+    assert r.returncode == 0
+    assert r.stdout.rstrip().endswith(";")
+    assert "'a;DROP TABLE sessions;--'" in r.stdout    # quoted, inert, intact
+
+
+def test_unknown_statement_is_empty_not_an_unbound_error():
+    """run() distinguishes these by emptiness, so stmt_bind must return nothing
+    (not an error line) for a name that does not exist."""
+    r = _sh('stmt_bind W_NOPE_NOT_A_STATEMENT')
+    assert r.stdout == ""
+
+
+def test_read_input_slurps_stdin_without_a_fork():
+    """Replaced `INPUT=$(cat)`. NOT $(</dev/stdin) — Claude's invocation leaves that
+    empty, which is why the comment in session_start.sh warns about it."""
+    payload = '{"a": 1, "b": "two words", "c": null}'
+    r = _sh('read_input; printf "%s" "$INPUT"', stdin=payload)
+    assert r.stdout == payload
+
+
+def test_read_input_keeps_interior_whitespace_and_blank_lines():
+    """IFS= matters: without it read strips leading/trailing whitespace."""
+    payload = '  {"a":\n\n  1}  '
+    r = _sh('read_input; printf "[%s]" "$INPUT"', stdin=payload)
+    assert r.stdout == f"[{payload}]"
+
+
+def test_now_pair_falls_back_when_date_has_no_percent_3n(tmp_path):
+    """macOS/BSD date leaves %3N unexpanded. The old code paid a `date -u +%3N`
+    probe at SOURCE time — every hook fire, ~1/sec/session — to learn this; now the
+    real call detects it and latches. A regression here writes a last_event_at of
+    '...:00.3NZ', which no consumer can parse."""
+    fake = tmp_path / "date"
+    fake.write_text('#!/bin/bash\nargs=(); for a in "$@"; do args+=("${a//%3N/3N}"); done\n'
+                    'exec /usr/bin/date "${args[@]}"\n')
+    fake.chmod(0o755)
+    env = {"PATH": f"{tmp_path}:{os.environ['PATH']}"}
+    r = _sh('now_pair; echo "$NOW_ISO|$NOW_EPOCH"', env)
+    iso, _, epoch = r.stdout.strip().partition("|")
+    assert iso.endswith(".000Z"), iso
+    assert "3N" not in iso
+    assert epoch.isdigit()
+
+
+def test_now_pair_gives_millis_on_gnu_date():
+    r = _sh('now_pair; echo "$NOW_ISO"')
+    iso = r.stdout.strip()
+    assert iso.endswith("Z") and iso[-5:-1].lstrip(".").isdigit(), iso
+
+
+def test_db_leaves_no_errfile_behind(hook_env):
+    """db() truncates one per-process errfile and an EXIT trap reaps it, instead of
+    forking `rm` per call. The trap is the only thing deleting it now."""
+    import pathlib
+    r = hook_env.run("post_tool_use.sh", {"session_id": "s1"})
+    assert r.returncode == 0
+    debris = list(pathlib.Path(hook_env.runtime).glob("herd-db-err.*"))
+    assert debris == [], f"errfile debris: {debris}"

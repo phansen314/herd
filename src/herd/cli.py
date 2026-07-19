@@ -18,6 +18,7 @@ layer would only be a second rendering path to keep in sync with `ls`. See cmd_w
 """
 import argparse
 import os
+import pathlib
 import shlex
 import shutil
 import subprocess
@@ -145,6 +146,33 @@ def _has_fzf():
     return bool(shutil.which("fzf")) and sys.stdin.isatty()
 
 
+# The CHECKOUT copy, deliberately — NOT ~/.herd/hooks. The installed copy exists so
+# a `git checkout` cannot change what RUNNING CLAUDE SESSIONS execute; this pane is
+# spawned by a herd process that already runs checkout code and already read
+# writes.sql from the checkout via load_statements(). Pointing it at ~/.herd would
+# let the list and its own preview read two different R1_list definitions.
+_PREVIEW_SH = pathlib.Path(__file__).resolve().parent / "hooks" / "preview.sh"
+
+
+def _preview_cmd():
+    """The pane's command, re-run by fzf on EVERY highlight change.
+
+    bash+sqlite (~6ms) instead of the python verb (~78ms, ~60 of it bare
+    interpreter startup — nothing inside cmd_preview was the problem). The verb
+    stays as the fallback: a pip/zip install can drop the mode bit, and a blank
+    preview pane is a bad way to find that out. Invoked as argv[0], not
+    `bash <path>`, so a lost +x lands here rather than silently no-oping.
+
+    fzf runs this through `sh -c`, so the PATH needs shell quoting — a checkout
+    (previously a venv) under a directory with a space silently broke the pane and
+    ctrl-r refresh. `{1}` stays UNQUOTED: fzf quotes placeholder substitutions
+    itself, so quoting here would nest them.
+    """
+    if os.access(_PREVIEW_SH, os.X_OK):
+        return f"{shlex.quote(str(_PREVIEW_SH))} {{1}}"
+    return f"{shlex.quote(sys.executable)} -m herd.cli preview {{1}}"
+
+
 def _fzf_run(rows, query, extra=()):
     """Run the picker, return its raw stdout. watch needs the raw text: with
     --expect the pressed key is the first line, and that is its only way to tell
@@ -157,10 +185,7 @@ def _fzf_run(rows, query, extra=()):
     Capture ONLY stdout (the selection). fzf draws its UI to stderr/the tty — piping
     stderr (capture_output=True) makes the picker invisible and looks like a hang.
     """
-    # fzf runs preview/reload strings through `sh -c`, so the interpreter path
-    # needs shell quoting: a venv under a directory with a space silently broke
-    # the preview pane and ctrl-r refresh.
-    preview = f"{shlex.quote(sys.executable)} -m herd.cli preview {{1}}"  # {1} = hidden id
+    preview = _preview_cmd()
     p = subprocess.run(
         ["fzf", "--delimiter", "\t", "--with-nth", "2..", "--reverse",
          "--height", "60%", "--query", query, "--prompt", "jump ▸ ",

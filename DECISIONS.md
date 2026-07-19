@@ -198,6 +198,67 @@ query: `R1_list` sat unused while the CLI's private copy missed the
 `test_source_invariants.py::test_no_hook_inlines_dml`. Any inline SQL is the rot
 these exist to prevent.
 
+## 2026-07-18 — The statusline paid for eight forks it did not need {#statusline-forks}
+
+`statusline.sh` fires ~1/sec **per session**, and its fingerprint cache cannot
+absorb that: the cache covers every field it sinks, and token counts move every
+tick, so an active session takes the miss path essentially always. The cache is an
+**idle**-path optimization; the fork count is what an active herd pays.
+
+Measured 19 execs, 28.8ms/tick. Five removals, none of them semantic:
+
+| removed | measured |
+|---|---|
+| `INPUT=$(cat)` → `read_input` (`read -r -d ''`), all six hooks | 2.9ms |
+| two `date -d @epoch` reset formats → `strflocaltime` in the jq already running | 1.25ms |
+| `date -u +%3N` probe at source time → detect from the real `now_pair` call | 0.6ms |
+| `rm` per `db()` call → one errfile + an `EXIT` trap | ~1.8ms |
+| `stmt` + `bind` (2 awk) → `stmt_bind` (1 awk) | ~1.8ms |
+
+**Result: 11 execs, 18.2ms/tick — 37% off.** Rendered output is byte-identical.
+
+Two things worth keeping in mind, both of which bit during the change:
+
+The jq filter is one **single-quoted bash string**, so an apostrophe in a comment
+inside it ends the quote and hands the rest of the program to the shell. It fails
+as a silent parse error — every field empty, nothing sunk, exit 0.
+
+`strflocaltime` gets padded `%I`/`%m`/`%d` with the leading zeros removed by jq's
+own `sub()`, **not** `%-I`. jq calls the system strftime and BSD has no `-` flag,
+so the GNU-only form would emit the format string literally on macOS. This is the
+same portability split the two-branch `date -d`/`date -r` fallback existed to
+straddle — moving it into jq is what let that fallback go.
+
+**Protects:** `test_reset_stamps_match_what_date_produced` (GNU `date` is the
+reference the old code used), `test_now_pair_falls_back_when_date_has_no_percent_3n`,
+`test_stmt_bind_equals_stmt_then_bind`, `test_db_leaves_no_errfile_behind`.
+
+## 2026-07-18 — Two preview formatters, pinned byte-for-byte {#preview-twins}
+
+The picker's `--preview` is re-run by fzf on **every highlight change**. Measured:
+`python -m herd.cli preview` **78ms**, of which ~60ms is bare interpreter startup —
+`python3 -c pass` costs the same, so nothing inside `cmd_preview` was worth
+optimizing. `hooks/preview.sh` renders the identical pane in **~6ms**.
+
+`uv run` was investigated and rejected: it does not address interpreter startup.
+The apparent win in a first measurement was a cleaner `site` — the system
+interpreter was paying ~9ms for editable-install `.pth` hooks — not uv.
+
+**Decided:** keep both formatters. `cli._preview_text` is the fallback when the
+script loses its `+x` (a pip/zip install can drop the mode bit, and a blank pane is
+a bad way to discover that) and the reference the bash twin is pinned against.
+
+This is a deliberate exception to [#transcription](#transcription), which is why
+the pin is stricter than usual: `test_preview_bash.py` asserts the two produce
+**identical bytes** across every row shape that can diverge — all-NULL (the em-dash
+path), `cost=0.0` (`$0.00`, the falsy-vs-None trap), each rung of the name-fallback
+ladder, each attention glyph including the `❗` unknown-status branch, armed-but-acked
+(line suppressed), and a `session_name` containing a newline. The SQL itself is *not*
+duplicated — preview.sh pulls `R1_list` through `stmt()` like everything else.
+
+**Protects:** `test_preview_bash.py` and
+`test_source_invariants.py::test_preview_reads_live_sessions_only_through_r1_list`.
+
 ## 2026-07-18 — `ctrl-q` needs `--expect`, not a bind {#expect}
 
 `herd watch` re-enters fzf on every exit, so quitting has to be distinguishable from

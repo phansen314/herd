@@ -10,7 +10,7 @@
 __d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."
 . "$__d/common.sh" || { echo "herd: cannot source $__d/common.sh" >&2; exit 1; }
 
-INPUT=$(cat)     # NEVER $(</dev/stdin) — Claude's invocation makes that empty.
+read_input      # see common.sh: NOT $(</dev/stdin), which Claude leaves empty
 
 { read -r SID; read -r CWD; read -r MODEL; read -r TRANSCRIPT; } <<JQ
 $(jq_in -r '.session_id // "", .cwd // "", .model // "", .transcript_path // ""')

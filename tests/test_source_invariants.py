@@ -190,6 +190,18 @@ def test_no_hook_inlines_dml():
     assert not offenders, f"inlined DML at {offenders}"
 
 
+def test_preview_reads_live_sessions_only_through_r1_list():
+    """The bash twin of test_focus_cli.py::test_cli_reads_live_sessions_only_through_r1_list.
+
+    preview.sh is the one hook that SELECTs, so test_no_hook_inlines_dml (which
+    matches INSERT|UPDATE|DELETE only) does not cover it. Transcribing the query
+    here instead of pulling it from writes.sql would give the picker's list and its
+    own preview pane two definitions of "a live session" to drift apart."""
+    src = (HOOKS / "preview.sh").read_text()
+    assert "stmt R1_list" in src, "preview.sh must extract R1_list from writes.sql"
+    assert "FROM sessions" not in src, "preview.sh transcribed SQL instead of using writes.sql"
+
+
 @pytest.mark.parametrize("shf", sorted(HOOKS.glob("*.sh")), ids=lambda p: p.name)
 def test_every_hook_is_executable(shf):
     """settings.json execs these paths directly; a missing +x is a silent no-op."""

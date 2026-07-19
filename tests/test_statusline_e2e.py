@@ -5,6 +5,8 @@ import os
 import pathlib
 import subprocess
 
+import pytest
+
 from helpers import HOOKS, T0, T1, SOCK, mk_session, mk_herd
 
 SL_PAY = {"session_id": "s1", "model": {"id": "claude-opus-4-8"}, "session_name": "sess",
@@ -233,3 +235,43 @@ def test_session_end_removes_both_per_session_runtime_files(hook_env):
     hook_env.run("session_end.sh", {"session_id": "e1"})
     assert not (rt / "herd-tool-e1").exists()
     assert not (rt / "herd-stline-e1").exists(), "the statusline cache file leaked"
+
+
+# ── reset stamps: jq strflocaltime replaced two `date` forks per tick ─────────
+@pytest.mark.parametrize("epoch", [
+    1784172774, 1784259174,
+    1767225600,   # midnight — the hour that pads to 12, not 0
+    1765000000,   # a PM time
+    1735689600,   # Jan 1: single-digit month AND day, both needing a zero stripped
+    1730000000,
+])
+def test_reset_stamps_match_what_date_produced(hook_env, epoch):
+    """The two `date -d @epoch` forks are gone; jq formats these in the parse it
+    already runs. GNU date is the reference the old code used, so the new output
+    must be indistinguishable from it — including the %-I/%-m/%-d zero-stripping,
+    which jq cannot ask strftime for portably and does with sub() instead."""
+    import subprocess
+    pay = {**SL_PAY, "rate_limits": {"five_hour": {"used_percentage": 50, "resets_at": epoch},
+                                     "seven_day": {"used_percentage": 10, "resets_at": epoch}}}
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/code/herd")
+    out = _statusline(hook_env, pay).stdout
+    want5 = subprocess.run(["date", "-d", f"@{epoch}", "+%-I:%M%p"],
+                           capture_output=True, text=True).stdout.strip()
+    want7 = subprocess.run(["date", "-d", f"@{epoch}", "+%-m/%-d %-I:%M%p"],
+                           capture_output=True, text=True).stdout.strip()
+    assert f"5h 50% resets {want5}" in out, out
+    assert f"7d 10% resets {want7}" in out, out
+
+
+def test_reset_segment_is_omitted_when_the_payload_has_no_resets_at(hook_env):
+    """A missing resets_at must drop the 'resets ...' suffix, not render an empty
+    one or the literal format string."""
+    pay = {**SL_PAY, "rate_limits": {"five_hour": {"used_percentage": 50},
+                                     "seven_day": {"used_percentage": 10}}}
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/code/herd")
+    out = _statusline(hook_env, pay).stdout
+    assert "5h 50%" in out and "7d 10%" in out
+    assert "resets" not in out, out
+    assert "%I" not in out and "%-I" not in out, out

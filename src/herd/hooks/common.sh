@@ -16,20 +16,46 @@ __herd_dir="${BASH_SOURCE%/*}"
 [ "$__herd_dir" = "${BASH_SOURCE}" ] && __herd_dir="."
 HERD_WRITES="${HERD_WRITES:-$__herd_dir/../schema/writes.sql}"
 
+# ── payload ───────────────────────────────────────────────────────────────
+# Slurp stdin into INPUT with NO FORK. `$(cat)` cost a subshell plus an exec —
+# measured 2.9ms, on the statusline's ~1/sec/session path and on PostToolUse's
+# per-tool-call path — to move a few KB that bash can read itself.
+#
+# NEVER `$(</dev/stdin)`: Claude's invocation makes that empty (learned the hard
+# way; the comment it replaces in session_start.sh said so). read -d '' is a
+# different mechanism — it reads fd 0 directly, to EOF.
+#
+# A JSON payload contains no NUL, so read never finds its delimiter and returns
+# nonzero at EOF with INPUT fully populated. `|| :` keeps that expected rc off
+# `set -e` and out of the caller's $?. IFS= stops leading/trailing whitespace
+# being stripped from the payload.
+read_input() { IFS= read -r -d '' INPUT || :; }
+
 # ── time ──────────────────────────────────────────────────────────────────
-# Probe GNU-vs-BSD date ONCE at source time. now_pair emits ISO + epoch from a
-# SINGLE fork (throttle needs epoch, write needs ISO).
-__herd_probe=$(date -u +%3N 2>/dev/null)
-case "$__herd_probe" in
-    ''|*[!0-9]*) __HERD_FMT='+%Y-%m-%dT%H:%M:%S.000Z %s' ;;
-    *)           __HERD_FMT='+%Y-%m-%dT%H:%M:%S.%3NZ %s' ;;
-esac
-unset __herd_probe
+# now_pair emits ISO + epoch from a SINGLE fork (throttle needs epoch, write
+# needs ISO).
+#
+# GNU-vs-BSD is detected from the REAL call, not a separate `date -u +%3N`
+# probe. That probe ran at SOURCE time — so every hook fire, including the
+# statusline's ~1/sec/session, paid a fork (0.6ms) to answer a question that is
+# constant per machine. Now the first call optimistically asks for %3N and
+# checks whether it came back as digits; a date without it costs one retry and
+# latches $__HERD_FMT for the rest of the process, so BSD pays the same two
+# forks it always did and GNU pays one instead of two.
+__HERD_FMT='+%Y-%m-%dT%H:%M:%S.%3NZ %s'
 
 NOW_ISO=""; NOW_EPOCH=""
 now_pair() {
-    local __o
+    local __o __ms
     __o=$(date -u "$__HERD_FMT")
+    # millis field of "<iso>.<ms>Z <epoch>". Non-digits (or empty) mean this date
+    # left %3N unexpanded — BSD renders it literally, e.g. "...:00.3NZ".
+    __ms="${__o%Z *}"; __ms="${__ms##*.}"
+    case "$__ms" in
+        ''|*[!0-9]*)
+            __HERD_FMT='+%Y-%m-%dT%H:%M:%S.000Z %s'
+            __o=$(date -u "$__HERD_FMT") ;;
+    esac
     NOW_ISO="${__o% *}"
     NOW_EPOCH="${__o##* }"
 }
@@ -109,8 +135,18 @@ claude_pid() { ps -eo pid=,ppid=,comm= 2>/dev/null | _walk_claude "$$"; }
 # -bail is LOAD-BEARING for run_tx: without it the CLI skips a failed statement
 # and COMMITs anyway, half-committing. busy_timeout is not optional (WAL
 # serialises writers). See DESIGN.md#commonsh-internals.
+# ONE errfile per process, reaped by an EXIT trap, instead of an `rm` fork per
+# call. The statusline makes 2-3 db() calls a tick at ~1/sec/session, so that
+# `rm` was ~1.8ms/tick spent deleting a file we immediately recreate. `>` is a
+# builtin truncate, so reuse costs nothing. No hook sets its own EXIT trap
+# (checked); if one ever does, it must call herd_db_cleanup itself.
+__HERD_ERRFILE="$HERD_RUNTIME/herd-db-err.$$"
+herd_db_cleanup() { rm -f "$__HERD_ERRFILE" 2>/dev/null; }
+trap herd_db_cleanup EXIT
+
 db() {
-    local err="$HERD_RUNTIME/herd-db-err.$$" rc
+    local err="$__HERD_ERRFILE" rc
+    : > "$err" 2>/dev/null              # builtin truncate: no stale stderr leaks in
     sqlite3 \
         -bail \
         -cmd ".timeout 3000" \
@@ -123,7 +159,6 @@ db() {
           tr '\n' ' ' < "$err"; printf '\n'; } >> "$HERD_ERRLOG" 2>/dev/null
         herd_log_rotate            # db() appends directly, so cap it here too
     fi
-    rm -f "$err"
     return $rc
 }
 
@@ -140,44 +175,68 @@ stmt() {
     ' "$HERD_WRITES"
 }
 
+# The :param substitution, as an awk FUNCTION so extract-and-bind can be one fork
+# instead of two. Composed into both bind() and stmt_bind() below — ONE copy of
+# the rule, two entry points. Do not inline it into either.
+__HERD_BINDFN='
+function bindline(s,   out, name, key, val, q) {
+    q = sprintf("%c", 39)
+    out = ""
+    while (match(s, /:[a-zA-Z_][a-zA-Z_0-9]*/)) {
+        name = substr(s, RSTART + 1, RLENGTH - 1)
+        out  = out substr(s, 1, RSTART - 1)
+        key  = "HERD_P_" name
+        if (key in ENVIRON) {
+            val = ENVIRON[key]
+            if (val == "") { out = out "NULL" }
+            else { gsub(q, q q, val); out = out q val q }
+        } else {
+            missing++
+            printf("herd: unbound param :%s\n", name) > "/dev/stderr"
+            out = out ":" name
+        }
+        s = substr(s, RSTART + RLENGTH)
+    }
+    return out s
+}'
+
 # ── parameter binding ─────────────────────────────────────────────────────
 # Expand :name params from HERD_P_<name> env vars, SINGLE PASS. Not sqlite3's
 # .param set (its shell-quoting mis-tokenizes SQL escapes and binds NULL
 # silently). Single-pass so a value containing ":now" isn't rescanned. Empty ->
 # NULL; unknown param -> hard failure. See DESIGN.md#commonsh-internals.
 bind() {
-    printf '%s' "$1" | awk '
-        BEGIN { q = sprintf("%c", 39); missing = 0 }
-        {
-            out = ""; s = $0
-            while (match(s, /:[a-zA-Z_][a-zA-Z_0-9]*/)) {
-                name = substr(s, RSTART + 1, RLENGTH - 1)
-                out  = out substr(s, 1, RSTART - 1)
-                key  = "HERD_P_" name
-                if (key in ENVIRON) {
-                    val = ENVIRON[key]
-                    if (val == "") { out = out "NULL" }
-                    else { gsub(q, q q, val); out = out q val q }
-                } else {
-                    missing++
-                    printf("herd: unbound param :%s\n", name) > "/dev/stderr"
-                    out = out ":" name
-                }
-                s = substr(s, RSTART + RLENGTH)
-            }
-            print out s
-        }
+    printf '%s' "$1" | awk "$__HERD_BINDFN"'
+        BEGIN { missing = 0 }
+        { print bindline($0) }
         END { exit (missing > 0) }
     '
+}
+
+# stmt + bind in ONE awk fork. run()/run_tx() use this; stmt() and bind() stay as
+# the separately-testable halves. The `;` cut tests $0 — the RAW line — not the
+# bound text, because a bound VALUE may itself contain a semicolon (a cwd or a
+# /rename can), and cutting on that would truncate the statement mid-flight.
+stmt_bind() {
+    awk -v want="$1" "$__HERD_BINDFN"'
+        BEGIN { missing = 0 }
+        index($0, "-- :name ") == 1 { f = ($0 == "-- :name " want); next }
+        !f { next }
+        { print bindline($0); if (index($0, ";")) exit }
+        END { exit (missing > 0) }
+    ' "$HERD_WRITES"
 }
 
 # run <statement_name> [<extra_sql>] — extract, bind, execute. Extra SQL may be
 # appended (e.g. "SELECT changes();") to read a result on the SAME connection.
 run() {
-    local sql bound
-    sql=$(stmt "$1")
-    if [ -z "$sql" ]; then herd_log "no such statement: $1"; return 1; fi
-    bound=$(bind "$sql") || { herd_log "unbound params in $1"; return 1; }
+    local bound rc
+    bound=$(stmt_bind "$1"); rc=$?
+    # Empty output means the NAME did not match (an unbound param still emits the
+    # statement, with `:name` left in place, and only sets rc) — so the emptiness
+    # check has to come first or a typo'd name reports as an unbound param.
+    if [ -z "$bound" ]; then herd_log "no such statement: $1"; return 1; fi
+    if [ "$rc" -ne 0 ]; then herd_log "unbound params in $1"; return 1; fi
     if [ -n "$2" ]; then
         printf '%s\n%s\n' "$bound" "$2" | db
     else
@@ -190,11 +249,11 @@ run() {
 # SQLITE_BUSY_SNAPSHOT the busy timeout can't retry. All binding happens before
 # any SQL runs, so an unbound param aborts with nothing executed.
 run_tx() {
-    local name sql bound body=""
+    local name bound rc body=""
     for name in "$@"; do
-        sql=$(stmt "$name")
-        if [ -z "$sql" ]; then herd_log "no such statement: $name"; return 1; fi
-        bound=$(bind "$sql") || { herd_log "unbound params in $name"; return 1; }
+        bound=$(stmt_bind "$name"); rc=$?
+        if [ -z "$bound" ]; then herd_log "no such statement: $name"; return 1; fi
+        if [ "$rc" -ne 0 ]; then herd_log "unbound params in $name"; return 1; fi
         body="$body$bound
 "
     done

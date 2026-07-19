@@ -64,12 +64,16 @@ def hook_env(tmp_path):
     runtime = str(tmp_path / "rt")
     os.makedirs(runtime)
 
-    def run(script, payload, env=None):
+    def run(script, payload, env=None, args=()):
+        """`args` is for the scripts that take argv instead of a stdin payload
+        (preview.sh). payload=None sends no stdin — a hook reading it would just
+        parse nothing, which is the correct outcome for a payload that isn't ours."""
         e = dict(os.environ, HERD_DB=dbp, HERD_RUNTIME=runtime,
                  HERD_ERRLOG=f"{runtime}/err.log")
         if env:
             e.update(env)
-        return subprocess.run(["bash", str(HOOKS / script)], input=json.dumps(payload),
+        return subprocess.run(["bash", str(HOOKS / script), *args],
+                              input="" if payload is None else json.dumps(payload),
                               capture_output=True, text=True, env=e)
 
     def conn():

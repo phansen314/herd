@@ -262,9 +262,26 @@ hook guards: `__d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."`
   happens before any SQL runs, so an unbound param aborts with nothing executed.
 - **`valid_sid()`** — a `session_id` becomes a filename (throttle/cache); reject
   anything with `/` or `..` so a payload can't escape `$HERD_RUNTIME`.
+- **`stmt_bind()`** does `stmt` + `bind` in **one** awk fork; `run`/`run_tx` use
+  it. The two halves remain as separate functions, so the substitution rule is
+  shared as an awk *function* (`__HERD_BINDFN`) composed into both rather than
+  written twice — and `test_stmt_bind_equals_stmt_then_bind` pins the merged path
+  to the composed one for every statement in `writes.sql`. The `;` that ends a
+  statement is matched on the **raw** line, never the bound text: a bound value
+  may contain a semicolon, and cutting there would truncate the statement.
 - **`now_pair()`** emits ISO + epoch from a *single* `date` fork (the throttle
-  needs epoch, the write needs ISO); the GNU-vs-BSD format is probed once at
-  source time.
+  needs epoch, the write needs ISO). GNU-vs-BSD is detected **from that call** —
+  ask for `%3N`, check the millis came back as digits, and latch the fallback for
+  the process if not. It used to be a separate `date -u +%3N` probe at *source
+  time*, i.e. a fork on every hook fire — including the statusline's
+  ~1/sec/session — to answer a question that is constant per machine.
+- **`read_input()`** slurps stdin into `INPUT` with no fork (`read -r -d ''`),
+  replacing `INPUT=$(cat)` in all six hooks — a subshell plus an exec, measured
+  2.9ms, on both hot paths. Note `$(</dev/stdin)` is **not** an option: Claude's
+  invocation leaves it empty.
+- **`db()`** truncates one per-process errfile and reaps it with an `EXIT` trap,
+  rather than forking `rm` per call — the statusline makes 2-3 `db()` calls a
+  tick. A hook that ever needs its own `EXIT` trap must call `herd_db_cleanup`.
 
 ### Per-hook notes
 
@@ -389,9 +406,43 @@ without a live kitty — the same discipline as `daemon.py` and `common.sh`.
 
 There is exactly one live-session read: `R1_list`, loaded from `writes.sql` like
 every other shipping statement. `cli._live()` *is* that statement, and `ls`, the
-picker, `rows` and the preview pane all go through it — `preview` filters it by
-id in Python rather than issuing a second query
+picker, `rows` and the preview pane all go through it — the preview filters it by
+id rather than issuing a second query
 ([DECISIONS.md#transcription](DECISIONS.md#transcription)).
+
+### The preview pane is bash, not Python {#preview}
+
+fzf re-runs `--preview` through `sh -c` on **every highlight change** — every
+arrow-key press. `python -m herd.cli preview` cost **78ms** a keystroke, of which
+~60ms was bare interpreter startup (`python3 -c pass` measures the same), so
+nothing *inside* `cmd_preview` was the problem: the cost was starting Python at
+all. `hooks/preview.sh` does the same work in **~6ms** — source `common.sh`,
+`stmt R1_list`, one `sqlite3`, one `awk` — and the pane now tracks key repeat.
+
+It still queries per keystroke rather than reading a precomputed cache, so a
+session that dies while the picker is open still reads `(session gone)`. That
+guarantee is the reason a cache file was rejected: `watch` could refresh one on
+its 2s poke tick, but `jump` has no poker, so its pane would be frozen for the
+life of the picker.
+
+No `R2_preview` statement was added. `stopped_at` is unindexed, so a `WHERE
+s.id = :id` variant would scan the same rows and merely emit fewer bytes —
+unmeasurable against a ~1.4ms process spawn — while becoming the one read with no
+column-coverage guard (`test_preview_serves_every_field_it_renders` pins
+`R1_list` only). Filtering in awk also means "live" stays defined in exactly one
+place: *in the `R1_list` result set*.
+
+Rows are separated by `\x1e`, fields by `\x1f`. Not newline, because
+`session_name` is arbitrary `/rename` text and `cwd` is a path — either may
+contain one, which under newline-delimited rows shifts every later row's fields
+and renders **another session** into the pane. A wrong preview is worse than a
+blank one, so the parse also fails closed on `NF != 20`.
+
+The cost is a second copy of the formatter. `cli._preview_text` stays as the
+fallback when the script loses its `+x` (a pip/zip install can drop it) and as
+the reference `tests/test_preview_bash.py` pins bash against, byte-for-byte, over
+every row shape — the same discipline as
+[`test_bash_and_python_extract_same`](#write-paths-schemawritessql).
 
 `cli` surface: `ls`, `jump`, `spawn`, `watch` and `doctor` are the user verbs;
 `preview` (fzf's per-highlight pane), `complete` / `tcomplete` (tab-completion
@@ -407,9 +458,9 @@ jump *is* an ack (`W6c_ack`).
 
 `herd watch` is the dashboard: one kitty tab running the jump picker forever.
 There is deliberately **no curses layer**. fzf already renders the list,
-navigates it, and — because it spawns `preview` as a fresh process per highlight
-— shows per-session detail that reads live from SQLite for free. A TUI would only
-be a second rendering path to keep in sync with `ls`.
+navigates it, and — because it spawns [`hooks/preview.sh`](#preview) as a fresh
+process per highlight — shows per-session detail that reads live from SQLite for
+free. A TUI would only be a second rendering path to keep in sync with `ls`.
 
 Two things turn a picker into a dashboard:
 

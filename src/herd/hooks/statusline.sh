@@ -11,13 +11,14 @@
 __d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."
 . "$__d/common.sh" || { echo "herd: cannot source $__d/common.sh" >&2; exit 1; }
 
-INPUT=$(cat)
+read_input
 
 # ── parse: ONE jq into \x1f-separated fields ──────────────────────────────
 # \x1f (Unit Separator), NOT tab (tab is IFS whitespace and collapses empties).
 # model is an OBJECT here (.model.id). resets_at is a UNIX EPOCH.
 IFS=$'\x1f' read -r SID MODEL SNAME CTX COST RL5 RL5RESET RL7 RL7RESET CWD API_MS \
-                    CTXSIZE OCWD LADD LDEL TOKIN TOKOUT VER GWT EXC200 OSTYLE <<JQ
+                    CTXSIZE OCWD LADD LDEL TOKIN TOKOUT VER GWT EXC200 OSTYLE \
+                    RL5FMT RL7FMT <<JQ
 $(jq_in -rj '[
   .session_id,
   .model.id,
@@ -39,7 +40,25 @@ $(jq_in -rj '[
   .version,
   .workspace.git_worktree,
   (if .exceeds_200k_tokens then 1 else 0 end),
-  .output_style.name
+  .output_style.name,
+  # The rate-limit reset stamps, FORMATTED HERE. These were two "date -d @epoch"
+  # forks per tick (1.25ms measured) on the ~1/sec/session path, doing what the jq
+  # we already fork does for free. strflocaltime is local-TZ, as "date -d" was.
+  #
+  # NO APOSTROPHES IN THESE COMMENTS: the whole filter is one single-quoted bash
+  # string, so one would end it and hand the rest of the program to the shell.
+  #
+  # Padded %I/%m/%d with the leading zeros sub()bed off, NOT the GNU-only %-I/%-m:
+  # jq calls the system strftime, and BSD has no "-" flag, so asking for it on
+  # macOS emits the format literally. sub() belongs to jq and behaves the same on
+  # both — which is also why the old BSD "date -r" fallback disappears with it.
+  (if .rate_limits.five_hour.resets_at
+   then (.rate_limits.five_hour.resets_at | strflocaltime("%I:%M%p") | sub("^0"; ""))
+   else "" end),
+  (if .rate_limits.seven_day.resets_at
+   then (.rate_limits.seven_day.resets_at | strflocaltime("%m/%d %I:%M%p")
+         | sub("^0"; "") | sub("/0"; "/") | sub(" 0"; " "))
+   else "" end)
 ] | map(. // "" | tostring) | join("\u001f")')
 JQ
 
@@ -130,11 +149,7 @@ render() {
     if [[ "$RL5" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
         printf -v n '%.0f' "$RL5"
         seg="⏱️ 5h ${n}%"
-        if [ -n "$RL5RESET" ]; then
-            t=$(date -d "@$RL5RESET" +'%-I:%M%p' 2>/dev/null \
-                || date -r "$RL5RESET" +'%I:%M%p' 2>/dev/null)
-            [ -n "$t" ] && seg="$seg resets $t"
-        fi
+        [ -n "$RL5FMT" ] && seg="$seg resets $RL5FMT"
         L2+=("$seg")
     fi
 
@@ -142,11 +157,7 @@ render() {
     if [[ "$RL7" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
         printf -v n '%.0f' "$RL7"
         seg="7d ${n}%"
-        if [ -n "$RL7RESET" ]; then
-            t=$(date -d "@$RL7RESET" +'%-m/%-d %-I:%M%p' 2>/dev/null \
-                || date -r "$RL7RESET" +'%m/%d %I:%M%p' 2>/dev/null)
-            [ -n "$t" ] && seg="$seg resets $t"
-        fi
+        [ -n "$RL7FMT" ] && seg="$seg resets $RL7FMT"
         L2+=("$seg")
     fi
 
@@ -162,8 +173,19 @@ emit() {
 CACHE=""
 valid_sid "$SID" && CACHE="$HERD_RUNTIME/herd-stline-$SID"
 
-# ── fingerprint: skip ALL DB work when nothing changed. Covers every rendered
-# field so a hit can't show a stale line. Cache is 3 fixed lines: FP, L1, L2.
+# ── fingerprint: skip ALL DB work when nothing changed. Cache is 3 fixed lines:
+# FP, L1, L2.
+#
+# It covers every field we RENDER *and* every field we SINK — the second set is
+# the bigger one (tokens, line counts, version, output style render nothing), and
+# it has to be there or a tick that changes only a sunk field would take a cache
+# hit and never reach the DB.
+#
+# The consequence is worth stating plainly, because it is easy to read this block
+# as a hot-path optimization and it is not: token counts move on essentially every
+# tick of an ACTIVE session, so an active session misses the cache basically
+# always. This is an IDLE-path optimization. What an active herd pays is the fork
+# count on the miss path below — see DECISIONS.md#statusline-forks.
 FP="$MODEL|$SNAME|$CTX|$COST|$RL5|$RL5RESET|$RL7|$RL7RESET|$CWD|$BRANCH|$API_MS"
 FP="$FP|$CTXSIZE|$OCWD|$LADD|$LDEL|$TOKIN|$TOKOUT|$VER|$GWT|$EXC200|$OSTYLE"
 if [ -n "$CACHE" ] && [ -f "$CACHE" ]; then

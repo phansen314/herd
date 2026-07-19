@@ -463,16 +463,38 @@ def test_jump_without_kitten_installed_is_a_message_not_a_traceback(tmp_path, mo
     assert focus._focus("unix:/tmp/nope", 7) is False
 
 
-def test_fzf_command_strings_survive_an_interpreter_path_with_a_space(monkeypatch):
-    """fzf hands --preview and reload(...) to `sh -c`. Unquoted, a venv under a
-    directory with a space broke the preview pane and ctrl-r refresh."""
-    import shlex
-    monkeypatch.setattr(cli.sys, "executable", "/opt/My Tools/venv/bin/python3")
+def _preview_arg(monkeypatch):
     seen = {}
     monkeypatch.setattr(cli.subprocess, "run",
                         lambda argv, **k: seen.update(argv=argv) or
                         __import__("types").SimpleNamespace(stdout=""))
     cli._fzf_run([], "")
-    preview = seen["argv"][seen["argv"].index("--preview") + 1]
-    # the interpreter must survive a round trip through the shell's own lexer
-    assert shlex.split(preview)[0] == "/opt/My Tools/venv/bin/python3"
+    return seen["argv"][seen["argv"].index("--preview") + 1]
+
+
+def test_fzf_command_strings_survive_a_script_path_with_a_space(monkeypatch, tmp_path):
+    """fzf hands --preview and reload(...) to `sh -c`. Unquoted, a path under a
+    directory with a space broke the preview pane and ctrl-r refresh. The path is
+    now the bash script rather than a venv interpreter — same lexer, same hazard."""
+    import shlex
+    sh = tmp_path / "My Tools" / "preview.sh"
+    sh.parent.mkdir()
+    sh.write_text("#!/bin/bash\n")
+    sh.chmod(0o755)
+    monkeypatch.setattr(cli, "_PREVIEW_SH", sh)
+    assert shlex.split(_preview_arg(monkeypatch))[0] == str(sh)
+
+
+def test_preview_falls_back_to_python_when_the_script_is_not_executable(monkeypatch, tmp_path):
+    """A pip/zip install can drop the mode bit. The pane must degrade to the slow
+    python verb, not render blank — and that path needs the same quoting."""
+    import shlex
+    sh = tmp_path / "My Tools" / "preview.sh"
+    sh.parent.mkdir()
+    sh.write_text("#!/bin/bash\n")
+    sh.chmod(0o644)                                     # readable, NOT executable
+    monkeypatch.setattr(cli, "_PREVIEW_SH", sh)
+    monkeypatch.setattr(cli.sys, "executable", "/opt/My Tools/venv/bin/python3")
+    parts = shlex.split(_preview_arg(monkeypatch))
+    assert parts[0] == "/opt/My Tools/venv/bin/python3"
+    assert parts[1:4] == ["-m", "herd.cli", "preview"]

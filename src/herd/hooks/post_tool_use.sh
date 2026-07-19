@@ -10,7 +10,7 @@ __d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."
 
 HERD_TOOL_THROTTLE="${HERD_TOOL_THROTTLE:-2}"
 
-INPUT=$(cat)
+read_input
 SID=$(jq_in -r '.session_id // empty')
 valid_sid "$SID" || exit 0
 
