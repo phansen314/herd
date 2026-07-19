@@ -442,17 +442,25 @@ def test_failed_adopt_with_a_reservation_present_still_defers(hook_env):
     assert "reservation present, deferring" in log, log
 
 
-def test_failed_adopt_outside_kitty_always_inserts(hook_env):
-    """No window means no reservation can exist, so there is nothing to defer to."""
-    restore = _readonly_db(hook_env)
-    try:
-        hook_env.run("session_start.sh",
-                     {"session_id": "nokitty", "cwd": "/x", "model": "m",
-                      "source": "startup", "transcript_path": "/t"})
-    finally:
-        restore()
-    log = pathlib.Path(hook_env.runtime, "err.log").read_text()
-    assert "no reservation to adopt, inserting" in log, log
+def test_outside_kitty_the_session_is_inserted_and_nothing_defers(hook_env):
+    """No window means no reservation can exist, so there is nothing to defer TO —
+    and W2_adopt never runs at all, so there is no failed-adopt decision to log.
+
+    This asserted the decision log line and passed locally for the wrong reason:
+    hook_env inherited the developer's real KITTY_WINDOW_ID, so "outside kitty" ran
+    INSIDE kitty and took the adopt path. It failed the first time it met a machine
+    with no kitty. conftest now scrubs those vars; this asserts the actual
+    outside-kitty behaviour instead of a log line it cannot produce."""
+    c = hook_env.conn()
+    hook_env.run("session_start.sh",
+                 {"session_id": "nokitty", "cwd": "/x", "model": "m",
+                  "source": "startup", "transcript_path": "/t"})
+    row = c.execute("SELECT status FROM sessions WHERE session_id='nokitty'").fetchone()
+    assert row is not None and row["status"] == "working", "the session was not inserted"
+    assert not c.execute("SELECT 1 FROM herd_sessions").fetchall(), \
+        "no window, so no placement row should exist"
+    log = pathlib.Path(hook_env.runtime, "err.log")
+    assert "defer" not in (log.read_text() if log.exists() else "")
 
 
 # ── adoption must not depend on the window stamp having landed ────────────────

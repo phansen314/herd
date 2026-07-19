@@ -1,5 +1,6 @@
 """herd spawn — build the launch argv, and record the W1 placeholder (guards run
 before any launch). IO injected exactly like test_focus_cli.py."""
+import shutil
 import sqlite3
 
 import pytest
@@ -212,10 +213,16 @@ def test_launch_passes_the_built_argv_through():
 
 
 @pytest.mark.shell
+@pytest.mark.skipif(shutil.which("kitten") is None,
+                    reason="drives the real `kitten` binary, which kitty ships")
 def test_launch_times_out_against_a_socket_that_never_answers(tmp_path, monkeypatch):
     """The real path: a stale unix:/tmp/kitty-<pid> whose kitty is gone. Drives the
     actual subprocess call, not a stub, so the TimeoutExpired -> "" -> None chain
-    is exercised end to end."""
+    is exercised end to end.
+
+    Needs kitten on PATH — the point is the REAL subprocess, so stubbing it would
+    delete the test. CONTRIBUTING lists kitty as not needed for the suite, and this
+    is the one exception, so it skips rather than fails."""
     import socket as _socket
     from herd.kitty import launch as L
     srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)

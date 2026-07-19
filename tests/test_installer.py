@@ -600,8 +600,17 @@ def test_bin_herd_resolves_symlinks_without_readlink_f(tmp_path):
     nested.mkdir()
     chained = nested / "chained"
     chained.symlink_to(pathlib.Path("..") / "direct")    # relative, to a symlink
+    # HERD_DB points at a fresh temp file. `herd ls` opens the DB, so inheriting
+    # the ambient one made this pass only on a machine that had already installed
+    # herd — it failed on the first runner with no ~/.herd/herd.db. The subject
+    # here is the symlink resolution in bin/herd, not the database.
+    db = tmp_path / "herd.db"
+    from herd.db import connect, apply_schema
+    conn = connect(str(db)); apply_schema(conn); conn.close()
+    env = dict(os.environ, HERD_DB=str(db))
     for entry in (inst.CLI_SRC, direct, chained):
-        r = subprocess.run(["bash", str(entry), "ls"], capture_output=True, text=True)
+        r = subprocess.run(["bash", str(entry), "ls"], capture_output=True,
+                           text=True, env=env)
         assert r.returncode == 0, f"{entry}: {r.stderr}"
         assert "readlink" not in r.stderr
 

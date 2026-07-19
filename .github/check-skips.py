@@ -20,8 +20,19 @@ make it fire. The JUnit report cannot be formatted away.
 import sys
 import xml.etree.ElementTree as ET
 
-# The only skip reason CI accepts. Keep in step with tests/test_template.py.
-ALLOWED = "templates need Python 3.11+"
+# The ONLY skip reasons CI accepts, as substrings of the skip message.
+#
+# Everything absent from this list is treated as a hollow run — in particular
+# "needs bash, jq, sqlite3", which is conftest saying the real-hook tests could not
+# run at all. That is the case this script exists to catch.
+ALLOWED = (
+    # tomllib is stdlib from 3.11; templates degrade to a friendly error below that
+    # and the 3.9 matrix entry skips those tests on purpose.
+    "templates need Python 3.11+",
+    # One test drives the real `kitten` binary, which the runners do not have. The
+    # point of it is the REAL subprocess, so stubbing would delete the test.
+    "drives the real `kitten` binary",
+)
 
 
 def main(path):
@@ -33,7 +44,7 @@ def main(path):
     for case in suite.iter("testcase"):
         for skip in case.findall("skipped"):
             reason = (skip.get("message") or "").strip()
-            if ALLOWED not in reason:
+            if not any(a in reason for a in ALLOWED):
                 bad.append(f"{case.get('classname')}::{case.get('name')} — {reason}")
 
     print(f"ran {total} tests, {skipped} skipped")
@@ -44,7 +55,7 @@ def main(path):
             print(f"  {b}")
         return 1
     if int(skipped):
-        print(f"note: {skipped} skip(s), all version-gated ({ALLOWED!r}) — expected on 3.9")
+        print(f"note: {skipped} skip(s), all for approved reasons")
     return 0
 
 

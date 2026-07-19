@@ -108,6 +108,13 @@ def hook_env(tmp_path):
         parse nothing, which is the correct outcome for a payload that isn't ours."""
         e = dict(os.environ, HERD_DB=dbp, HERD_RUNTIME=runtime,
                  HERD_ERRLOG=f"{runtime}/err.log")
+        # SCRUB the ambient kitty vars. The hooks branch on them, so inheriting the
+        # developer's terminal makes "outside kitty" tests silently run INSIDE
+        # kitty — one passed that way locally for weeks and only failed on a CI
+        # runner, where there is no kitty. A test that needs them passes them in
+        # `env`, which still wins because the update below comes after.
+        for k in ("KITTY_WINDOW_ID", "KITTY_LISTEN_ON", "HERD_JOB"):
+            e.pop(k, None)
         if env:
             e.update(env)
         return subprocess.run(["bash", str(HOOKS / script), *args],
