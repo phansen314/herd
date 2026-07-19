@@ -3,6 +3,7 @@ systemd unit, CLI paths, and the terminal-bell opt-in. Pure functions."""
 import json
 import os
 import pathlib
+import plistlib
 import subprocess
 
 import pytest
@@ -523,15 +524,135 @@ def test_relink_is_idempotent(tmp_path):
     assert not list(tmp_path.glob("herd.herd-bak.*"))
 
 
-def test_service_install_is_a_graceful_noop_without_systemd(monkeypatch, tmp_path):
-    """macOS/headless: the daemon still works, you just run it yourself. This must
-    not look like a failure, and must not write a unit nowhere useful."""
+def test_service_install_is_a_graceful_noop_without_any_service_manager(monkeypatch, tmp_path):
+    """Headless/containers: the daemon still works, you just run it yourself. This
+    must not look like a failure, and must not write a unit nowhere useful.
+
+    Both probes are patched, not just systemd's. Patching only _has_systemd_user
+    made this test fall through to the launchd branch on a Mac and bootstrap a REAL
+    LaunchAgent into the developer's session — a unit test restarting the live
+    daemon — so the absence of the second patch has to be a test failure, not a
+    side effect."""
     monkeypatch.setattr(inst, "_has_systemd_user", lambda: False)
+    monkeypatch.setattr(inst, "_has_launchd", lambda: False)
     monkeypatch.setattr(inst, "SERVICE", tmp_path / "herd.service")
+    monkeypatch.setattr(inst, "PLIST", tmp_path / "herd.plist")
     msg = inst.install_service()
     assert "SKIPPED" in msg and "herd.daemon" in msg     # tells you what to do
     assert not (tmp_path / "herd.service").exists()
+    assert not (tmp_path / "herd.plist").exists()
     assert inst.uninstall_service() == "no herd.service to remove"
+
+
+# ── the macOS half: a launchd LaunchAgent ────────────────────────────────────
+def _plist(**patch):
+    """plist_text() parsed back into a dict, so assertions read as key lookups
+    rather than substring searches on XML."""
+    return plistlib.loads(inst.plist_text().encode())
+
+
+def test_plist_is_well_formed():
+    p = _plist()
+    assert p["Label"] == inst.LAUNCHD_LABEL
+    assert p["ProgramArguments"][1:] == ["-m", "herd.daemon"]
+    assert p["EnvironmentVariables"]["PYTHONPATH"] == str(inst.PKG_SRC)
+    assert p["EnvironmentVariables"]["HERD_DB"] == str(inst.DB)
+    assert p["RunAtLoad"] is True
+    assert inst.PKG_SRC.name == "src"
+
+
+def test_plist_retries_forever():
+    """The launchd mirror of test_service_unit_retries_forever, and the same
+    reasoning: a stopped daemon is invisible — sessions just never leave `herd ls`.
+    KeepAlive={"SuccessfulExit": False} is the idiom to avoid; it is launchd's
+    Restart=on-failure and would leave a clean exit un-restarted."""
+    p = _plist()
+    assert p["KeepAlive"] is True, "a clean exit must restart too"
+    assert p["ThrottleInterval"] == 5
+    # ProcessType=Background opts a job into CPU/IO throttling. A throttled reaper
+    # is a stale `herd ls`, which is the symptom this service exists to prevent.
+    assert "ProcessType" not in p
+
+
+def test_plist_survives_a_path_that_would_break_hand_rolled_xml(monkeypatch, tmp_path):
+    """HOME reaches five values in this plist. Built with a format string, a path
+    holding & or < emits XML launchd rejects as 'Bootstrap failed: 5', which says
+    nothing about the cause."""
+    monkeypatch.setattr(inst, "DB", tmp_path / "a&b" / "<h>" / "herd.db")
+    p = _plist()
+    assert p["EnvironmentVariables"]["HERD_DB"] == str(tmp_path / "a&b" / "<h>" / "herd.db")
+
+
+def test_launchd_install_reloads_rather_than_leaving_the_old_definition(monkeypatch, tmp_path):
+    """bootstrap on an already-loaded label fails with EEXIST and leaves the OLD
+    plist running, so a re-install would silently keep stale settings. bootout
+    first — and it must come first, which is what the order assertion pins."""
+    calls = []
+    monkeypatch.setattr(inst, "_has_systemd_user", lambda: False)
+    monkeypatch.setattr(inst, "_has_launchd", lambda: True)
+    monkeypatch.setattr(inst, "PLIST", tmp_path / "herd.plist")
+    monkeypatch.setattr(inst, "HERD_DIR", tmp_path)
+    monkeypatch.setattr(inst, "_launchctl",
+                        lambda *a: calls.append(a) or SimpleNamespace(returncode=0, stdout="\tpid = 42\n", stderr=""))
+    msg = inst.install_service()
+    verbs = [c[0] for c in calls]
+    assert verbs[:2] == ["bootout", "bootstrap"]
+    assert (tmp_path / "herd.plist").exists()
+    assert "pid 42" in msg
+
+
+def test_launchd_install_falls_back_to_the_deprecated_verbs(monkeypatch, tmp_path):
+    """bootstrap/bootout are 10.11+. An older macOS must still end up loaded rather
+    than fail the whole install."""
+    calls = []
+
+    def fake(*a):
+        calls.append(a)
+        rc = 1 if a[0] == "bootstrap" else 0
+        return SimpleNamespace(returncode=rc, stdout="", stderr="unrecognized")
+
+    monkeypatch.setattr(inst, "_has_systemd_user", lambda: False)
+    monkeypatch.setattr(inst, "_has_launchd", lambda: True)
+    monkeypatch.setattr(inst, "PLIST", tmp_path / "herd.plist")
+    monkeypatch.setattr(inst, "HERD_DIR", tmp_path)
+    monkeypatch.setattr(inst, "_launchctl", fake)
+    msg = inst.install_service()
+    assert "load" in [c[0] for c in calls]
+    assert "FAILED" not in msg
+
+
+def test_launchd_install_reports_a_load_failure_instead_of_claiming_success(monkeypatch, tmp_path):
+    """Both verbs failing must say so. The plist on disk without a loaded job is
+    the silent-no-reaper case, so it needs to be loud and tell you the manual verb."""
+    monkeypatch.setattr(inst, "_has_systemd_user", lambda: False)
+    monkeypatch.setattr(inst, "_has_launchd", lambda: True)
+    monkeypatch.setattr(inst, "PLIST", tmp_path / "herd.plist")
+    monkeypatch.setattr(inst, "HERD_DIR", tmp_path)
+    monkeypatch.setattr(inst, "_launchctl",
+                        lambda *a: SimpleNamespace(returncode=1, stdout="", stderr="nope"))
+    msg = inst.install_service()
+    assert "FAILED" in msg and "launchctl bootstrap" in msg
+
+
+def test_uninstall_launchd_removes_and_unloads_the_plist(monkeypatch, tmp_path):
+    calls = []
+    plist = tmp_path / "herd.plist"
+    plist.write_text("<plist/>")
+    monkeypatch.setattr(inst, "_has_systemd_user", lambda: False)
+    monkeypatch.setattr(inst, "_has_launchd", lambda: True)
+    monkeypatch.setattr(inst, "PLIST", plist)
+    monkeypatch.setattr(inst, "_launchctl",
+                        lambda *a: calls.append(a) or SimpleNamespace(returncode=0, stdout="", stderr=""))
+    msg = inst.uninstall_service()
+    assert "bootout" in [c[0] for c in calls], "left loaded after its plist was deleted"
+    assert not plist.exists() and "removed" in msg
+
+
+def test_uninstall_launchd_with_nothing_installed(monkeypatch, tmp_path):
+    monkeypatch.setattr(inst, "_has_systemd_user", lambda: False)
+    monkeypatch.setattr(inst, "_has_launchd", lambda: True)
+    monkeypatch.setattr(inst, "PLIST", tmp_path / "absent.plist")
+    assert inst.uninstall_service() == "no LaunchAgent to remove"
 
 
 @pytest.mark.shell

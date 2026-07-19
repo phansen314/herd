@@ -19,6 +19,7 @@ nonzero. Reuses herd.db for the DB bootstrap. Leaves klawde's repo and
 import json
 import os
 import pathlib
+import plistlib
 import re
 import shutil
 import subprocess
@@ -46,6 +47,15 @@ DB = HERD_DIR / "herd.db"
 INSTALLED_HOOKS = HERD_DIR / "hooks"
 INSTALLED_SCHEMA = HERD_DIR / "schema"
 SERVICE = HOME / ".config" / "systemd" / "user" / "herd.service"
+# macOS has no systemd; the same daemon runs as a per-user LaunchAgent. Reverse-DNS
+# label to match the other tools in this account, and it doubles as the launchctl
+# handle (`launchctl print gui/$UID/com.codingzen.herd`).
+LAUNCHD_LABEL = "com.codingzen.herd"
+PLIST = HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+# launchd keeps no journal, so the daemon's own stderr is the only record of a
+# crash loop. Into ~/.herd, next to the DB it is failing to reap.
+DAEMON_OUT = HERD_DIR / "daemon.out.log"
+DAEMON_ERR = HERD_DIR / "daemon.err.log"
 CLI_SRC = REPO / "bin" / "herd"
 CLI_LINK = HOME / ".local" / "bin" / "herd"
 COMPLETION_SRC = REPO / "completions" / "herd.bash"
@@ -65,6 +75,8 @@ STATUSLINE = str(INSTALLED_HOOKS / "statusline.sh")
 
 # systemctl can block on a busy/degraded manager; the installer must not hang.
 SYSTEMCTL_TIMEOUT = 15
+# launchctl blocks the same way when launchd is wedged. Same bound, same reason.
+LAUNCHCTL_TIMEOUT = 15
 # A wired hook that hangs would hang the self-test that exists to vet it.
 SELFTEST_TIMEOUT = 20
 
@@ -263,13 +275,93 @@ def service_unit_text():
     )
 
 
+def _has_launchd():
+    """macOS. `launchctl` alone is not enough — checking the platform too keeps a
+    stray binary on a Linux box from routing the install away from systemd."""
+    return sys.platform == "darwin" and bool(shutil.which("launchctl"))
+
+
+def plist_text():
+    """The launchd LaunchAgent, as XML. Pure — testable without touching launchd.
+
+    The macOS half of service_unit_text(); the two must stay behaviourally equal,
+    so the reasoning below deliberately mirrors the [Service] block's.
+
+    Built with plistlib rather than a format string: HOME is user-controlled and
+    lands in five of these values, and a path holding & or < would emit XML that
+    launchd rejects with nothing more useful than "Bootstrap failed: 5".
+    """
+    return plistlib.dumps({
+        "Label": LAUNCHD_LABEL,
+        "ProgramArguments": [_service_python(), "-m", "herd.daemon"],
+        "EnvironmentVariables": {"PYTHONPATH": str(PKG_SRC), "HERD_DB": str(DB)},
+        "RunAtLoad": True,
+        # Plain true, NOT {"SuccessfulExit": False}: like Restart=always, and for
+        # the same reason. A CLEAN exit still leaves nothing reaping silent deaths,
+        # and the only symptom is sessions that never leave `herd ls` — so restart
+        # on exit 0 too.
+        "KeepAlive": True,
+        # launchd's default throttle is 10s; 5 to match RestartSec=5. There is no
+        # burst limit to disable (the systemd StartLimitIntervalSec=0 half) —
+        # launchd throttles indefinitely and never latches into a failed state,
+        # which is the behavior that setting was chosen to get.
+        "ThrottleInterval": 5,
+        # No ProcessType. It defaults to Standard; "Background" reads right for a
+        # daemon but opts into CPU/IO throttling, and a throttled reaper shows up
+        # as exactly the stale `herd ls` this service exists to prevent.
+        "StandardOutPath": str(DAEMON_OUT),
+        "StandardErrorPath": str(DAEMON_ERR),
+    }).decode()
+
+
+def _launchctl(*args):
+    """launchctl, never raising and never hanging. Returns the CompletedProcess."""
+    return subprocess.run(["launchctl", *args], check=False,
+                          capture_output=True, text=True, timeout=LAUNCHCTL_TIMEOUT)
+
+
+def _gui_target():
+    return f"gui/{os.getuid()}"
+
+
+def install_launchd(dry=False):
+    """Write + (re)load the LaunchAgent. Idempotent, like its systemd twin."""
+    if dry:
+        return f"would write {PLIST} and (re)load {LAUNCHD_LABEL}"
+    PLIST.parent.mkdir(parents=True, exist_ok=True)
+    HERD_DIR.mkdir(parents=True, exist_ok=True)          # StandardOut/ErrPath's dir
+    PLIST.write_text(plist_text())
+    # bootout first so a rewritten plist is actually re-read: bootstrap on an
+    # already-loaded label fails with EEXIST and would silently leave the OLD
+    # definition running. Failure here just means "wasn't loaded" — expected on a
+    # first install, so the result is ignored.
+    _launchctl("bootout", f"{_gui_target()}/{LAUNCHD_LABEL}")
+    r = _launchctl("bootstrap", _gui_target(), str(PLIST))
+    if r.returncode != 0:
+        # bootstrap/bootout are 10.11+. Fall back to the deprecated verbs rather
+        # than fail the install on an older macOS.
+        _launchctl("unload", str(PLIST))
+        r = _launchctl("load", "-w", str(PLIST))
+        if r.returncode != 0:
+            return (f"LaunchAgent written to {PLIST} but load FAILED "
+                    f"({(r.stderr or r.stdout).strip() or f'rc={r.returncode}'}) — "
+                    f"load it yourself: launchctl bootstrap {_gui_target()} {PLIST}")
+    # RunAtLoad has started it by now; report what launchd actually thinks.
+    printed = _launchctl("print", f"{_gui_target()}/{LAUNCHD_LABEL}").stdout
+    m = re.search(r"^\s*pid = (\d+)", printed, re.M)
+    state = f"running (pid {m.group(1)})" if m else "loaded"
+    return f"{LAUNCHD_LABEL} written + loaded ({state})"
+
+
 def install_service(dry=False):
-    """Write + enable + (re)start the daemon unit. Idempotent. Graceful no-op where
-    systemd --user is unavailable (macOS/headless) — herd still works, just run the
-    daemon yourself."""
+    """Write + enable + (re)start the daemon unit. Idempotent. systemd --user on
+    Linux, a launchd LaunchAgent on macOS. Graceful no-op where neither exists
+    (headless/containers) — herd still works, just run the daemon yourself."""
     if not _has_systemd_user():
-        return ("daemon service SKIPPED — no systemctl --user here. Run the daemon "
-                "yourself:  PYTHONPATH=src python3 -m herd.daemon  (or a launchd job)")
+        if _has_launchd():
+            return install_launchd(dry)
+        return ("daemon service SKIPPED — no systemctl --user or launchctl here. "
+                "Run the daemon yourself:  PYTHONPATH=src python3 -m herd.daemon")
     if dry:
         return f"would write {SERVICE} and enable + (re)start herd.service"
     SERVICE.parent.mkdir(parents=True, exist_ok=True)
@@ -283,8 +375,21 @@ def install_service(dry=False):
     return f"herd.service written + enabled ({active or 'unknown'})"
 
 
+def uninstall_launchd():
+    if not PLIST.exists():
+        return "no LaunchAgent to remove"
+    _launchctl("bootout", f"{_gui_target()}/{LAUNCHD_LABEL}")
+    _launchctl("unload", str(PLIST))       # pre-10.11 fallback; a no-op after bootout
+    PLIST.unlink(missing_ok=True)
+    return f"removed {PLIST}"
+
+
 def uninstall_service():
-    if not _has_systemd_user() or not SERVICE.exists():
+    if not _has_systemd_user():
+        if _has_launchd():
+            return uninstall_launchd()
+        return "no herd.service to remove"
+    if not SERVICE.exists():
         return "no herd.service to remove"
     subprocess.run(["systemctl", "--user", "disable", "--now", "herd.service"],
                    check=False, capture_output=True, timeout=SYSTEMCTL_TIMEOUT)

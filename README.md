@@ -61,9 +61,11 @@ The installer:
    else it does. A `statusLine` running a script herd doesn't recognise is **left
    alone and reported**: point it at `src/herd/hooks/statusline.sh` yourself, or herd
    records no cost/context/branch (that hook is the only writer of those columns);
-4. **installs the daemon** as a `systemd --user` service (`herd.service`), enabled on
-   login with auto-restart. Where `systemctl --user` is unavailable (macOS/headless)
-   this step is a graceful no-op — run the daemon yourself.
+4. **installs the daemon** to start on login and restart on exit — a `systemd --user`
+   service (`herd.service`) on Linux, a LaunchAgent (`com.codingzen.herd`) on macOS,
+   where it also logs to `~/.herd/daemon.{out,err}.log` because launchd keeps no
+   journal. Where neither manager exists (headless/containers) this step is a
+   graceful no-op — run the daemon yourself.
 5. **symlinks the CLI** — `herd` into `~/.local/bin` and bash completion into
    `~/.local/share/bash-completion/completions` (WARNs if `~/.local/bin` isn't on
    your PATH);
@@ -267,9 +269,15 @@ all — today it is `start|tool|stop|notify|end`.
 ### The daemon
 
 ```bash
+# Linux (systemd --user)
 systemctl --user status herd            # is it running
 systemctl --user restart herd           # after editing the source
 journalctl --user -u herd -f            # watch it (quiet unless it errors)
+
+# macOS (launchd). $UID, not `sudo` — it is a per-user agent.
+launchctl print gui/$UID/com.codingzen.herd     # is it running (look for `state`/`pid`)
+launchctl kickstart -k gui/$UID/com.codingzen.herd   # -k = restart if already up
+tail -f ~/.herd/daemon.err.log                  # launchd has no journal; this is it
 
 # or run it by hand:
 PYTHONPATH=src python3 -m herd.daemon           # reaper + attention
@@ -403,7 +411,8 @@ and `journalctl --user -u herd`.
 | `herd watch` → "needs fzf and a tty" | `fzf` isn't installed, or you're not on a terminal |
 | `herd jump` prints a list instead of jumping | same — no `fzf`, so it degrades to printing rather than failing |
 | a key bound to `launch --type=background` does nothing | that process gets no `KITTY_LISTEN_ON`; add `--allow-remote-control` (see [watch](#herd-watch--the-dashboard)) |
-| no `systemctl --user` (macOS/headless) | expected — the service step no-ops. Run `python3 -m herd.daemon` yourself |
+| no `systemctl --user` or `launchctl` (headless/containers) | expected — the service step no-ops. Run `python3 -m herd.daemon` yourself |
+| macOS: daemon not running after login | `launchctl print gui/$UID/com.codingzen.herd`; if absent, re-run the installer. Its stderr is `~/.herd/daemon.err.log`, not a journal |
 
 Start fresh: stop the daemon, delete `~/.herd/herd.db*` (the DB plus its `-wal` and
 `-shm` siblings), and re-run the installer. You lose history; nothing else depends
