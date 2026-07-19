@@ -9,7 +9,7 @@ from herd import cli
 from herd.kitty.launch import build_launch_argv, launch
 from herd.spawn import SpawnSpec, spawn, valid_job
 
-from helpers import T0, SOCK, mk_session, mk_herd, job_holder
+from helpers import T0, SOCK, short_tmp_dir, mk_session, mk_herd, job_holder
 
 
 def _spec(job="api", cwd="/code/app", launch_type="tab", prompt=None, claude_args=None):
@@ -215,24 +215,30 @@ def test_launch_passes_the_built_argv_through():
 @pytest.mark.shell
 @pytest.mark.skipif(shutil.which("kitten") is None,
                     reason="drives the real `kitten` binary, which kitty ships")
-def test_launch_times_out_against_a_socket_that_never_answers(tmp_path, monkeypatch):
+def test_launch_times_out_against_a_socket_that_never_answers(monkeypatch):
     """The real path: a stale unix:/tmp/kitty-<pid> whose kitty is gone. Drives the
     actual subprocess call, not a stub, so the TimeoutExpired -> "" -> None chain
     is exercised end to end.
 
     Needs kitten on PATH — the point is the REAL subprocess, so stubbing it would
     delete the test. CONTRIBUTING lists kitty as not needed for the suite, and this
-    is the one exception, so it skips rather than fails."""
+    is the one exception, so it skips rather than fails.
+
+    The two guards are not redundant. The skip covers a runner with no kitty; a Mac
+    HAS kitten, so it runs there — and then binds under short_tmp_dir() rather than
+    tmp_path, because sun_path is 104 bytes on macOS and pytest's tmp_path overruns
+    it, failing the bind before the timeout under test is ever reached."""
     import socket as _socket
     from herd.kitty import launch as L
-    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-    p = str(tmp_path / "kitty-stale")
-    srv.bind(p); srv.listen(1)
     monkeypatch.setattr(L, "LAUNCH_TIMEOUT", 1)
-    try:
-        assert L.launch(_spec(), f"unix:{p}") is None
-    finally:
-        srv.close()
+    with short_tmp_dir() as d:
+        srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        p = str(d / "kitty-stale")
+        srv.bind(p); srv.listen(1)
+        try:
+            assert L.launch(_spec(), f"unix:{p}") is None
+        finally:
+            srv.close()
 
 
 # ── spawned sessions carry their own identity (DECISIONS.md#spawn-identity) ───

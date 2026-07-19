@@ -1,5 +1,6 @@
 """T — jump / focus (kitty/focus.py + cli.py): pid->window resolution, the focus
 path (re-derive, ack, self-heal), and cli display/resolve/completion."""
+import contextlib
 import inspect
 import pathlib
 import re
@@ -14,7 +15,7 @@ from herd.kitty import focus
 from herd.kitty.focus import window_for_pid, flatten_windows, focus_session
 from herd import cli
 
-from helpers import T0, T1, SOCK, mk_session, mk_herd, mk_attention
+from helpers import T0, T1, SOCK, short_tmp_dir, mk_session, mk_herd, mk_attention
 
 _WINS = [{"id": 1, "foreground_processes": [{"pid": 111, "cmdline": ["bash"]}]},
          {"id": 42, "foreground_processes": [{"pid": 5000, "cmdline": ["/opt/claude"]},
@@ -428,37 +429,40 @@ def test_jump_without_fzf_reports_an_unmatched_query(monkeypatch, fresh, capsys)
 # `kitten @` against a stale unix socket (the kitty is gone, the socket file is
 # not) BLOCKS. These sit on the interactive path, so an unbounded call hangs
 # `herd jump` with no output — on exactly the stale placement the cache tolerates.
-def _hanging_socket(tmp_path):
+@contextlib.contextmanager
+def _hanging_socket():
     """A real AF_UNIX socket that is listening but never answers — the precise
-    shape of a stale kitty socket, not an approximation of it."""
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    p = str(tmp_path / "kitty-stale")
-    s.bind(p); s.listen(1)
-    return f"unix:{p}", s
+    shape of a stale kitty socket, not an approximation of it.
+
+    Binds under short_tmp_dir(), NOT pytest's tmp_path: sun_path caps at 104 bytes
+    on macOS and tmp_path there is far longer, so bind() raised "AF_UNIX path too
+    long" before the test could assert anything about timeouts."""
+    with short_tmp_dir() as d:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        p = str(d / "kitty-stale")
+        s.bind(p); s.listen(1)
+        try:
+            yield f"unix:{p}", s
+        finally:
+            s.close()
 
 
-def test_ls_against_a_dead_kitty_gives_up(tmp_path, monkeypatch):
-    sock, srv = _hanging_socket(tmp_path)
+def test_ls_against_a_dead_kitty_gives_up(monkeypatch):
     monkeypatch.setattr(focus, "KITTY_TIMEOUT", 1)      # keep the test quick
-    try:
+    with _hanging_socket() as (sock, _srv):
         t0 = time.monotonic()
         out = focus._ls(sock)
         elapsed = time.monotonic() - t0
-    finally:
-        srv.close()
     assert out == ""                                    # -> falls back to the cache
     assert elapsed < 10, f"_ls blocked for {elapsed:.1f}s"
 
 
-def test_focus_against_a_dead_kitty_reports_failure(tmp_path, monkeypatch):
-    sock, srv = _hanging_socket(tmp_path)
+def test_focus_against_a_dead_kitty_reports_failure(monkeypatch):
     monkeypatch.setattr(focus, "KITTY_TIMEOUT", 1)
-    try:
+    with _hanging_socket() as (sock, _srv):
         t0 = time.monotonic()
         ok = focus._focus(sock, 7)
         elapsed = time.monotonic() - t0
-    finally:
-        srv.close()
     assert ok is False                                  # -> "kitty focus failed"
     assert elapsed < 10, f"_focus blocked for {elapsed:.1f}s"
 
