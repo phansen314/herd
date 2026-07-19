@@ -111,9 +111,10 @@ spawn)
     ok "job '$JOB' is free"
 
     echo; c '1' "── spawning ────────────────────────────────────────────────"
-    before=$(q "SELECT COALESCE(MAX(id),0) FROM sessions")
     echo "  \$ herd spawn $JOB"
     "$HERD" spawn "$JOB" 2>&1 | sed 's/^/  /'
+
+    resv=$(q "SELECT COALESCE(MAX(id),0) FROM sessions")   # the reservation W1 just made
 
     echo; c '1' "── waiting for the new claude to reach SessionStart ─────────"
     echo "  (a NEW TAB should have opened. If it asks whether you trust the"
@@ -125,8 +126,13 @@ spawn)
         [ -n "$sid" ] && break
         sleep 1; printf '.'
     done; echo
-    [ "$before" = "$(q "SELECT COALESCE(MAX(id),0) FROM sessions")" ] \
-        || hm "new row(s) appeared since the spawn — see the table for duplicates"
+    # A duplicate is a row created AFTER the reservation, which is what W2b_insert
+    # does when both adopt routes miss. Comparing against MAX(id) from BEFORE the
+    # spawn was wrong and warned on every successful run: the spawn creates the
+    # reservation itself, so the max always moves.
+    dup=$(q "SELECT COUNT(*) FROM sessions WHERE id > $resv")
+    [ "$dup" = "0" ] && ok "no duplicate row: nothing was created after reservation #$resv" \
+                     || hm "$dup row(s) created after reservation #$resv — adoption missed"
 
     c '1' "── verify ──────────────────────────────────────────────────"
     verify
