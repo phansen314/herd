@@ -230,7 +230,17 @@ def check_daemon(lock_path, holder=None, alive=None):
     if pid and alive(pid):
         return [(OK, "daemon", f"running (pid {pid})")]
     return [(FAIL, "daemon not running",
-             f"stale lock at {lock_path} — start it, or: systemctl --user start herd")]
+             f"stale lock at {lock_path} — start it, or: {_service_start_hint()}")]
+
+
+def _service_start_hint():
+    """The service manager herd installed the daemon under differs by platform, and
+    handing a macOS user a systemctl line is the kind of advice that reads as herd
+    being broken rather than the hint being wrong."""
+    from herd import install                            # local, as in _hooks_current
+    if sys.platform == "darwin":
+        return f"launchctl kickstart gui/{os.getuid()}/{install.LAUNCHD_LABEL}"
+    return "systemctl --user start herd"
 
 
 def _pid_alive(pid):

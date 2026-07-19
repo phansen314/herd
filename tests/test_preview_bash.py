@@ -14,7 +14,8 @@ import pytest
 
 from herd import cli
 from herd.db import connect
-from helpers import mk_attention, mk_herd, mk_session, T0, T1
+from helpers import (mk_attention, mk_herd, mk_session,
+                     sqlite3_cli_emits_raw_control_chars, T0, T1)
 
 
 def _full(c):
@@ -170,12 +171,27 @@ def test_a_control_char_in_a_name_reports_unreadable_not_gone(hook_env, name):
     """\\x1f/\\x1e are the field and record separators, and session_name is arbitrary
     /rename text. The row cannot be parsed — skipping it is right, since rendering a
     mis-split row would show ANOTHER session's data — but calling a live session
-    "gone" is a false statement about the session rather than about the data."""
+    "gone" is a false statement about the session rather than about the data.
+
+    Which of those two happens depends on the sqlite3 CLI, so the invariant is
+    asserted rather than the mechanism. Where the CLI emits the control byte raw,
+    it forges a separator, the record splits, NF != 20 trips and the pane says
+    "unreadable". Where the CLI escapes it to caret notation (Apple's 3.51), no
+    separator ever reaches awk, the split cannot happen and the row renders
+    normally. Both are correct; what neither may do is call a live session gone.
+    """
     c = hook_env.conn()
     pk = mk_session(c, session_id="s1", cwd="/x", session_name=name)
     r = hook_env.run("preview.sh", None, args=[str(pk)])
-    assert r.stdout.strip() == "(preview unavailable — unreadable row)"
+    out = r.stdout.strip()
     assert r.returncode == 0
+    assert out != "(session gone)", "a live session reported as dead"
+    if sqlite3_cli_emits_raw_control_chars():
+        assert out == "(preview unavailable — unreadable row)"
+    else:
+        # Escaped: the real row, and only it — no field of another session's data.
+        assert out.startswith("name      na")
+        assert "session   s1" in out and "herd id   #%d" % pk in out
 
 
 def test_an_absent_id_still_reads_gone_despite_another_broken_row(hook_env):

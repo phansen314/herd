@@ -6,7 +6,7 @@ import subprocess
 
 import pytest
 
-from helpers import W, T0, SOCK, HOOKS, mk_session, mk_herd, mk_attention
+from helpers import W, T0, SOCK, HOOKS, REAL_DATE, mk_session, mk_herd, mk_attention
 
 
 # ── _walk_claude: the ppid-walk logic, against synthetic ancestries ──────────
@@ -319,7 +319,7 @@ def test_now_pair_falls_back_when_date_has_no_percent_3n(tmp_path):
     '...:00.3NZ', which no consumer can parse."""
     fake = tmp_path / "date"
     fake.write_text('#!/bin/bash\nargs=(); for a in "$@"; do args+=("${a//%3N/3N}"); done\n'
-                    'exec /usr/bin/date "${args[@]}"\n')
+                    f'exec {REAL_DATE} "${{args[@]}}"\n')
     fake.chmod(0o755)
     env = {"PATH": f"{tmp_path}:{os.environ['PATH']}"}
     r = _sh('now_pair; echo "$NOW_ISO|$NOW_EPOCH"', env)
@@ -541,9 +541,17 @@ def test_a_transient_date_failure_does_not_downgrade_later_stamps(tmp_path):
     no way back. No output is not evidence about the format."""
     marker = tmp_path / "failed_once"
     fake = tmp_path / "date"
-    fake.write_text(f'#!/bin/bash\n'
+    # The fake EXPANDS %3N itself rather than delegating to the real `date`. The
+    # assertion below is "millis survived", which only means something when the
+    # date underneath can produce millis at all — a real BSD date cannot, so
+    # delegating made this pass vacuously on macOS, the platform whose latching
+    # behavior it exists to pin. Simulating a GNU date keeps the oracle able to
+    # fail everywhere: if the empty first call latches again, call 2 comes back
+    # .000Z on Linux and macOS alike.
+    fake.write_text('#!/bin/bash\n'
                     f'if [ ! -f "{marker}" ]; then touch "{marker}"; exit 1; fi\n'
-                    f'exec /usr/bin/date "$@"\n')
+                    'args=(); for a in "$@"; do args+=("${a//%3N/123}"); done\n'
+                    f'exec {REAL_DATE} "${{args[@]}}"\n')
     fake.chmod(0o755)
     r = subprocess.run(
         ["bash", "-c", f'. "{HOOKS}/common.sh"; now_pair; echo "1:$NOW_ISO"; '
@@ -552,7 +560,7 @@ def test_a_transient_date_failure_does_not_downgrade_later_stamps(tmp_path):
         env=dict(os.environ, PATH=f"{tmp_path}:{os.environ['PATH']}"))
     first, second = [l.split(":", 1)[1] for l in r.stdout.strip().splitlines()]
     assert first == "", "the failing call should yield no stamp at all"
-    assert second.endswith("Z") and not second.endswith(".000Z"), \
+    assert second.endswith(".123Z"), \
         f"millis lost after a transient failure: {second!r}"
 
 
@@ -560,7 +568,7 @@ def test_a_date_without_percent_3n_still_latches(tmp_path):
     """The other side — a real BSD date must still be detected once and reused."""
     fake = tmp_path / "date"
     fake.write_text('#!/bin/bash\nargs=(); for a in "$@"; do args+=("${a//%3N/3N}"); done\n'
-                    'exec /usr/bin/date "${args[@]}"\n')
+                    f'exec {REAL_DATE} "${{args[@]}}"\n')
     fake.chmod(0o755)
     r = subprocess.run(
         ["bash", "-c", f'. "{HOOKS}/common.sh"; now_pair; echo "$NOW_ISO"'],

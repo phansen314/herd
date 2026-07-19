@@ -4,8 +4,12 @@ The builders collapse the endless `INSERT INTO sessions(...) VALUES(...)` that t
 old validate.py repeated ~90 times. Every column has a sane default; name only
 what the test cares about.
 """
+import contextlib
 import pathlib
+import shutil
+import subprocess
 import sys
+import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -24,6 +28,49 @@ T0_240 = "2026-07-15T10:04:00.000Z"
 
 SOCK = "unix:/tmp/kitty-20035"
 HOOKS = ROOT / "src" / "herd" / "hooks"
+
+# `date` by ABSOLUTE path, resolved before any test shadows PATH. The fake-date
+# fixtures shadow PATH to intercept `date`, so their final `exec` must name the
+# real binary directly — and it is /bin/date on macOS, /usr/bin/date on most Linux.
+# Hardcoding either one makes the BSD-portability tests fail on the very platform
+# they exist to protect (see CONTRIBUTING.md, "write oracles that can fail").
+REAL_DATE = shutil.which("date") or "/bin/date"
+
+
+def sqlite3_cli_emits_raw_control_chars():
+    """Does the sqlite3 CLI pass a control character in a VALUE through untouched
+    under `.mode list`?
+
+    Newer builds (Apple's 3.51 among them) render it in caret notation instead —
+    char(31) comes out as the two bytes "^_", not 0x1f. That decides whether
+    preview.sh's separators can ever be forged by row data: where the CLI escapes
+    them, a value can no longer split a record, the NF != 20 guard cannot trip,
+    and the row renders normally. Probed rather than version-gated — the behavior
+    is what matters and it is cheap to just ask.
+    """
+    out = subprocess.run(
+        ["sqlite3", ":memory:"],
+        input='.mode list\n.separator "\x1f" "\x1e"\nselect char(31);\n',
+        capture_output=True, text=True,
+    ).stdout
+    return "\x1f" in out
+
+
+@contextlib.contextmanager
+def short_tmp_dir(prefix="herd-"):
+    """A temp dir with a SHORT absolute path, for binding AF_UNIX sockets.
+
+    sun_path is 104 bytes on macOS (108 on Linux), and pytest's `tmp_path` under
+    macOS's $TMPDIR (/private/var/folders/<...>/pytest-of-<user>/<test-name-N>/)
+    blows past it — bind() then fails with "AF_UNIX path too long" for reasons
+    that have nothing to do with what the test is asserting. /tmp keeps it short
+    on both platforms.
+    """
+    d = tempfile.mkdtemp(prefix=prefix, dir="/tmp")
+    try:
+        yield pathlib.Path(d)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def cells(s):
