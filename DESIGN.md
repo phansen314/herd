@@ -459,7 +459,9 @@ jump *is* an ack (`W6c_ack`).
 
 ### `watch` — fzf *is* the TUI {#watch}
 
-`herd watch` is the dashboard: one kitty tab running the jump picker forever.
+`herd watch` is the dashboard: the jump picker, run forever. Its home is a kitty
+**overlay** on a key (`--one-shot`), which costs no tab and no split; a dedicated
+tab still works and is what plain `watch` is shaped for.
 There is deliberately **no curses layer**. fzf already renders the list,
 navigates it, and — because it spawns [`hooks/preview.sh`](#preview) as a fresh
 process per highlight — shows per-session detail that reads live from SQLite for
@@ -471,6 +473,22 @@ Two things turn a picker into a dashboard:
 Esc therefore re-opens the picker rather than dropping you to a prompt — the tab
 is something you cannot accidentally fall out of. `ctrl-q` and `ctrl-c` are the
 way out.
+
+`--one-shot` inverts exactly that, and only that, because a kitty **overlay** dies
+with its process. Left looping, the overlay would outlive the jump and strand a live
+panel on the window you jumped *away* from — and the next keypress, now in a
+different window, would open another, accumulating one per window visited. So
+one-shot returns after a successful focus, and Esc dismisses rather than re-entering:
+in a panel, a thing you cannot close is a bug, though in the tab it was the point.
+The picker itself is untouched (same flags, same `--expect`, same poker) — one-shot
+changes what `cmd_watch` does with the *result*, not how fzf behaves. It exits on a
+focus, on Esc, or on a quit key; a pick that no longer resolves keeps the panel up,
+because "✗ that session is gone" printed as an overlay tears down is unreadable.
+
+Two facts make the overlay viable, both measured: `--type=overlay` inherits
+`KITTY_LISTEN_ON` (`--type=background` does not, which is why the old dedicated-tab
+launcher needed `--allow-remote-control`), and closing an overlay does **not** hand
+focus back to its parent window, so the jump survives the teardown.
 
 Both quit keys go through `--expect`, which prints the pressed key as stdout's
 first line — every other exit collapses into Esc's outcome, and ctrl-c never
@@ -520,7 +538,7 @@ The marks differ **because the statuses are not equivalent**. Two of the three
 already reach you ambiently; the third is the only one herd tells you something you
 could not otherwise learn, and it is the case a herd-owned notifier was going to
 exist for. Rather than build the actuator, the mark is made legible and the answer to
-"is anything wedged?" is `herd watch` on a dedicated tab
+"is anything wedged?" is `herd watch` one keystroke away
 ([DECISIONS.md#pager](DECISIONS.md#pager)).
 
 Rendering rules (`cli.ATTENTION_MARKS` / `ATTENTION_REASONS`): every glyph occupies

@@ -137,7 +137,8 @@ herd ls                 # live sessions, attention-first, by name
 herd spawn <job>        # launch claude in a new kitty tab, tracked from the start
 herd jump               # fuzzy-pick a session (fzf) with a live preview, and focus it
 herd jump <query>       # herd id, name (/rename), job, uuid, or cwd; unique match jumps
-herd watch              # the picker as a permanent dashboard, for a dedicated tab
+herd watch              # the picker as a permanent dashboard
+herd watch --one-shot   # same picker, exits after one jump (kitty overlay panel)
 herd doctor             # why isn't herd recording anything? (see Troubleshooting)
 ```
 
@@ -195,43 +196,33 @@ silently doing nothing. (Why TOML, and how precedence is resolved:
 
 ### `herd watch` — the dashboard
 
-The same picker, looping, refreshing itself as sessions change. Give it a dedicated
-kitty tab and a key to reach it:
+The same picker, looping, refreshing itself as sessions change. The best home for it
+is a **kitty overlay** — a panel that stacks on top of whatever window you're in,
+costs no tab and no split, and disappears when you pick something:
 
 ```conf
-# ~/.config/kitty/kitty.conf — focus the herd tab, launching it once if needed.
-# --allow-remote-control is REQUIRED: a plain --type=background process gets no
-# KITTY_LISTEN_ON, so every `kitten @` in the script fails silently and the key
-# looks like it does nothing.
-map ctrl+space>c launch --type=background --allow-remote-control ~/.config/kitty/focus-herd.sh
+# ~/.config/kitty/kitty.conf
+map ctrl+space>c launch --type=overlay ~/.local/bin/herd watch --one-shot
 ```
 
-```sh
-#!/bin/sh
-# ~/.config/kitty/focus-herd.sh
-set -eu
-# Match values are unanchored regexes — bare `title:herd` also hits `herd-2`.
-kitten @ focus-tab --match 'title:^herd$' 2>/dev/null && exit 0
-exec kitten @ launch --type=tab --tab-title herd --cwd "$HOME" \
-    bash -l -i -c 'herd watch; exec bash'
-```
+That's the whole recipe. Two things make it work, both measured rather than assumed:
 
-The login shell matters: `herd` lives in `~/.local/bin`, which a bare `launch` may not
-have on PATH. `exec bash` means quitting the dashboard leaves a shell rather than
-closing the tab.
+- **`--type=overlay` inherits `KITTY_LISTEN_ON`.** `--type=background` does *not*, and
+  a process without it fails every `kitten @` call silently — so the overlay can focus
+  its target with no `--allow-remote-control` on the mapping.
+- **Closing the overlay does not steal focus back.** kitty leaves you on the window you
+  jumped to, so the panel can tear itself down immediately after the jump.
 
-To have the tab from the start, add it to your `startup_session` file:
+`--one-shot` is required here, and it is the only difference from plain `watch`: an
+overlay dies with its process, so the forever-loop would survive the jump and strand a
+live panel on the window you jumped *away* from — then the next keypress, now in a
+different window, would open another. In one-shot mode Enter jumps and closes, Esc
+dismisses, `ctrl-r` still refreshes, `ctrl-q` / `ctrl-c` still quit.
 
-```conf
-new_tab herd
-cd ~
-launch bash -l -i -c 'herd watch; exec bash'
-```
-
-Enter jumps to a session, `ctrl-r` forces a refresh, `ctrl-q` / `ctrl-c` quit. Esc
-re-opens the picker rather than exiting — it's a tab you can't accidentally fall out
-of, so after jumping away, the same key brings you back to a live list. (Why fzf and
-not a curses TUI: [DESIGN.md#watch](DESIGN.md#watch).)
+Plain `herd watch` keeps the original behavior for a dedicated tab or a spare monitor:
+it loops, and Esc re-opens the picker rather than exiting — a window you can't
+accidentally fall out of. (Why fzf and not a curses TUI:
+[DESIGN.md#watch](DESIGN.md#watch).)
 
 ### Reading the database directly
 
@@ -365,9 +356,9 @@ shows in `herd ls` and the jump picker as one of three glyphs:
 
 A stuck session never ends its turn, so it never bells and kitty never flags its tab.
 That is the one state you can only find by *looking* — which is what
-[`herd watch`](#herd-watch--the-dashboard) is for. Give it a dedicated tab and a key
-(recipe above), and the answer to "is anything wedged?" is one keystroke rather than
-a notification you'd have to trust herd to send.
+[`herd watch`](#herd-watch--the-dashboard) is for. Bind it to a key as an overlay
+panel (recipe above), and the answer to "is anything wedged?" is one keystroke rather
+than a notification you'd have to trust herd to send.
 
 herd deliberately sends none. Why a session-invoked pager was considered and
 rejected: [DECISIONS.md#pager](DECISIONS.md#pager).
@@ -410,7 +401,7 @@ and `journalctl --user -u herd`.
 | `herd spawn -t` → "templates need Python 3.11+" | `tomllib` is 3.11+. Only templates need it; the rest of herd runs on 3.9 |
 | `herd watch` → "needs fzf and a tty" | `fzf` isn't installed, or you're not on a terminal |
 | `herd jump` prints a list instead of jumping | same — no `fzf`, so it degrades to printing rather than failing |
-| a key bound to `launch --type=background` does nothing | that process gets no `KITTY_LISTEN_ON`; add `--allow-remote-control` (see [watch](#herd-watch--the-dashboard)) |
+| a key bound to `launch --type=background` does nothing | that process gets no `KITTY_LISTEN_ON`, so every `kitten @` fails silently; add `--allow-remote-control`, or use `--type=overlay`, which inherits it (see [watch](#herd-watch--the-dashboard)) |
 | no `systemctl --user` or `launchctl` (headless/containers) | expected — the service step no-ops. Run `python3 -m herd.daemon` yourself |
 | macOS: daemon not running after login | `launchctl print gui/$UID/com.codingzen.herd`; if absent, re-run the installer. Its stderr is `~/.herd/daemon.err.log`, not a journal |
 

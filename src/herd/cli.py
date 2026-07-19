@@ -5,6 +5,7 @@
     herd jump <query>       # query = herd id, name (/rename), job, uuid, or cwd
     herd spawn <job>        # launch a named claude session in a kitty tab/pane
     herd watch              # the picker as a permanent dashboard (dedicated tab)
+    herd watch --one-shot   # same picker, exits after one jump (kitty overlay panel)
     herd preview <id>       # session detail (used by the fzf preview pane)
 
 Sessions show by their recognizable name — Claude's /rename name, else herd's job,
@@ -399,12 +400,16 @@ def _free_port():
 _QUIT_KEYS = ("ctrl-q", "ctrl-c")
 
 
-def _watch_flags(port):
+def _watch_flags(port, one_shot=False):
+    """Only the header differs between the modes. The picker itself is identical —
+    one-shot changes what cmd_watch does with the RESULT, not how fzf behaves, so
+    --expect must stay on both paths (see test_only_watch_expects_keys)."""
     return [f"--listen={port}",
             f"--bind=ctrl-r:reload({_ROWS_CMD})",
             f"--expect={','.join(_QUIT_KEYS)}",
             "--prompt", "herd ▸ ",
-            "--header", "enter jump · ctrl-r refresh · ctrl-q quit"]
+            "--header", ("enter jump · esc dismiss · ctrl-r refresh" if one_shot
+                         else "enter jump · ctrl-r refresh · ctrl-q quit")]
 
 
 def _parse_expect(stdout):
@@ -453,8 +458,24 @@ def _reap_poker(poker, port):
 
 def cmd_watch(conn, args):
     """The jump picker, looping forever, self-refreshing — a tab you can't fall out of.
-    Esc re-enters the picker; ctrl-q (or ctrl-c) is the way out."""
+    Esc re-enters the picker; ctrl-q (or ctrl-c) is the way out.
+
+    --one-shot keeps every bit of that machinery (the refresh poker, --listen,
+    ctrl-r, the live preview pane) but exits after ONE resolution, because it runs
+    in a kitty overlay window and an overlay dies with its process. Without it the
+    overlay survives the jump and strands itself on the window you jumped AWAY from,
+    and the next keypress — now in a different window — opens a second one. Overlays
+    accumulate, one per window visited. Esc dismisses there rather than re-entering:
+    a panel you cannot close is a bug, even though for the dedicated tab it was the
+    whole point.
+    """
     import time
+    one_shot = args == ["--one-shot"]
+    if args and not one_shot:
+        # main() refuses this first (before opening the DB) for CLI callers; this is
+        # the same guard for direct callers. The two must stay in agreement.
+        print(f"herd watch: unknown option {args[0]!r} — the only option is --one-shot")
+        return 2
     if not _has_fzf():
         print("herd watch needs fzf and a tty (try: herd ls)")
         return 2
@@ -462,6 +483,9 @@ def cmd_watch(conn, args):
     while True:
         rows = _live(conn)
         if not rows:
+            if one_shot:                    # nothing to pick, and an overlay that
+                print("  (no live sessions)")   # sleeps forever is a stuck panel
+                return 1                    # 1, as cmd_jump returns for the same case
             if not empty:                   # print once, not every tick
                 print("  (no live sessions — waiting)")
                 empty = True
@@ -479,7 +503,7 @@ def cmd_watch(conn, args):
         port = _free_port()
         poker = _spawn_poker(port)
         try:
-            out = _fzf_run(rows, "", _watch_flags(port))
+            out = _fzf_run(rows, "", _watch_flags(port, one_shot))
         except KeyboardInterrupt:
             return 130                      # belt-and-braces: a ctrl-c that lands
                                             # before fzf has taken the terminal
@@ -498,8 +522,19 @@ def cmd_watch(conn, args):
         picked = _parse_pick(_live(conn), sel)
         if picked is not None:
             _do_focus(conn, picked)         # pick or cancel: either way, back in
+            if one_shot:
+                return 0                    # focused; the overlay tears down here.
+                                            # Measured: kitty does NOT hand focus
+                                            # back to the overlay's parent window on
+                                            # teardown, so the jump survives it.
         elif sel.strip():                   # a selection we could not resolve at all
             print("✗ that session is gone")  # (it ended between the pick and now)
+            # Deliberately NOT an exit in one-shot mode. Anything printed as an
+            # overlay closes is unreadable — it flashes and the window is gone. So
+            # one-shot exits on a successful focus, on Esc, or on a quit key; a pick
+            # that resolves to nothing keeps the panel up so the message can be read.
+        elif one_shot:
+            return 130                      # Esc: no key, no selection — dismiss
 
 
 def _complete_tokens(rows):
@@ -610,8 +645,11 @@ def cmd_doctor(argv):
 
 
 # Verbs that take NO arguments at all. `spawn` parses its own (argparse, plus a
-# `--` passthrough), `jump`/`preview` take one operand — those validate themselves.
-_NO_ARGS = {"ls", "watch", "rows", "complete", "tcomplete", "poke"}
+# `--` passthrough), `jump`/`preview` take one operand, `watch` takes one optional
+# flag — those validate themselves. watch left this set when --one-shot landed, so
+# `herd watch --typo` is refused by main()'s own watch guard instead (before the DB
+# is opened), with a matching one in cmd_watch for direct callers.
+_NO_ARGS = {"ls", "rows", "complete", "tcomplete", "poke"}
 
 USAGE = """usage: herd <command> [args]
 
@@ -619,6 +657,7 @@ USAGE = """usage: herd <command> [args]
   jump [query]    focus a session; fuzzy-pick when the query is not unique
   spawn <job>     launch a named claude session in a kitty tab/pane
   watch           the picker as a permanent dashboard
+    --one-shot    exit after one jump (for a kitty overlay panel)
   doctor          diagnose the install
 
   query = herd id, name, job, uuid prefix, or cwd substring"""
@@ -650,6 +689,16 @@ def main(argv=None):
         return 2
     if cmd in ("jump", "preview") and rest and rest[0].startswith("-"):
         print(f"herd {cmd}: unknown option {rest[0]!r} — a query is not a flag")
+        print()
+        print(USAGE)
+        return 2
+    # watch is out of _NO_ARGS (it takes --one-shot), so the guard above no longer
+    # covers it. It gets its own, HERE rather than in cmd_watch, because refusing
+    # argv must not cost a DB open — test_cli_refuses_unknown_arguments pins that,
+    # and it caught this exact mistake. cmd_watch keeps a matching guard for direct
+    # callers; the two must stay in agreement.
+    if cmd == "watch" and rest and rest != ["--one-shot"]:
+        print(f"herd watch: unknown option {rest[0]!r} — the only option is --one-shot")
         print()
         print(USAGE)
         return 2

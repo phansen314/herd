@@ -317,6 +317,106 @@ def test_watch_reaps_its_poker_even_when_the_picker_raises(monkeypatch, fresh):
     assert len(killed) == 1
 
 
+# ── watch --one-shot: the kitty overlay mode ────────────────────────────────
+# The tests above all drive cmd_watch(c, []) and pin the LOOPING default. That is
+# deliberate and load-bearing: --one-shot must not change the dedicated-tab
+# behavior, and test_watch_reenters_the_picker_on_esc above is the exact assertion
+# --one-shot inverts. If both keep passing, the flag is genuinely opt-in.
+#
+# _watch_driver raises "cmd_watch looped past its canned input" when the loop asks
+# for more fzf output than it was given, so handing it exactly ONE canned picker is
+# how these tests prove watch exited rather than looped.
+
+
+def test_one_shot_exits_after_a_jump(monkeypatch, fresh):
+    """Enter focuses and returns — one picker, not two. This is the whole feature:
+    the overlay dies with the process, so looping strands it on the origin window."""
+    c, pk = _watch_fixture(fresh)
+    killed, _ = _watch_driver(monkeypatch, [f"\n{pk}\t! #{pk}  api\n"])
+    focused = []
+    monkeypatch.setattr(cli, "_do_focus", lambda conn, row: focused.append(row["id"]))
+    assert cli.cmd_watch(c, ["--one-shot"]) == 0
+    assert focused == [pk]
+    assert len(killed) == 1                 # focused, exited, and still reaped
+
+
+def test_one_shot_dismisses_on_esc(monkeypatch, fresh):
+    """Esc prints nothing at all. Default watch re-enters the picker; a panel you
+    cannot close with Esc is a bug, so one-shot exits 130 (cancel, as cmd_jump)."""
+    c, _ = _watch_fixture(fresh)
+    killed, _ = _watch_driver(monkeypatch, [""])
+    assert cli.cmd_watch(c, ["--one-shot"]) == 130
+    assert len(killed) == 1
+
+
+@pytest.mark.parametrize("key", ["ctrl-q", "ctrl-c"])
+def test_one_shot_quits_on_the_quit_keys_too(monkeypatch, fresh, key):
+    """The quit keys are unchanged by the flag — the one path both modes share."""
+    c, pk = _watch_fixture(fresh)
+    _watch_driver(monkeypatch, [f"{key}\n{pk}\t! #{pk}  api\n"])
+    assert cli.cmd_watch(c, ["--one-shot"]) == 0
+
+
+def test_one_shot_returns_when_the_herd_is_empty(monkeypatch, fresh):
+    """Default watch sleeps until a session shows up. An overlay doing that is a
+    stuck panel with nothing in it, so one-shot returns 1 like `jump` on no rows."""
+    c = fresh()                             # no sessions at all
+    monkeypatch.setattr(cli, "_has_fzf", lambda: True)
+
+    def no_sleep(_):
+        raise AssertionError("one-shot must not wait for a session to appear")
+
+    # cmd_watch does `import time` locally, so there is no cli.time to patch —
+    # patch the stdlib module its local import resolves to.
+    monkeypatch.setattr("time.sleep", no_sleep)
+    assert cli.cmd_watch(c, ["--one-shot"]) == 1
+
+
+def test_one_shot_keeps_the_panel_up_on_an_unresolvable_pick(monkeypatch, fresh):
+    """A pick whose session died between the pick and the lookup must NOT exit:
+    '✗ that session is gone' printed as the overlay tears down is unreadable. So
+    the panel stays and the message can be read — hence a SECOND picker here."""
+    c, _ = _watch_fixture(fresh)
+    gone = "9999\t! #9999 vanished\n"
+    killed, _ = _watch_driver(monkeypatch, [f"\n{gone}", "ctrl-q\n"])
+    assert cli.cmd_watch(c, ["--one-shot"]) == 0    # looped, then quit
+    assert len(killed) == 2                         # two pickers, two pokers
+
+
+def test_one_shot_header_tells_the_truth_about_esc(fresh):
+    """The header is the only flag that differs. Both modes keep --expect: one-shot
+    changes what cmd_watch does with the result, not how fzf behaves."""
+    plain, once = cli._watch_flags(4321), cli._watch_flags(4321, one_shot=True)
+    assert "esc dismiss" in once[once.index("--header") + 1]
+    assert "esc" not in plain[plain.index("--header") + 1]
+    assert "--expect=ctrl-q,ctrl-c" in plain and "--expect=ctrl-q,ctrl-c" in once
+
+
+def test_watch_refuses_unknown_options(monkeypatch, fresh):
+    """watch left _NO_ARGS to take --one-shot, so main()'s generic no-args guard no
+    longer covers it and cmd_watch is the ONLY thing refusing a typo. Without this
+    test, `herd watch --one-shit` silently runs the forever-loop in an overlay.
+    See main()'s docstring: an unrecognized flag is refused, never repurposed."""
+    c, _ = _watch_fixture(fresh)
+
+    def no_poker(port):
+        raise AssertionError("refused argv must not reach the picker")
+
+    monkeypatch.setattr(cli, "_spawn_poker", no_poker)
+    monkeypatch.setattr(cli, "_has_fzf", lambda: True)
+    for bad in (["--foo"], ["--one-shot", "extra"], ["one-shot"], ["--one-shot=1"]):
+        assert cli.cmd_watch(c, bad) == 2, bad
+
+
+def test_watch_is_not_in_no_args_but_still_a_user_command():
+    """The pair that keeps --one-shot reachable: out of _NO_ARGS (or main() rejects
+    the flag before cmd_watch sees it), still in USER_COMMANDS (or it vanishes from
+    help and tab-completion)."""
+    assert "watch" not in cli._NO_ARGS
+    assert "watch" in cli.USER_COMMANDS
+    assert "--one-shot" in cli.USAGE
+
+
 def test_parse_expect_matches_measured_fzf_output():
     """Byte-for-byte what fzf 0.44.1 writes, captured by injecting keys via a pty."""
     assert cli._parse_expect("ctrl-q\n1\tAAA\n") == ("ctrl-q", "1\tAAA\n")
@@ -770,7 +870,8 @@ def test_poke_refuses_a_port_that_is_not_a_number(bad, monkeypatch, fresh):
 @pytest.mark.parametrize("argv,why", [
     (["ls", "--help"], "ls ignored the flag and listed"),
     (["ls", "extra"], "ls takes no operand"),
-    (["watch", "--foo"], "watch takes no arguments"),
+    (["watch", "--foo"], "watch's only option is --one-shot"),
+    (["watch", "--one-shot", "extra"], "--one-shot takes no operand"),
     (["jump", "--foo"], "searched for a session named '--foo'"),
     (["preview", "-1"], "not an id"),
 ])
@@ -779,6 +880,19 @@ def test_cli_refuses_unknown_arguments(argv, why, monkeypatch, capsys):
                         lambda *a, **k: pytest.fail(f"must not open the DB: {why}"))
     assert cli.main(argv) == 2, why
     assert "usage" in capsys.readouterr().out
+
+
+def test_cli_lets_one_shot_through(monkeypatch):
+    """The other half of the guard above: refusing typos is only correct if the one
+    real flag still REACHES cmd_watch. A guard that rejects everything would pass
+    every refusal test and silently break the overlay binding."""
+    got = []
+    monkeypatch.setattr(cli, "connect", lambda *a, **k: None)
+    # setITEM, not setattr: COMMANDS captured the function object at import, so
+    # patching cli.cmd_watch leaves dispatch pointing at the original.
+    monkeypatch.setitem(cli.COMMANDS, "watch", lambda conn, args: got.append(args) or 0)
+    assert cli.main(["watch", "--one-shot"]) == 0
+    assert got == [["--one-shot"]]
 
 
 @pytest.mark.parametrize("flag", ["--help", "-h", "help"])
