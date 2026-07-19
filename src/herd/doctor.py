@@ -12,9 +12,13 @@ Nothing here writes: doctor must be safe on a system that is already sick.
 import json
 import os
 import pathlib
+import re
 import shutil
 import sqlite3
+import subprocess
+import sys
 
+from herd import MIN_PYTHON
 from herd import daemon
 
 OK, WARN, FAIL = "ok", "warn", "fail"
@@ -24,6 +28,13 @@ _MARK = {OK: "✔", WARN: "!", FAIL: "✘"}
 # it, and plenty of herd works without kitty at all.
 REQUIRED = ("jq", "sqlite3", "ps", "bash")
 OPTIONAL = ("kitten", "fzf")
+
+# strflocaltime, which the statusline formats both reset stamps with. PRESENCE IS
+# NOT ENOUGH HERE: on jq 1.5 that function does not exist, the call raises, and a
+# raise aborts the WHOLE filter — so all 23 fields come back empty and the
+# statusline sinks nothing, silently. The per-field `try` wrappers in statusline.sh
+# cannot help; they catch a bad field, not an unknown function.
+JQ_MIN = (1, 6)
 
 
 def _db_path():
@@ -42,6 +53,46 @@ def check_deps(which=shutil.which):
         out.append((OK, f"{b}", p) if p else
                    (WARN, f"{b} not found", "herd spawn / jump need it; the rest works"))
     return out
+
+
+def check_jq_version(which=shutil.which, run=None):
+    """`which jq` answers the wrong question — jq 1.5 is on PATH and still breaks
+    the statusline outright (see JQ_MIN). Returns [] when jq is absent, because
+    check_deps already FAILs that and two lines for one cause is noise."""
+    if which("jq") is None:
+        return []
+    run = run or (lambda: subprocess.run(["jq", "--version"], capture_output=True,
+                                         text=True, timeout=5).stdout)
+    try:
+        raw = (run() or "").strip()
+    except Exception as e:                       # noqa: BLE001
+        return [(WARN, "jq version unknown", f"could not run `jq --version`: {e}")]
+    # "jq-1.7.1", "jq-1.6", older "jq version 1.5", prereleases "jq-1.7rc1".
+    m = re.search(r"(\d+)\.(\d+)", raw)
+    if not m:
+        return [(WARN, "jq version unreadable", f"`jq --version` said {raw!r}")]
+    ver = (int(m.group(1)), int(m.group(2)))
+    if ver < JQ_MIN:
+        return [(FAIL, f"jq {raw} is too old",
+                 f"herd needs jq >= {JQ_MIN[0]}.{JQ_MIN[1]} (strflocaltime) — without "
+                 "it the statusline\n      filter aborts and records NO cost, context "
+                 "or branch, silently")]
+    return [(OK, f"jq {'.'.join(str(n) for n in ver)}", "supports strflocaltime")]
+
+
+def check_python(version_info=None, executable=None):
+    """The dependency doctor is standing inside. bin/herd proves python3 EXISTS
+    (`command -v`) and herd/__init__ enforces the floor at import — but neither is
+    visible in a report, and 'why isn't herd recording' has been answered by 'that
+    is the system python, not the one you installed for' more than once."""
+    vi = version_info or sys.version_info
+    exe = executable or sys.executable
+    cur = (vi[0], vi[1])
+    txt = f"{cur[0]}.{cur[1]}"
+    if cur < MIN_PYTHON:
+        return [(FAIL, f"python {txt} is too old",
+                 f"{exe} — herd needs >= {MIN_PYTHON[0]}.{MIN_PYTHON[1]}")]
+    return [(OK, f"python {txt}", exe)]
 
 
 def check_db(path, connect_fn=None):
@@ -242,7 +293,7 @@ def collect(environ=None, settings_path=None):
     roots = (install.INSTALLED_HOOKS, install.HOOKS_DIR)
     statuslines = tuple(install.statusline_cmd(r) for r in roots)
     return [
-        ("dependencies", check_deps()),
+        ("dependencies", check_deps() + check_jq_version() + check_python()),
         ("database", check_db(_db_path())),
         ("wiring", check_wiring(text, roots, statuslines, tuple(install.HERD_HOOKS))
                    + check_hook_mode(text, install.INSTALLED_HOOKS, install.HOOKS_DIR)),

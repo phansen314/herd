@@ -35,6 +35,53 @@ def test_a_missing_optional_dep_is_only_a_warning():
     assert "kitten" in _text(out)
 
 
+# ── jq version: PRESENCE IS NOT ENOUGH ──────────────────────────────────────
+_HAVE_JQ = lambda b: f"/usr/bin/{b}"             # noqa: E731
+
+
+@pytest.mark.parametrize("raw", ["jq-1.5", "jq version 1.5", "jq-1.4"])
+def test_jq_below_1_6_fails_because_strflocaltime_is_missing(raw):
+    """The whole point: jq is installed, `which` is happy, and the statusline still
+    records nothing — strflocaltime raises and one raise aborts the entire filter."""
+    out = doctor.check_jq_version(which=_HAVE_JQ, run=lambda: raw + "\n")
+    assert FAIL in _levels(out)
+    assert "too old" in _text(out) and "strflocaltime" in _text(out)
+
+
+@pytest.mark.parametrize("raw", ["jq-1.6", "jq-1.7.1", "jq-1.7rc1", "jq-2.0"])
+def test_jq_at_or_above_1_6_is_ok(raw):
+    out = doctor.check_jq_version(which=_HAVE_JQ, run=lambda: raw + "\n")
+    assert _levels(out) == [OK]
+
+
+def test_no_jq_reports_nothing_here_because_check_deps_already_failed_it():
+    """Two lines for one cause is noise — check_deps owns the absent case."""
+    assert doctor.check_jq_version(which=lambda b: None) == []
+
+
+def test_an_unreadable_or_unrunnable_jq_version_warns_rather_than_crashing():
+    """doctor must be safe on a machine that is already sick, so a jq that errors
+    or prints something unrecognised cannot take the whole report down."""
+    def boom():
+        raise OSError("no such file")
+    assert WARN in _levels(doctor.check_jq_version(which=_HAVE_JQ, run=boom))
+    out = doctor.check_jq_version(which=_HAVE_JQ, run=lambda: "not a version")
+    assert WARN in _levels(out) and FAIL not in _levels(out)
+
+
+# ── the interpreter doctor is standing inside ───────────────────────────────
+def test_a_too_old_python_is_named_with_its_path():
+    out = doctor.check_python(version_info=(3, 8, 0), executable="/usr/bin/python3")
+    assert FAIL in _levels(out)
+    assert "3.8" in _text(out) and "/usr/bin/python3" in _text(out)
+
+
+def test_a_supported_python_is_ok():
+    out = doctor.check_python(version_info=(3, 9, 0), executable="/opt/py/bin/python3")
+    assert _levels(out) == [OK]
+    assert "/opt/py/bin/python3" in _text(out)     # WHICH python, not just a version
+
+
 # ── database ────────────────────────────────────────────────────────────────
 def test_a_missing_db_says_run_the_installer(tmp_path):
     out = doctor.check_db(str(tmp_path / "nope.db"))

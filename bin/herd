@@ -16,4 +16,15 @@ while [ -L "$SELF" ]; do
     esac
 done
 HERE="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+# The one dependency `herd doctor` cannot report on, because reporting it means
+# already being inside the interpreter that is missing. Unguarded, this exec'd
+# straight into `bin/herd: python3: command not found` — the shell's message,
+# naming neither herd nor the fix. `command -v` is a builtin: no fork.
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "herd: python3 not found on PATH (herd needs Python >= 3.9)" >&2
+    echo "  the CLI, the daemon and the installer are Python; the hooks are not," >&2
+    echo "  so an already-installed herd keeps recording — you just cannot read it." >&2
+    exit 127
+fi
 PYTHONPATH="$HERE/src${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m herd.cli "$@"
