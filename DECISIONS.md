@@ -252,6 +252,56 @@ could not read, states that nothing changed, prints usage, and exits 2. `--help`
 **Protects:** `test_installer.py::test_unreadable_argv_installs_nothing` and
 `test_known_flags_still_route`.
 
+## 2026-07-18 — The job name follows the pid across `/clear` {#clear-inherits-job}
+
+`/clear` is **Claude's**, not herd's. Claude ends the session and starts a new
+`session_id` in the **same window**, on the **same process**. `W2_adopt` cannot
+match — its subquery needs `stopped_at IS NULL` and the predecessor was just
+stopped — so a spawned job fell through to `W2b_placement`, which omitted
+`job_name`. `herd jump <job>` broke permanently on the first `/clear`.
+
+**The discriminator is the pid, not a time window.** The first design used a
+~60s recency gate, which was a guess. Reading a live herd settled it: four chained
+`/clear` sessions in one window all shared **one pid** (`/clear` does not restart
+the process). So same pid + same window means the same tab continuing, exactly,
+with no threshold to tune. A genuinely new claude in a recycled window has a
+different pid and inherits nothing; a NULL pid matches nothing.
+
+Setting `job_name` on the INSERT branch is not a contract violation — it is
+immutable *once set*, which the untouched `ON CONFLICT` branch still honours.
+
+`test_every_window_lookup_derives_liveness` was relaxed to accept
+`stopped_at IS NOT NULL`: this lookup wants a deliberately STOPPED predecessor,
+which is as explicit a liveness decision as `IS NULL`. The real hole — a window
+lookup with no `stopped_at` reference at all — stays closed.
+
+**Two related bugs are reproduced and deliberately NOT fixed:**
+
+*Two live sessions can hold one job name.* Spawn `api`, let it die, spawn `api`
+again, then resume the first: `R_job_live` returns two. Every clean fix collides
+with something — clearing the resumed row's `job_name` violates immutability and
+undoes the deliberate revive-on-resume behaviour ([#live-column](#live-column)),
+and refusing to reissue a name any *stopped* session holds means names are never
+reusable, since every session is resumable in principle. `spawn` still correctly
+refuses a third, so the only symptom is that `herd jump api` opens the picker
+instead of jumping — which is arguably honest, because the handle really is
+ambiguous.
+
+*A statusline-adopted row is unreapable.* `W5b_adopt` sets `session_id` but never
+`pid`, so `reap_once` skips it (needs `pid IS NOT NULL`) and `W3f` skips it (needs
+`session_id IS NULL`). It holds its job name until the next boot sweep. Only
+reachable in the reconciled-but-unhooked mode; with hooks wired, `W2b_insert`
+heals the pid immediately. Left alone because there is **no liveness oracle** for
+those rows: `updated_at` staleness cannot work, since the statusline's fingerprint
+cache means an idle-but-alive session stops writing for hours, and `W5b_adopt`
+cannot capture a pid because `claude_pid()` is only meaningful from a blocking
+hook. A bad oracle here would reap live sessions, which is the failure class
+[#lost-sessions](#lost-sessions) exists to eliminate.
+
+**Protects:** `test_clear_carries_the_job_name_to_the_new_session` and its four
+siblings in `test_window_reuse.py`. The unrelated-claude and NULL-pid cases are
+what keep the discriminator honest — drop them and a recency heuristic looks fine.
+
 ## 2026-07-18 — Four ways a LIVE session could vanish {#lost-sessions}
 
 An audit found four defects that share one shape: herd concluding a session was

@@ -1,11 +1,15 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]  # PEP 639 license/license-files
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "herd"
 version = "0.1.0"
 description = "Track Claude Code sessions and jump to them in kitty"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Paul Hansen", email = "paul.b.hansen@gmail.com" }]
 requires-python = ">=3.9"
 dependencies = []
 # Local-only by design: no network, no runtime deps. The hooks are bash + jq +

@@ -147,12 +147,19 @@ def test_core_writers_take_no_tier2_value():
 # ── 44. liveness is derived, never stored ────────────────────────────────────
 def test_every_window_lookup_derives_liveness():
     """Any (socket, window_id) LOOKUP (kitty_socket = :param) must JOIN
-    sessions.stopped_at. W2b_placement's `= excluded.` is a WRITE, not a lookup."""
+    sessions.stopped_at. W2b_placement's `= excluded.` is a WRITE, not a lookup.
+
+    EITHER DIRECTION counts. What this forbids is a window lookup that ignores
+    liveness altogether and so treats a dead predecessor's placement as current.
+    W2b_placement's job_name inheritance is a lookup for a session that is
+    deliberately STOPPED (the /clear predecessor whose job name should follow the
+    tab), which is just as explicit a liveness decision as `IS NULL`. Accepting
+    `IS NOT NULL` keeps the real hole — no stopped_at reference at all — closed."""
     writes_code = "\n".join(l.split("--")[0] for l in WRITES.splitlines())
     stmts = [s for s in writes_code.split(";") if "window_id" in s and "kitty_socket" in s]
     lookups = [s for s in stmts if re.search(r"kitty_socket\s*=\s*:", s, re.I)]
     offenders = [" ".join(s.split())[:70] for s in lookups
-                 if not re.search(r"stopped_at\s+IS\s+NULL", s, re.I)]
+                 if not re.search(r"stopped_at\s+IS\s+(NOT\s+)?NULL", s, re.I)]
     assert not offenders, f"un-joined window lookups: {offenders}"
 
 

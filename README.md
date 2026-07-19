@@ -33,7 +33,8 @@ Every Claude Code session writes into `~/.herd/herd.db` as it lives:
 ## Install
 
 Requires: `bash`, `jq`, `sqlite3`, Python ≥ 3.9, and — for `jump`/`watch`/placement —
-`fzf` and kitty. herd is run from the source tree — no `pip install` needed.
+`fzf` and kitty. The CLI runs from the source tree — no `pip install` needed — and the
+installer *copies* the hooks out of it (see [Hook development](#hook-development---dev)).
 
 An existing `~/.claude/settings.json` is expected; the installer edits it in place.
 
@@ -46,7 +47,13 @@ PYTHONPATH=src python3 -m herd.install --dry-run  # preview, touch nothing
 The installer:
 
 1. **bootstraps** `~/.herd/herd.db` and `~/.herd/templates/`;
-2. **wires the hooks + statusline** into `~/.claude/settings.json` — backing up each
+2. **copies the hooks + their SQL** from the checkout to `~/.herd/hooks` and
+   `~/.herd/schema`, and wires `settings.json` *there* — so a `git checkout`, stash
+   or rebase in the source tree cannot change what running sessions execute. The
+   SQL travels with them on purpose: `common.sh` resolves `writes.sql` relative to
+   the hook directory, and hooks installed without it would fail every write while
+   still exiting 0. Re-run the installer after editing hooks, or use `--dev`;
+3. **wires the hooks + statusline** into `~/.claude/settings.json` — backing up each
    file first (`*.herd-bak.<ts>`, plus a one-time `*.herd-bak.original`) and preserving
    anything it doesn't own (e.g. an existing PreToolUse hook). The `statusLine` key is
    pointed at herd's `statusline.sh`, except where a `~/.claude/custom-status-line.sh`
@@ -54,13 +61,13 @@ The installer:
    else it does. A `statusLine` running a script herd doesn't recognise is **left
    alone and reported**: point it at `src/herd/hooks/statusline.sh` yourself, or herd
    records no cost/context/branch (that hook is the only writer of those columns);
-3. **installs the daemon** as a `systemd --user` service (`herd.service`), enabled on
+4. **installs the daemon** as a `systemd --user` service (`herd.service`), enabled on
    login with auto-restart. Where `systemctl --user` is unavailable (macOS/headless)
    this step is a graceful no-op — run the daemon yourself.
-4. **symlinks the CLI** — `herd` into `~/.local/bin` and bash completion into
+5. **symlinks the CLI** — `herd` into `~/.local/bin` and bash completion into
    `~/.local/share/bash-completion/completions` (WARNs if `~/.local/bin` isn't on
    your PATH);
-5. **self-tests** — runs the wired hooks against a temp DB and prints PASS/FAIL.
+6. **self-tests** — runs the wired hooks against a temp DB and prints PASS/FAIL.
 
 If you use [klawde](https://github.com/wolffiex/klawde), note that the installer
 **unwires it**: any hook command under `/.klawde/` is dropped from `settings.json`
@@ -97,6 +104,29 @@ fall back to the oldest `*.herd-bak.<ts>`.) If no pre-herd copy survives it says
 exits nonzero, and leaves the file wired for you to unwire by hand.
 
 Your data survives either way: `~/.herd/herd.db` is never deleted.
+
+### Hook development (--dev)
+
+The copy in step 2 is what makes hook edits invisible until you re-install. If you're
+*working on* the hooks, that round trip gets old:
+
+```bash
+PYTHONPATH=src python3 -m herd.install --dev   # wire the CHECKOUT, no copy
+```
+
+Every session then executes `src/herd/hooks/*.sh` directly, so edits take effect on
+the next hook fire. The tradeoff is the one the copy exists to prevent: **a `git
+checkout`, stash or rebase now changes what live sessions run** — mid-turn. `herd
+doctor` reports which mode is wired, WARNs while `--dev` is active, and on a copy
+install tells you when the copy has drifted from the tree. Re-run the installer with
+no flags to go back to the copy.
+
+### Bad flags are refused
+
+An argv token the installer doesn't recognise is treated as a typo, not ignored:
+it prints the usage, **changes nothing**, and exits 2. Same for `--uninstall`
+combined with `--dry-run` or `--dev` — uninstall has no dry-run and ignores `--dev`,
+so accepting either would do something other than what you asked.
 
 ## Using it
 
@@ -463,3 +493,7 @@ herd started as a rewrite of *klawde* and deliberately diverges from it: livenes
 derived from `stopped_at` rather than a denormalized flag; the idle signal is the gap
 between two clocks rather than a single constantly-stamped one; and every write goes
 through canonical SQL rather than statements re-typed into each hook.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

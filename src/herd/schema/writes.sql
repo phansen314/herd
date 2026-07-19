@@ -97,11 +97,38 @@ WHERE pid = :pid AND stopped_at IS NULL
 -- stands in, so a user-started `claude` is first-class. Only writer of
 -- source='hook'. pk via SELECT on session_id (NOT last_insert_rowid(), which
 -- returns the INSERTed not the ON-CONFLICT-updated row). Run in the SAME run_tx
--- as W2b_insert. Omits job_name/created_at + keeps source unchanged per the
--- mutability contract. Trailing WHERE = no-op suppressor for an unchanged re-fire.
+-- as W2b_insert. Keeps source and created_at unchanged per the mutability
+-- contract. Trailing WHERE = no-op suppressor for an unchanged re-fire.
+--
+-- job_name is INHERITED on the INSERT branch, and only there. /clear is Claude's,
+-- not herd's: Claude ends the session and starts a NEW session_id in the SAME
+-- window (DESIGN.md#per-hook-notes). W2_adopt cannot match — its subquery needs
+-- stopped_at IS NULL and the predecessor was just stopped — so a spawned job fell
+-- through to here, which omitted job_name, and `herd jump <job>` broke permanently
+-- on the first /clear.
+--
+-- THE PID IS THE DISCRIMINATOR, not a time window. /clear does not restart the
+-- process, so the successor inherits the predecessor's pid — verified against a
+-- live herd where four chained /clear sessions in one window all shared one pid.
+-- Same pid + same window means the same tab continuing, so the job name follows
+-- it. An unrelated claude started in a recycled window later has a different pid
+-- and inherits nothing, and a NULL pid (claude_pid found no ancestor) matches
+-- nothing, so both degrade to today's behaviour.
+--
+-- Setting job_name on a NEW row is not a mutation: the contract makes it immutable
+-- ONCE SET, which the untouched ON CONFLICT branch below still honours.
 -- :name W2b_placement
-INSERT INTO herd_sessions(session_pk, kitty_socket, window_id, source, verified_at)
-SELECT id, :socket, :win, 'hook', :now FROM sessions WHERE session_id = :session_id
+INSERT INTO herd_sessions(session_pk, job_name, kitty_socket, window_id, source, verified_at)
+SELECT s.id,
+       (SELECT h2.job_name FROM herd_sessions h2
+          JOIN sessions s2 ON s2.id = h2.session_pk
+         WHERE h2.kitty_socket = :socket AND h2.window_id = :win
+           AND s2.stopped_at IS NOT NULL
+           AND s2.pid IS NOT NULL AND s2.pid = s.pid
+           AND h2.job_name IS NOT NULL
+         ORDER BY s2.stopped_at DESC, s2.id DESC LIMIT 1),
+       :socket, :win, 'hook', :now
+FROM sessions s WHERE s.session_id = :session_id
 ON CONFLICT(session_pk) DO UPDATE SET
     kitty_socket = excluded.kitty_socket,
     window_id    = excluded.window_id,
