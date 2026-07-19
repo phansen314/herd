@@ -389,6 +389,53 @@ def _safe(label, fn, *a, **kw):
                  f"{type(e).__name__}: {e} — this is a herd bug, please report it")]
 
 
+def check_kitty(environ, which=shutil.which, run=None):
+    """Is kitty's remote control actually available to herd?
+
+    Returns [] when kitten is absent — check_deps already WARNs it, and two lines
+    for one cause is noise (same rule as check_jq_version).
+
+    This reads the ENVIRONMENT, never kitty.conf: that file has includes and
+    last-wins overrides, so a parse could confidently declare a working setup
+    broken. See herd.kitty.config for the full argument. WARN and never FAIL —
+    kitten/fzf are OPTIONAL and herd still records sessions without kitty; only
+    placement, spawn and jump are lost.
+    """
+    from herd.kitty import config
+    if which("kitten") is None:
+        return []
+    st = config.state(environ)
+    if st == config.NOT_KITTY:
+        # Unverifiable, not broken. check_hook_mode's unknown-state branch is the
+        # precedent: a check that cries wolf where it cannot see teaches people to
+        # ignore it.
+        return [(OK, "kitty remote control unverified",
+                 "not running inside kitty — run `herd doctor` in a kitty window")]
+    if st == config.OFF:
+        return [(WARN, "kitty remote control is OFF",
+                 "in kitty, but KITTY_LISTEN_ON is unset, so herd records no window "
+                 "for any\n      session and spawn/jump cannot work. Add to "
+                 f"{config.KITTY_CONF}:\n"
+                 "        allow_remote_control yes\n"
+                 "        listen_on unix:/tmp/kitty-{kitty_pid}\n"
+                 f"      then {config.RESTART}")]
+    sock = environ["KITTY_LISTEN_ON"]
+    # focus._ls() is deliberately not reused: it collapses timeout, missing binary
+    # and dead socket into "", and the whole point here is to report WHICH.
+    run = run or (lambda: subprocess.run(["kitten", "@", "--to", sock, "ls"],
+                                         capture_output=True, text=True, timeout=5))
+    try:
+        p = run()
+    except Exception as e:                       # noqa: BLE001
+        return [(WARN, "kitty remote control unreachable",
+                 f"KITTY_LISTEN_ON={sock} but `kitten @ ls` failed: {e}")]
+    if getattr(p, "returncode", 1) != 0:
+        why = (getattr(p, "stderr", "") or "").strip().splitlines()
+        return [(WARN, "kitty remote control refused",
+                 f"{sock}: {why[-1] if why else 'kitten @ ls exited nonzero'}")]
+    return [(OK, "kitty remote control", sock)]
+
+
 def collect(environ=None, settings_path=None):
     """Run every check. Returns [(section, [(level, headline, detail), ...])]."""
     from herd import install                      # local: pulls in pathlib/HOME only
@@ -417,6 +464,7 @@ def collect(environ=None, settings_path=None):
                          tuple(install.HERD_HOOKS))
                    + _safe("hook mode", check_hook_mode, text,
                            install.INSTALLED_HOOKS, install.HOOKS_DIR)),
+        ("kitty", _safe("kitty", check_kitty, environ)),
         ("daemon", _safe("daemon", check_daemon, daemon.lock_path())),
         ("environment", _safe("environment", check_env, environ)),
         ("hook errors", _safe("hook error log", check_errlog, errlog)),
@@ -446,8 +494,9 @@ _FLAGS = {"--help", "-h"}
 
 USAGE = """usage: herd doctor
 
-  Diagnoses why herd is not recording: dependencies, database, wiring, daemon,
-  environment overrides, and the hook error log. Writes nothing.
+  Diagnoses why herd is not recording: dependencies, database, wiring, kitty
+  remote control, daemon, environment overrides, and the hook error log.
+  Writes nothing.
 
   Exit: 0 healthy (or warnings only), 1 when anything FAILED."""
 

@@ -33,8 +33,10 @@ Every Claude Code session writes into `~/.herd/herd.db` as it lives:
 ## Install
 
 Requires: `bash`, `jq`, `sqlite3`, Python ≥ 3.9, and — for `jump`/`watch`/placement —
-`fzf` and kitty. The CLI runs from the source tree — no `pip install` needed — and the
-installer *copies* the hooks out of it (see [Hook development](#hook-development---dev)).
+`fzf` and kitty. **kitty also has to be configured** for remote control, which is not
+its default: see [kitty setup](#kitty-setup). The CLI runs from the source tree — no
+`pip install` needed — and the installer *copies* the hooks out of it (see
+[Hook development](#hook-development---dev)).
 
 An existing `~/.claude/settings.json` is expected; the installer edits it in place.
 
@@ -69,7 +71,10 @@ The installer:
 5. **symlinks the CLI** — `herd` into `~/.local/bin` and bash completion into
    `~/.local/share/bash-completion/completions` (WARNs if `~/.local/bin` isn't on
    your PATH);
-6. **self-tests** — runs the wired hooks against a temp DB and prints PASS/FAIL.
+6. **offers to enable kitty remote control** — only when it can see that it's off
+   (running inside kitty with no socket). Opt-in, backed up, and removed again by
+   `--uninstall`; see [kitty setup](#kitty-setup);
+7. **self-tests** — runs the wired hooks against a temp DB and prints PASS/FAIL.
 
 If you use [klawde](https://github.com/wolffiex/klawde), note that the installer
 **unwires it**: any hook command under `/.klawde/` is dropped from `settings.json`
@@ -82,9 +87,9 @@ PYTHONPATH=src python3 -m herd.install --uninstall
 ```
 
 This **reverses herd's edits on the live files** — it strips the hook entries herd
-owns, hands `statusLine` back to whatever held it before, and restores the wrapper's
-original statusline invocation. Everything else in `settings.json` is left exactly as
-it is: permission grants, MCP servers, and other tools' hooks all survive, including
+owns, hands `statusLine` back to whatever held it before, restores the wrapper's
+original statusline invocation, and removes herd's block from `kitty.conf` if the
+installer added one. Everything else in `settings.json` is left exactly as it is: permission grants, MCP servers, and other tools' hooks all survive, including
 ones added long after the install. Each file is backed up (`*.herd-bak.<ts>`) before
 it is written.
 
@@ -106,6 +111,36 @@ fall back to the oldest `*.herd-bak.<ts>`.) If no pre-herd copy survives it says
 exits nonzero, and leaves the file wired for you to unwire by hand.
 
 Your data survives either way: `~/.herd/herd.db` is never deleted.
+
+### kitty setup
+
+herd needs kitty's **remote control** to record *where* a session lives and to jump
+there. It is off by default, and when it's off the failure is quiet: sessions are
+still tracked, still listed, still costed — but every placement is empty, `herd jump`
+has nothing to focus, and `herd spawn` refuses outright.
+
+```conf
+# ~/.config/kitty/kitty.conf
+allow_remote_control yes
+listen_on unix:/tmp/kitty-{kitty_pid}
+```
+
+Then **restart kitty** — neither option is picked up by a config reload, so
+`kitten @ load-config` will not do it.
+
+`{kitty_pid}` is not cosmetic. A window id only means something paired with the
+socket it came from, so a fixed socket path lets two kitty instances hand out
+colliding ids and jumps land in the wrong window.
+
+The installer offers to add exactly these two lines for you, wrapped in
+`# BEGIN herd` / `# END herd` markers. It only asks when it can *see* that they're
+missing — i.e. you're inside kitty and there's no socket — because from outside kitty
+it cannot tell a missing config from a working one, and it will not edit a file herd
+doesn't own on a guess. The file is backed up first, and `--uninstall` removes the
+block again, leaving a kitty.conf herd never touched byte-identical.
+
+`herd doctor` reports the state either way, including a live `kitten @ ls` probe when
+a socket is configured.
 
 ### Hook development (--dev)
 
@@ -397,7 +432,8 @@ and `journalctl --user -u herd`.
 | cost / context / branch always empty, but sessions appear | the hooks are wired and `statusLine` isn't. Only `statusline.sh` writes those columns — see the `statusLine` note under Install |
 | no sessions ever appear | `~/.claude/settings.json` wasn't rewired — re-run the installer. Rows come from the hooks and `herd spawn`, never from the daemon, so this is not a daemon problem |
 | sessions appear but never go away | the daemon is down; only it reaps silent deaths. Live rows are `stopped_at IS NULL` |
-| `herd spawn` → "needs to run inside kitty" | `KITTY_LISTEN_ON` is unset. kitty needs `allow_remote_control yes` **and** `listen_on unix:/tmp/kitty` |
+| `herd spawn` → "needs to run inside kitty" | `KITTY_LISTEN_ON` is unset. kitty needs `allow_remote_control yes` **and** `listen_on unix:/tmp/kitty-{kitty_pid}` — see [kitty setup](#kitty-setup) |
+| sessions listed fine, but `herd jump` says there's no window | same cause, quieter: remote control is off, so placement was never recorded. `herd doctor` names it |
 | `herd spawn -t` → "templates need Python 3.11+" | `tomllib` is 3.11+. Only templates need it; the rest of herd runs on 3.9 |
 | `herd watch` → "needs fzf and a tty" | `fzf` isn't installed, or you're not on a terminal |
 | `herd jump` prints a list instead of jumping | same — no `fzf`, so it degrades to printing rather than failing |
@@ -464,7 +500,8 @@ src/herd/
   cli.py         the `herd` CLI (ls, spawn, jump, watch + fzf preview machinery)
   spawn.py       `herd spawn` — SpawnSpec, resolve_spec, reserve-then-launch
   template.py    ~/.herd/templates/*.toml -> SpawnSpec defaults (herd spawn -t)
-  kitty/         focus.py — re-derive a session's window and jump to it
+  kitty/         config.py — the two kitty.conf options herd needs, and the state read
+                 focus.py — re-derive a session's window and jump to it
                  launch.py — `kitten @ launch` for `herd spawn`
 completions/     bash completion   ·   bin/herd — the CLI wrapper
 tests/           pytest suite (helpers.py + conftest.py + test_*.py per concern)

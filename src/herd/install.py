@@ -513,6 +513,80 @@ def _offer_bell(new_settings):
     return "terminal_bell notifications skipped (enable later via README)"
 
 
+# ── kitty.conf: remote control, the one thing herd needs and cannot see ────
+# The only file herd writes that it does not own. Hence: opt-in, marker-delimited,
+# backed up, and removed again by --uninstall. It is offered at all because without
+# these two options herd records an empty placement for every session and spawn /
+# jump cannot work — and nothing about that failure points at kitty.conf.
+def _kitty_decision(state, has_block, answer):
+    """Pure: should we write the block? Only when we KNOW it is missing (in kitty,
+    no socket) and herd has not already added it. `not-kitty` never writes — we
+    cannot see the config from outside kitty, and appending on a guess would edit a
+    working file. `ready` never writes: the options are already on, however they got
+    there, and a duplicate block is noise at best."""
+    from herd.kitty import config
+    if state != config.OFF or has_block:
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def _kitty_tip(lead="kitty remote control is OFF"):
+    """The advice, with a caller-supplied opening clause — the decline path already
+    says "skipped", and stacking both read as two sentences arguing with each other."""
+    from herd.kitty import config
+    return (f"{lead} — herd will record no window for any session and\n"
+            f"    spawn/jump cannot work. Add to {config.KITTY_CONF}:\n"
+            "      allow_remote_control yes\n"
+            "      listen_on unix:/tmp/kitty-{kitty_pid}\n"
+            f"    then {config.RESTART}.  `herd doctor` verifies it.")
+
+
+def _offer_kitty(dry=False, environ=None, answer=None):
+    """Interactively offer to enable kitty remote control. Returns a status line."""
+    from herd.kitty import config
+    environ = environ if environ is not None else os.environ
+    state = config.state(environ)
+    if state == config.READY:
+        return "kitty remote control already enabled — left as-is"
+    text = config.KITTY_CONF.read_text() if config.KITTY_CONF.exists() else ""
+    if config.has_block(text):
+        return f"kitty remote control block already in {config.KITTY_CONF.name} — " \
+               f"{config.RESTART}"
+    if state == config.NOT_KITTY:
+        # Not a prompt: outside kitty we cannot tell a missing config from a fine
+        # one, and this installer runs plenty of places that are not a terminal.
+        return ("kitty not detected — if you use kitty, see README (kitty setup); "
+                "`herd doctor` in a kitty window checks it")
+    if dry:
+        return f"would offer to add remote control to {config.KITTY_CONF}"
+    if answer is None:
+        if not sys.stdin.isatty():
+            return _kitty_tip()
+        answer = input(
+            f"  Enable kitty remote control? herd needs it to record which window a\n"
+            f"  session is in and to jump there. Appends 2 lines to {config.KITTY_CONF}\n"
+            "  (backed up, and removed again by --uninstall) [y/N]: ")
+    if not _kitty_decision(state, False, answer):
+        return _kitty_tip("kitty remote control skipped")
+    backup(config.KITTY_CONF, _ts())
+    _atomic_write(config.KITTY_CONF, config.add_block(text))
+    return f"kitty remote control enabled in {config.KITTY_CONF} — {config.RESTART}"
+
+
+def _uninstall_kitty(ts):
+    """Remove herd's block. A kitty.conf herd never touched is left byte-identical —
+    this must not be the thing that reformats someone's terminal config."""
+    from herd.kitty import config
+    if not config.KITTY_CONF.exists():
+        return "no kitty.conf to clean"
+    text = config.KITTY_CONF.read_text()
+    if not config.has_block(text):
+        return "kitty.conf untouched by herd — left alone"
+    backup(config.KITTY_CONF, ts)
+    _atomic_write(config.KITTY_CONF, config.strip_block(text))
+    return f"removed herd's block from {config.KITTY_CONF} — {config.RESTART}"
+
+
 # ── settings.json surgery ──────────────────────────────────────────────────
 def _statusline_cmd(data):
     sl = data.get("statusLine")
@@ -826,6 +900,7 @@ def install(dry=False, dev=False):
         print("  " + install_service(dry=True))
         print("  " + install_cli(dry=True))
         print("  would offer (interactive, opt-in) to enable terminal_bell notifications")
+        print("  " + _offer_kitty(dry=True))
         print("\n  resulting hooks:")
         for e, blocks in new_settings["hooks"].items():
             cmds = [h.get("command") or f"<{h.get('type','?')}:{h.get('url','')}>"
@@ -896,6 +971,7 @@ def install(dry=False, dev=False):
     print("  " + install_service())
     print("  " + install_cli())
     print("  " + bell_note)
+    print("  " + _offer_kitty())
     print("\n  use it (new shell picks up `herd` + completion):")
     print("    herd ls        # live sessions, attention-first, by name")
     print("    herd jump      # fuzzy-pick (fzf) a session and focus its window")
@@ -988,6 +1064,7 @@ def uninstall(restore_original=False):
     print("  " + uninstall_service())
     print("  " + uninstall_cli())
     ts = _ts()
+    print("  " + _uninstall_kitty(ts))
     rc = _uninstall_settings(ts, restore_original)
     return rc | _uninstall_wrapper(ts, restore_original)
 

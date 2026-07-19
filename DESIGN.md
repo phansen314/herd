@@ -383,6 +383,25 @@ file, bad TOML, wrong type — so the CLI prints `✗ …` instead of a stack tr
 
 ---
 
+## kitty remote control — probed, never parsed (`kitty/config.py`)
+
+herd needs `allow_remote_control yes` + `listen_on` to record placement and to jump.
+Whether they are on is read from the **environment**, never by parsing `kitty.conf`:
+that file has `include`, last-wins overrides and conditional sections, so a parse can
+confidently declare a working setup broken — a worse failure than saying nothing,
+because it sends someone to fix what isn't wrong.
+
+`KITTY_LISTEN_ON` set is proof remote control works. The useful second signal is
+`KITTY_WINDOW_ID`, which kitty exports in every window *regardless* of remote control:
+present with no `LISTEN_ON` means "inside kitty, remote control off" — the one state
+worth warning about. Without that distinction a plain xterm and a misconfigured kitty
+are indistinguishable, and `doctor` would have to either cry wolf everywhere or stay
+quiet where it matters. Parsing is used for exactly one narrow question — has herd's
+own marker block already been added — where the markers make it exact.
+
+`install` will append that block, opt-in and backed up, and `--uninstall` removes it;
+a kitty.conf herd never touched comes back byte-identical.
+
 ## Focus / jump (`kitty/focus.py`, `cli.py`)
 
 Placement (`kitty_socket`, `window_id`) is a **cache, not a fact**. Before every
