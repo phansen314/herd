@@ -10,7 +10,7 @@ current behaviour that would break if the decision were undone.
 
 **By topic:** [the pager](#pager) · [attention/ack](#ack) · [reaper robustness](#ps-floor) ·
 [spawn TOCTOU](#toctou) · [the events table](#events) · [statement
-transcription](#transcription) · [ctrl-q](#expect) · [the poker](#poker) ·
+transcription](#transcription) · [ctrl-q](#expect) · [the poker](#poker) · [rows handoff](#rows-handoff) ·
 [pid ancestry](#spike1) · [the `live` column](#live-column) · [two clocks](#clocks) ·
 [HERD_RUNTIME](#runtime) · [awk vs bash](#awk) · [kitty match semantics](#kitty-match)
 
@@ -474,6 +474,37 @@ sessions" sleep, where no fzf is running. fzf 0.44.1 has no `print(...)` action,
 
 **Protects:** both quit keys going through `--expect`. A bind-based "simplification"
 makes the dashboard unquittable.
+
+## 2026-07-18 — fzf reloads from a file, not a second interpreter {#rows-handoff}
+
+`herd watch`'s auto-refresh cost **77ms** (measured, 20 runs), the same
+interpreter-startup problem as the preview pane — on a path that fires whenever the
+row list changes, so up to every 2s while a session is active.
+
+The waste was structural, not slow code: `_poke_loop` already computes the row text
+in-process to decide whether anything changed, and then told fzf to run
+`python -m herd.cli rows` and compute the identical text a second time. It now
+writes what it holds to `$HERD_RUNTIME/herd-rows-<port>` (tmp + `os.replace`, since
+fzf may `cat` it mid-write) and reloads with `cat`. **77ms → 2.8ms**, output
+verified byte-identical to the verb.
+
+**Rejected: porting `rows` to bash** the way `preview.sh` was. Two reasons the
+preview precedent does not carry over. `_line()` serves `herd ls` as well as the
+picker, so a bash twin would be a second implementation of a formatter still in
+production use — where `_preview_text` became a pure fallback. And `_line` pads
+columns (`{name:26}`), which Python does by codepoint while awk's `%-26s` pads by
+bytes under mawk and by characters under gawk, so a non-ASCII session name would
+misalign differently per platform. `preview.sh` pads nothing and never faced it.
+The handoff gets the same latency with no second formatter at all.
+
+`ctrl-r` keeps the python command on purpose: it is the explicit "refresh now" path,
+and answering it from a file the poker may not have rewritten would serve a stale
+list to the one gesture that exists to avoid that. It is user-initiated and
+once-per-keypress, so the 77ms is the right trade there.
+
+**Protects:** `test_poke_reload_does_not_spawn_an_interpreter` (any reload naming
+`sys.executable` is the slow path returning), `test_poke_writes_the_rows_it_already_has`,
+the four cleanup tests, and `test_ctrl_r_still_forces_a_fresh_read`.
 
 ## 2026-07-18 — Three measured facts about the poker {#poker}
 

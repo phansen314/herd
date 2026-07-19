@@ -488,6 +488,13 @@ reloads only on change, but contacts fzf every tick regardless so it notices an 
 that exited while the herd was quiet. Early failures are tolerated (`_POKE_GRACE`).
 All three were measured ([DECISIONS.md#poker](DECISIONS.md#poker)).
 
+The reload **reads a file the poker writes**, not a fresh `herd rows`. The diff
+above already computes the row text in-process, so spawning an interpreter to
+recompute it byte-for-byte cost 77ms a refresh against ~3ms for a `cat`
+([DECISIONS.md#rows-handoff](DECISIONS.md#rows-handoff)). `ctrl-r` deliberately
+keeps the python command: it is the explicit refresh-now path, and a file the poker
+has not rewritten yet would answer it with a stale list.
+
 ---
 
 ## Attention {#attention}

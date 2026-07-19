@@ -284,6 +284,27 @@ def _rows_text(conn):
     return "\n".join(_row_line(r) for r in _live(conn))
 
 
+def _runtime_dir():
+    """Same anchor as daemon.lock_path() and the hooks' HERD_RUNTIME."""
+    return os.environ.get("HERD_RUNTIME",
+                          os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+
+
+def _rows_file(port):
+    """Per-picker handoff file. Keyed by the port because `watch` already chose one
+    uniquely per picker (_free_port), so two dashboards cannot share it."""
+    return os.path.join(_runtime_dir(), f"herd-rows-{port}")
+
+
+def _write_rows(path, text):
+    """tmp + replace: fzf may `cat` this at any moment, and a torn read would draw a
+    half list. Same discipline as statusline.sh's cache and install._atomic_write."""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as fh:
+        fh.write(text + "\n" if text else "")
+    os.replace(tmp, path)
+
+
 def _poke_loop(conn, port, send, sleep, rounds=None):
     """Poll the rows; send `reload` only when they CHANGE. Injected IO, like focus.py.
 
@@ -291,27 +312,48 @@ def _poke_loop(conn, port, send, sleep, rounds=None):
     when nothing changed (data=None -> a liveness GET): watch respawns a poker per
     picker, so a poker that only spoke on change would outlive its fzf forever on an
     idle herd and pile up one process per jump. Returns why it stopped (for tests).
+
+    THE RELOAD READS A FILE, NOT A FRESH INTERPRETER. This loop already computes the
+    row text in-process to detect the change; telling fzf to run
+    `python -m herd.cli rows` made it start an interpreter and compute the
+    byte-identical text a second time — 79ms per refresh, measured, against ~1ms for
+    a `cat`. Handing over the text we already hold is also the reason there is still
+    exactly ONE row formatter: a bash port would have been a second implementation
+    of _line(), which `herd ls` still uses, with awk padding non-ASCII names by
+    bytes or characters depending on the awk. ctrl-r deliberately keeps the python
+    command — see _watch_flags.
     """
+    rows_file = _rows_file(port)
     last, n, up = _rows_text(conn), 0, False   # seed: fzf already has these on stdin
-    while rounds is None or n < rounds:
-        n += 1
-        sleep(_POKE_INTERVAL)
+    try:
+        while rounds is None or n < rounds:
+            n += 1
+            sleep(_POKE_INTERVAL)
+            try:
+                cur = _rows_text(conn)
+            except Exception:
+                return "db"                 # DB gone mid-write: don't kill the pane
+            changed, last = cur != last, cur
+            try:
+                if changed:
+                    _write_rows(rows_file, cur)
+                send(f"http://localhost:{port}",
+                     f"reload(cat {shlex.quote(rows_file)})".encode() if changed else None)
+                up = True
+            except Exception:
+                # Before the first success this is fzf still binding, not fzf gone —
+                # measured: watch spawns us first, and exiting here killed auto-refresh
+                # outright. After it, a failure means the port closed.
+                if up or n >= _POKE_GRACE:
+                    return "gone"           # fzf exited / port closed -> reap poker
+        return "done"
+    finally:
+        # Every exit path, including watch's terminate(). A per-process file with no
+        # reaper accumulates — the herd-db-err.$$ lesson.
         try:
-            cur = _rows_text(conn)
-        except Exception:
-            return "db"                     # DB gone mid-write: don't kill the pane
-        changed, last = cur != last, cur
-        try:
-            send(f"http://localhost:{port}",
-                 f"reload({_ROWS_CMD})".encode() if changed else None)
-            up = True
-        except Exception:
-            # Before the first success this is fzf still binding, not fzf gone —
-            # measured: watch spawns us first, and exiting here killed auto-refresh
-            # outright. After it, a failure means the port closed.
-            if up or n >= _POKE_GRACE:
-                return "gone"               # fzf exited / port closed -> reap poker
-    return "done"
+            os.unlink(rows_file)
+        except OSError:
+            pass
 
 
 def _http_send(url, data):

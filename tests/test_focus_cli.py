@@ -1,7 +1,10 @@
 """T — jump / focus (kitty/focus.py + cli.py): pid->window resolution, the focus
 path (re-derive, ack, self-heal), and cli display/resolve/completion."""
 import inspect
+import pathlib
 import re
+import shlex
+import sys
 import socket
 import time
 
@@ -163,7 +166,10 @@ def test_poke_reloads_once_per_change(fresh):
     why = cli._poke_loop(c, "1234", lambda u, d: sent.append(d), sleep, rounds=3)
     reloads = [d for d in sent if d is not None]
     assert why == "done" and len(reloads) == 1      # changed once -> reloaded once
-    assert reloads[0].startswith(b"reload(") and b"rows" in reloads[0]
+    # Assert the EXACT path. `b"rows" in ...` also matched the old python command
+    # (`-m herd.cli rows`) and would match the new one by coincidence of the
+    # filename, so it could not tell the two apart — which is the whole change.
+    assert reloads[0] == f"reload(cat {shlex.quote(cli._rows_file('1234'))})".encode()
 
 
 def test_poke_survives_fzf_still_binding_then_reaps_on_a_quiet_herd(fresh):
@@ -501,3 +507,102 @@ def test_preview_falls_back_to_python_when_the_script_is_not_executable(monkeypa
     parts = shlex.split(_preview_arg(monkeypatch))
     assert parts[0] == "/opt/My Tools/venv/bin/python3"
     assert parts[1:4] == ["-m", "herd.cli", "preview"]
+
+
+# ── the poker hands fzf the text it already computed ─────────────────────────
+def test_poke_writes_the_rows_it_already_has(fresh, monkeypatch, tmp_path):
+    """_poke_loop computes the row text in-process to detect the change, then used
+    to tell fzf to start a fresh interpreter and compute the identical text again —
+    79ms a refresh against ~1ms for a cat. The file must hold exactly what a `rows`
+    run would have produced, or the pane shows something the CLI never would."""
+    monkeypatch.setenv("HERD_RUNTIME", str(tmp_path))
+    c, pk = _watch_fixture(fresh)
+    sent = []
+
+    def sleep(_):
+        if not sent:
+            c.execute("UPDATE sessions SET status='waiting' WHERE id=?", (pk,))
+
+    seen = {}
+
+    def send(u, d):
+        sent.append(d)
+        if d is not None:                       # capture while the file still exists
+            seen["text"] = pathlib.Path(cli._rows_file("1234")).read_text()
+
+    cli._poke_loop(c, "1234", send, sleep, rounds=3)
+    assert seen["text"].rstrip("\n") == cli._rows_text(c)
+
+
+def test_poke_reload_does_not_spawn_an_interpreter(fresh, monkeypatch, tmp_path):
+    """The regression that matters: any reload naming sys.executable is the 79ms
+    path coming back."""
+    monkeypatch.setenv("HERD_RUNTIME", str(tmp_path))
+    c, pk = _watch_fixture(fresh)
+    sent = []
+
+    def sleep(_):
+        if not sent:
+            c.execute("UPDATE sessions SET status='waiting' WHERE id=?", (pk,))
+
+    cli._poke_loop(c, "1234", lambda u, d: sent.append(d), sleep, rounds=3)
+    payload = [d for d in sent if d is not None][0].decode()
+    assert sys.executable not in payload and "herd.cli rows" not in payload
+    assert payload.startswith("reload(cat ")
+
+
+@pytest.mark.parametrize("why,drive", [
+    ("done", lambda c, pk: None),
+    ("db", lambda c, pk: c.close()),
+])
+def test_poke_removes_its_rows_file_on_every_exit(fresh, monkeypatch, tmp_path, why, drive):
+    """A per-process file with no reaper accumulates — the herd-db-err.$$ lesson."""
+    monkeypatch.setenv("HERD_RUNTIME", str(tmp_path))
+    c, pk = _watch_fixture(fresh)
+    path = pathlib.Path(cli._rows_file("1234"))
+
+    def sleep(_):
+        c.execute("UPDATE sessions SET status='waiting' WHERE id=?", (pk,))
+        drive(c, pk)
+
+    assert cli._poke_loop(c, "1234", lambda u, d: None, sleep, rounds=2) == why
+    assert not path.exists(), f"rows file leaked on {why!r} exit"
+
+
+def test_poke_gone_exit_also_cleans_up(fresh, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERD_RUNTIME", str(tmp_path))
+    c, _ = _watch_fixture(fresh)
+    path = pathlib.Path(cli._rows_file("1234"))
+
+    def boom(u, d):
+        raise OSError("connection refused")
+
+    assert cli._poke_loop(c, "1234", boom, lambda s: None, rounds=99) == "gone"
+    assert not path.exists()
+
+
+def test_ctrl_r_still_forces_a_fresh_read(fresh):
+    """ctrl-r is the explicit "refresh NOW" path. Pointing it at the file would
+    answer a request for freshness with whatever the poker last wrote, so it keeps
+    the python command and its 79ms — user-initiated and once per keypress."""
+    flags = cli._watch_flags(1234)
+    rbind = next(f for f in flags if f.startswith("--bind=ctrl-r"))
+    assert cli._ROWS_CMD in rbind and "cat " not in rbind
+
+
+def test_rows_file_survives_a_runtime_dir_with_a_space(fresh, monkeypatch, tmp_path):
+    """The runtime dir is user-controlled and the payload goes through `sh -c`."""
+    spaced = tmp_path / "run time"
+    spaced.mkdir()
+    monkeypatch.setenv("HERD_RUNTIME", str(spaced))
+    c, pk = _watch_fixture(fresh)
+    sent = []
+
+    def sleep(_):
+        if not sent:
+            c.execute("UPDATE sessions SET status='waiting' WHERE id=?", (pk,))
+
+    cli._poke_loop(c, "1234", lambda u, d: sent.append(d), sleep, rounds=3)
+    payload = [d for d in sent if d is not None][0].decode()
+    inner = payload[len("reload("):-1]                 # strip reload( ... )
+    assert shlex.split(inner) == ["cat", cli._rows_file("1234")]
