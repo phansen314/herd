@@ -44,6 +44,20 @@ DELETE FROM sessions WHERE id = :pk;
 -- from env; idempotent (AND session_id IS NULL). The subquery's stopped_at IS
 -- NULL is load-bearing — a dead predecessor still owns this window. Routing read
 -- only: herd_ appears after WHERE, never in SET. See DESIGN.md#write-paths-schemawritessql.
+--
+-- ORDER BY ... ASC LIMIT 1 pins what the query plan already does, because the DB
+-- deliberately permits two live rows in one window (test_window_reuse) and the
+-- subquery is bare — so which row it returned was plan-dependent, not stated.
+--
+-- ASC, NOT DESC, and this is the opposite of what it looks like it should be.
+-- Preferring the NEWEST row sounds right (the older one is the likely stale one)
+-- and is actively harmful: with an adopted session plus a newer unadopted
+-- reservation in one window, DESC returns the reservation, the outer
+-- session_id IS NULL passes, and a SessionStart re-fire stamps an already-taken
+-- session_id onto it — verified, "UNIQUE constraint failed: sessions.session_id".
+-- ASC returns the adopted row, the outer predicate declines it, and the hook falls
+-- through to W2b_insert, which is the correct handling. Determinism here is worth
+-- having, but only in the direction that keeps the outer predicate meaningful.
 -- :name W2_adopt
 UPDATE sessions
 SET session_id      = :session_id,
@@ -59,7 +73,8 @@ SET session_id      = :session_id,
 WHERE id = (SELECT h.session_pk FROM herd_sessions h
             JOIN sessions s ON s.id = h.session_pk
             WHERE h.kitty_socket = :socket AND h.window_id = :win
-              AND s.stopped_at IS NULL)
+              AND s.stopped_at IS NULL
+            ORDER BY h.session_pk ASC LIMIT 1)
   AND session_id IS NULL
   AND stopped_at IS NULL;
 
@@ -315,7 +330,8 @@ SET session_id = :session_id, updated_at = :now
 WHERE id = (SELECT h.session_pk FROM herd_sessions h
             JOIN sessions s ON s.id = h.session_pk
             WHERE h.kitty_socket = :socket AND h.window_id = :win
-              AND s.stopped_at IS NULL)
+              AND s.stopped_at IS NULL
+            ORDER BY h.session_pk ASC LIMIT 1)
   AND session_id IS NULL
   AND stopped_at IS NULL;
 

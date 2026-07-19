@@ -144,3 +144,58 @@ def test_inheritance_does_not_mutate_an_existing_job_name(fresh):
     c.execute(W["W2b_placement"], {"session_id": "u1", "job": None, "socket": SOCK, "win": 5, "now": T2})
     assert c.execute("SELECT job_name FROM herd_sessions WHERE session_pk=?",
                      (pk,)).fetchone()[0] == "mine"
+
+
+# ── adoption must be deterministic when a window holds two live rows ──────────
+def test_adoption_is_deterministic_with_two_live_rows_in_a_window(fresh):
+    """The DB deliberately permits two live rows per window and the subquery was
+    bare, so which one adoption targeted was a query-plan detail rather than a
+    stated rule. ASC pins it to the oldest."""
+    c = fresh()
+    old = mk_session(c, session_id=None, pid=None, cwd="/x", status="unknown")
+    mk_herd(c, old, job_name="first", kitty_socket=SOCK, window_id=5)
+    new = mk_session(c, session_id=None, pid=None, cwd="/x", status="unknown")
+    mk_herd(c, new, job_name="second", kitty_socket=SOCK, window_id=5)
+    c.execute(W["W2_adopt"], {"session_id": "uuid-X", "cwd": "/x", "model": "opus",
+                              "transcript": "/t", "pid": 333, "now": T1,
+                              "socket": SOCK, "win": 5})
+    got = c.execute("SELECT id FROM sessions WHERE session_id='uuid-X'").fetchone()[0]
+    assert got == old
+
+
+def test_adoption_declines_rather_than_stamping_a_taken_session_id(fresh):
+    """WHY ASC AND NOT DESC — the opposite of what it looks like it should be.
+
+    Preferring the NEWEST row sounds right (the older is the likely stale one) and
+    is actively harmful. With an adopted session plus a NEWER unadopted reservation
+    in one window, DESC returns the reservation, the outer `session_id IS NULL`
+    passes, and a SessionStart re-fire stamps an already-taken session_id onto it:
+    UNIQUE constraint failed: sessions.session_id.
+
+    ASC returns the adopted row, the outer predicate declines it, and the hook falls
+    through to W2b_insert — which is the correct handling of a re-fire."""
+    c = fresh()
+    adopted = mk_session(c, session_id="uuid-X", pid=111, cwd="/x")
+    mk_herd(c, adopted, kitty_socket=SOCK, window_id=5)
+    reservation = mk_session(c, session_id=None, pid=None, cwd="/x", status="unknown")
+    mk_herd(c, reservation, job_name="api", kitty_socket=SOCK, window_id=5)
+    assert reservation > adopted                     # the trap needs this ordering
+    n = c.execute(W["W2_adopt"], {"session_id": "uuid-X", "cwd": "/x", "model": "opus",
+                                  "transcript": "/t", "pid": 111, "now": T1,
+                                  "socket": SOCK, "win": 5}).rowcount
+    assert n == 0                                    # declined, no IntegrityError
+    assert c.execute("SELECT session_id FROM sessions WHERE id=?",
+                     (reservation,)).fetchone()[0] is None
+
+
+def test_path_c_adoption_is_ordered_the_same_way(fresh):
+    """W5b_adopt carries the identical subquery, so it gets the identical rule —
+    the two adoption routes must not disagree about which row a window means."""
+    c = fresh()
+    old = mk_session(c, session_id=None, pid=None, cwd="/x", status="unknown")
+    mk_herd(c, old, job_name="first", kitty_socket=SOCK, window_id=5)
+    new = mk_session(c, session_id=None, pid=None, cwd="/x", status="unknown")
+    mk_herd(c, new, job_name="second", kitty_socket=SOCK, window_id=5)
+    c.execute(W["W5b_adopt"], {"session_id": "uuid-Y", "now": T1, "socket": SOCK, "win": 5})
+    got = c.execute("SELECT id FROM sessions WHERE session_id='uuid-Y'").fetchone()[0]
+    assert got == old
