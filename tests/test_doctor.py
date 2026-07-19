@@ -304,3 +304,121 @@ def test_negative_threshold_warns():
 def test_zero_threshold_is_accepted():
     """Zero is a coherent 'no grace' choice, unlike a negative."""
     assert WARN not in _levels(doctor.check_env({"HERD_WAIT_SECS": "0"}))
+
+
+# ── doctor must never raise: it runs on a machine that is already sick ───────
+MALFORMED = [
+    ({"hooks": {"SessionStart": [{"matcher": "Bash"}]}}, "block with no hooks key"),
+    ({"hooks": {"SessionStart": [{"hooks": [{"type": "command"}]}]}}, "hook with no command"),
+    ({"hooks": {"SessionStart": "not-a-list"}}, "event is a string"),
+    ({"hooks": {"SessionStart": [None, 3, "x"]}}, "blocks are not dicts"),
+    ({"hooks": "not-a-dict"}, "hooks is a string"),
+    ({"hooks": {"SessionStart": [{"hooks": "not-a-list"}]}}, "hooks value is a string"),
+    ({"statusLine": "a-bare-string"}, "statusLine is not an object"),
+    ({"statusLine": []}, "statusLine is a list"),
+]
+
+
+@pytest.mark.parametrize("data,why", MALFORMED)
+def test_a_malformed_settings_file_is_reported_not_raised(data, why):
+    """`b["hooks"]` raised KeyError on a block carrying only a matcher — from the
+    command you run to find out WHY the wiring looks wrong. install._strip_managed
+    has always used .get() on this same structure."""
+    text = json.dumps(data)
+    w = doctor.check_wiring(text, ("/r",), ("/r/statusline.sh",), ("SessionStart",))
+    m = doctor.check_hook_mode(text, "/installed", "/checkout")
+    assert w and m, why
+    assert all(lv in (OK, WARN, FAIL) for lv in _levels(w) + _levels(m)), why
+
+
+def test_a_statusline_pointing_at_a_directory_is_reported(tmp_path):
+    """The one file doctor opens whose contents it does not control. A directory,
+    an unreadable file and a non-UTF-8 one all raised straight out of check_wiring."""
+    d = tmp_path / "wrapdir"
+    d.mkdir()
+    r = doctor.check_wiring(json.dumps({"statusLine": {"command": str(d)}}),
+                            ("/r",), ("/r/statusline.sh",), ())
+    assert _levels(r) == [WARN] and "unreadable" in _text(r)
+
+
+def test_a_binary_statusline_wrapper_is_reported(tmp_path):
+    w = tmp_path / "wrapper.sh"
+    w.write_bytes(b"\xff\xfe\x00not utf-8")
+    r = doctor.check_wiring(json.dumps({"statusLine": {"command": str(w)}}),
+                            ("/r",), ("/r/statusline.sh",), ())
+    assert _levels(r) == [WARN] and "unreadable" in _text(r)
+
+
+def test_a_binary_hook_error_log_is_reported(tmp_path):
+    """check_errlog caught OSError but not UnicodeDecodeError — and a statusline
+    killed mid-write (which happens as a matter of course) can leave partial bytes."""
+    p = tmp_path / "err.log"
+    p.write_bytes(b"\xff\xfe\x00binary")
+    r = doctor.check_errlog(str(p))
+    assert _levels(r) == [WARN] and "unreadable" in _text(r)
+
+
+def test_an_unreadable_settings_file_is_named_once(tmp_path):
+    """collect() read it with no guard at all (PermissionError, verified). And the
+    finding must REPLACE the two checks that parse it — both would say 'missing',
+    which is a different problem with a different fix."""
+    s = tmp_path / "settings.json"
+    s.write_text("{}")
+    s.chmod(0o000)
+    try:
+        wiring = dict(doctor.collect(environ={}, settings_path=str(s)))["wiring"]
+    finally:
+        s.chmod(0o644)
+    assert _levels(wiring) == [FAIL]
+    assert "unreadable" in _text(wiring) and "missing" not in _text(wiring)
+
+
+def test_a_check_that_crashes_becomes_a_finding(monkeypatch):
+    """The property, independent of having thought of every input: one bad check
+    must not cost the user the other five sections."""
+    def boom(*a, **kw):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(doctor, "check_db", boom)
+    sections = dict(doctor.collect(environ={}))
+    assert _levels(sections["database"]) == [FAIL]
+    assert "kaboom" in _text(sections["database"])
+    assert sections["daemon"] and sections["environment"]     # the rest still ran
+
+
+# ── argv ────────────────────────────────────────────────────────────────────
+def test_doctor_refuses_unknown_argv(capsys):
+    """`herd doctor --json` silently ran a full text diagnostic."""
+    assert doctor.main(["--json"]) == 2
+    assert "usage" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_doctor_help_does_not_diagnose(flag, monkeypatch, capsys):
+    monkeypatch.setattr(doctor, "collect",
+                        lambda *a, **k: pytest.fail("--help must not run the checks"))
+    assert doctor.main([flag]) == 0
+    assert "usage" in capsys.readouterr().out
+
+
+# ── the env knobs doctor claims to report ───────────────────────────────────
+def test_the_daemon_log_cap_is_checked_too(monkeypatch):
+    """The list had drifted from daemon._int_env's, so a malformed
+    HERD_DAEMON_LOG_MAX — which the daemon does reject — was reported by nobody."""
+    r = doctor.check_env({"HERD_DAEMON_LOG_MAX": "big", "HERD_ERRLOG_MAX": "-1"})
+    assert _levels(r) == [WARN, WARN]
+    assert "HERD_DAEMON_LOG_MAX" in _text(r) and "HERD_ERRLOG_MAX" in _text(r)
+
+
+def test_a_long_claude_name_is_flagged():
+    """ps -o comm= is capped at 15 chars, so a longer name cannot match what the
+    reaper observes. It truncates to compare now, hence WARN not FAIL."""
+    r = doctor.check_env({"HERD_CLAUDE_NAME": "claude-code-node-runner"})
+    assert _levels(r) == [WARN] and "claude-code-nod" in _text(r)
+    assert _levels(doctor.check_env({"HERD_CLAUDE_NAME": "claude"})) == [OK]
+
+
+def test_attention_off_is_reported():
+    r = doctor.check_env({"HERD_ATTENTION": "0"})
+    assert _levels(r) == [WARN] and "core-only" in _text(r)
+    assert _levels(doctor.check_env({"HERD_ATTENTION": "1"})) == [OK]   # the default

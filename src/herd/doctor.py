@@ -41,6 +41,51 @@ def _db_path():
     return daemon.DEFAULT_DB
 
 
+# ── settings.json, defensively ───────────────────────────────────────────────
+# EVERY shape below is treated as suspect. This file is hand-edited, written by
+# other tools, and half of what doctor exists to diagnose IS a malformed one —
+# `b["hooks"]` raised KeyError on a block carrying only a matcher, so the command
+# you run to find out why herd is broken died with a traceback instead of naming
+# the block. install._strip_managed has always used .get() here; doctor did not.
+def _hook_commands(data):
+    """[(event, command), ...] from a settings dict, tolerating any shape."""
+    out = []
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return out
+    for event, blocks in hooks.items():
+        if not isinstance(blocks, list):
+            continue
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            hs = b.get("hooks")
+            if not isinstance(hs, list):
+                continue
+            for h in hs:
+                if isinstance(h, dict):
+                    out.append((event, h.get("command") or ""))
+    return out
+
+
+def _statusline_command(data):
+    """settings.statusLine.command, or "" — including when statusLine is a string,
+    a list, or anything else a hand edit can leave behind."""
+    sl = data.get("statusLine")
+    return (sl.get("command") or "") if isinstance(sl, dict) else ""
+
+
+def _readable(path):
+    """(text, problem). Never raises: a file doctor cannot read is a FINDING, and
+    the one file it must report on is the one it just failed to open."""
+    try:
+        return pathlib.Path(path).read_text(), None
+    except FileNotFoundError:
+        return None, None                       # absent: the caller's own message
+    except (OSError, ValueError) as e:          # ValueError covers UnicodeDecodeError
+        return None, str(e)
+
+
 # ── checks (pure) ────────────────────────────────────────────────────────────
 def check_deps(which=shutil.which):
     out = []
@@ -144,9 +189,9 @@ def check_wiring(settings_text, hook_roots, statusline_paths, events):
         return [(FAIL, "settings.json unparseable", str(e))]
 
     out = []
-    hooks = data.get("hooks") or {}
-    wired = {e: [h.get("command", "") for b in hooks.get(e, []) for h in b["hooks"]]
-             for e in hooks}
+    wired = {}
+    for ev, cmd in _hook_commands(data):
+        wired.setdefault(ev, []).append(cmd)
     for event in events:
         cmds = [c for c in wired.get(event, [])
                 if any(str(r) in c for r in hook_roots)]
@@ -160,14 +205,21 @@ def check_wiring(settings_text, hook_roots, statusline_paths, events):
         else:
             out.append((OK, event, cmds[0]))
 
-    sl = (data.get("statusLine") or {}).get("command", "")
+    sl = _statusline_command(data)
     if not sl:
         out.append((FAIL, "statusLine not set",
                     "no cost / context / branch will ever be recorded"))
-    elif sl in statusline_paths or any(str(r) in sl for r in hook_roots):
+        return out
+    if sl in statusline_paths or any(str(r) in sl for r in hook_roots):
         out.append((OK, "statusLine", sl))
-    elif os.path.exists(sl) and any(s in pathlib.Path(sl).read_text()
-                                    for s in statusline_paths):
+        return out
+    # The wrapper read is the one place doctor opens a file whose contents it does
+    # not control. A statusLine naming a DIRECTORY, an unreadable file, or one that
+    # is not UTF-8 all raised straight out of here — verified.
+    wrapper, problem = _readable(sl) if os.path.exists(sl) else (None, None)
+    if problem:
+        out.append((WARN, "statusLine unreadable", f"{sl}: {problem}"))
+    elif wrapper is not None and any(s in wrapper for s in statusline_paths):
         out.append((OK, "statusLine (via wrapper)", sl))
     else:
         out.append((WARN, "statusLine is not herd's", f"{sl} — herd records no metrics"))
@@ -188,8 +240,7 @@ def check_hook_mode(settings_text, installed_root, checkout_root, current=None):
         data = json.loads(settings_text)
     except ValueError:
         return [(FAIL, "hook mode unknown", "settings.json unparseable")]
-    cmds = [h.get("command", "") for bs in (data.get("hooks") or {}).values()
-            for b in bs for h in b["hooks"]]
+    cmds = [c for _, c in _hook_commands(data)]
     on_checkout = [c for c in cmds if str(checkout_root) in c]
     on_installed = [c for c in cmds if str(installed_root) in c]
 
@@ -255,8 +306,13 @@ def check_env(environ):
     """A malformed threshold used to traceback every command; now it silently falls
     back to the default, so say which ones are being ignored."""
     out = []
+    # Every knob _int_env validates, plus the two log caps — the list had drifted
+    # from the daemon's, so a malformed HERD_DAEMON_LOG_MAX (which daemon._int_env
+    # does reject) was reported by nobody, and the docstring's promise was only
+    # two-thirds true.
     for name in ("HERD_WAIT_SECS", "HERD_APPROVAL_SECS", "HERD_STUCK_SECS",
-                 "HERD_STRANDED_SECS", "HERD_TOOL_THROTTLE"):
+                 "HERD_STRANDED_SECS", "HERD_TOOL_THROTTLE",
+                 "HERD_DAEMON_LOG_MAX", "HERD_ERRLOG_MAX"):
         raw = environ.get(name)
         if raw is None or raw == "":
             continue
@@ -272,6 +328,27 @@ def check_env(environ):
             out.append((WARN, f"{name} is negative", f"{raw!r} — using the default"))
         else:
             out.append((OK, name, raw))
+
+    # HERD_CLAUDE_NAME is not a threshold, and its failure is the loudest of any
+    # knob here: `ps -o comm=` reads /proc/pid/stat, capped at 15 chars, so a
+    # longer name can never match what the reaper observes and _dead reads the
+    # mismatch as a recycled pid — every live session reaped on the first tick.
+    # The reaper truncates to compare (daemon._is_claude), so this is a warning
+    # about a name that no longer breaks anything, not a failure.
+    name = environ.get("HERD_CLAUDE_NAME")
+    if name:
+        if len(name) > daemon._COMM_MAX:
+            out.append((WARN, "HERD_CLAUDE_NAME is longer than ps reports",
+                        f"{name!r} — matched on its first {daemon._COMM_MAX} chars "
+                        f"({name[:daemon._COMM_MAX]!r})"))
+        else:
+            out.append((OK, "HERD_CLAUDE_NAME", name))
+
+    # Not an integer and not a name: the tier-2 switch. Off is a legitimate choice
+    # (core-only collection), but "herd_attention is empty" has an obvious cause.
+    if environ.get("HERD_ATTENTION", "").strip().lower() in ("0", "false", "no", "off"):
+        out.append((WARN, "HERD_ATTENTION is off",
+                    "core-only: the reaper runs, nothing is ever marked for attention"))
     return out or [(OK, "env", "no HERD_* overrides")]
 
 
@@ -283,7 +360,11 @@ def check_errlog(path, tail=3, read=None):
         return [(OK, "hook errors", "none logged")]
     try:
         lines = [ln for ln in read(path).splitlines() if ln.strip()]
-    except OSError as e:
+    # ValueError, not just OSError: a hook killed mid-write (the statusline is
+    # killed on timeout as a matter of course) can leave bytes that are not UTF-8,
+    # and UnicodeDecodeError escaped this handler — from the check reporting on
+    # "the hooks' only voice".
+    except (OSError, ValueError) as e:
         return [(WARN, "hook error log unreadable", str(e))]
     if not lines:
         return [(OK, "hook errors", "none logged")]
@@ -292,24 +373,53 @@ def check_errlog(path, tail=3, read=None):
 
 
 # ── driver ───────────────────────────────────────────────────────────────────
+def _safe(label, fn, *a, **kw):
+    """Run a check; turn an unexpected exception into a FINDING, not a traceback.
+
+    The specific crash paths are fixed at their source, but this is the property
+    that matters and it should not depend on having thought of every input: doctor
+    runs on a machine that is already sick, by someone who has just been told
+    nothing is being recorded. A traceback there costs them the other five
+    sections' worth of diagnosis too.
+    """
+    try:
+        return fn(*a, **kw)
+    except Exception as e:                       # noqa: BLE001 — that is the point
+        return [(FAIL, f"{label} check crashed",
+                 f"{type(e).__name__}: {e} — this is a herd bug, please report it")]
+
+
 def collect(environ=None, settings_path=None):
     """Run every check. Returns [(section, [(level, headline, detail), ...])]."""
     from herd import install                      # local: pulls in pathlib/HOME only
     environ = environ if environ is not None else os.environ
     settings = pathlib.Path(settings_path or install.SETTINGS)
-    text = settings.read_text() if settings.exists() else None
+    # A settings.json that EXISTS but cannot be read is its own finding — read_text
+    # raised straight out of collect (PermissionError, verified), and an unreadable
+    # settings.json is a first-class reason herd records nothing.
+    text, problem = _readable(settings)
+    # When it is unreadable, that finding REPLACES the two checks that parse it —
+    # both would only report "settings.json missing", which is a different problem
+    # with a different fix and contradicts the line above it.
+    wiring = ([(FAIL, "settings.json unreadable", f"{settings}: {problem}")] if problem
+              else None)
     errlog = environ.get("HERD_ERRLOG",
                          str(pathlib.Path.home() / ".herd" / "hook-errors.log"))
     roots = (install.INSTALLED_HOOKS, install.HOOKS_DIR)
     statuslines = tuple(install.statusline_cmd(r) for r in roots)
     return [
-        ("dependencies", check_deps() + check_jq_version() + check_python()),
-        ("database", check_db(_db_path())),
-        ("wiring", check_wiring(text, roots, statuslines, tuple(install.HERD_HOOKS))
-                   + check_hook_mode(text, install.INSTALLED_HOOKS, install.HOOKS_DIR)),
-        ("daemon", check_daemon(daemon.lock_path())),
-        ("environment", check_env(environ)),
-        ("hook errors", check_errlog(errlog)),
+        ("dependencies", _safe("dependency", check_deps)
+                         + _safe("jq version", check_jq_version)
+                         + _safe("python", check_python)),
+        ("database", _safe("database", check_db, _db_path())),
+        ("wiring", wiring if wiring is not None else
+                   _safe("wiring", check_wiring, text, roots, statuslines,
+                         tuple(install.HERD_HOOKS))
+                   + _safe("hook mode", check_hook_mode, text,
+                           install.INSTALLED_HOOKS, install.HOOKS_DIR)),
+        ("daemon", _safe("daemon", check_daemon, daemon.lock_path())),
+        ("environment", _safe("environment", check_env, environ)),
+        ("hook errors", _safe("hook error log", check_errlog, errlog)),
     ]
 
 
@@ -332,5 +442,28 @@ def report(sections, out=print):
     return 0
 
 
+_FLAGS = {"--help", "-h"}
+
+USAGE = """usage: herd doctor
+
+  Diagnoses why herd is not recording: dependencies, database, wiring, daemon,
+  environment overrides, and the hook error log. Writes nothing.
+
+  Exit: 0 healthy (or warnings only), 1 when anything FAILED."""
+
+
 def main(argv=None):
+    """Unknown argv is REFUSED, as in install/daemon/cli. `herd doctor --help` ran
+    a full diagnostic and `herd doctor --json` silently did the same — a flag this
+    command cannot read means the caller wanted output it is not producing."""
+    argv = argv if argv is not None else sys.argv[1:]
+    unknown = [a for a in argv if a not in _FLAGS]
+    if unknown:
+        print(f"herd doctor: unknown option {', '.join(repr(a) for a in unknown)}")
+        print()
+        print(USAGE)
+        return 2
+    if argv:
+        print(USAGE)
+        return 0
     return report(collect())
