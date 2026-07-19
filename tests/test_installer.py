@@ -494,3 +494,58 @@ def test_bin_herd_resolves_symlinks_without_readlink_f(tmp_path):
         r = subprocess.run(["bash", str(entry), "ls"], capture_output=True, text=True)
         assert r.returncode == 0, f"{entry}: {r.stderr}"
         assert "readlink" not in r.stderr
+
+
+# ── argv validation: an option we cannot read must change NOTHING ─────────────
+def _main_never_installs(monkeypatch, argv):
+    """Run main(argv) with install/uninstall replaced by tripwires."""
+    called = []
+    monkeypatch.setattr(inst, "install", lambda **k: called.append(("install", k)))
+    monkeypatch.setattr(inst, "uninstall", lambda: called.append(("uninstall",)))
+    rc = inst.main(argv)
+    return rc, called
+
+
+@pytest.mark.parametrize("argv", [
+    ["--help"], ["-h"],
+    ["--dry-runn"],            # the typo that silently installed
+    ["--DEV"],                 # case matters
+    ["-dev"],                  # one dash
+    ["--uninstal"],            # near-miss on the destructive flag
+    ["install"],               # a bare verb, git-style
+    ["--dry-run", "--nope"],   # one good flag does not excuse a bad one
+])
+def test_unreadable_argv_installs_nothing(monkeypatch, argv):
+    """`--help` used to perform a FULL INSTALL: main() membership-tested each known
+    flag and let everything else fall through to install(). On a command that
+    rewrites settings.json, rewires the statusline and restarts a systemd unit, a
+    flag it cannot read must mean stop — never 'proceed with the default'."""
+    rc, called = _main_never_installs(monkeypatch, argv)
+    assert called == [], f"{argv} reached {called[0][0]}()"
+    assert rc in (0, 2)
+
+
+def test_help_is_help_not_an_install(monkeypatch, capsys):
+    rc, called = _main_never_installs(monkeypatch, ["--help"])
+    assert rc == 0 and called == []
+    assert "usage:" in capsys.readouterr().out
+
+
+def test_unknown_flag_names_itself_and_exits_nonzero(monkeypatch, capsys):
+    rc, called = _main_never_installs(monkeypatch, ["--dry-runn"])
+    out = capsys.readouterr().out
+    assert rc == 2 and called == []
+    assert "--dry-runn" in out and "Nothing was changed" in out
+
+
+@pytest.mark.parametrize("argv,expect", [
+    ([], ("install", {"dry": False, "dev": False})),
+    (["--dev"], ("install", {"dry": False, "dev": True})),
+    (["--dry-run"], ("install", {"dry": True, "dev": False})),
+    (["--dry-run", "--dev"], ("install", {"dry": True, "dev": True})),
+    (["--uninstall"], ("uninstall",)),
+])
+def test_known_flags_still_route(monkeypatch, argv, expect):
+    """The refusal must not have broken the flags that DO work."""
+    rc, called = _main_never_installs(monkeypatch, argv)
+    assert called == [expect]

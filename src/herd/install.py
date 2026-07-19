@@ -613,8 +613,43 @@ def uninstall():
     return rc
 
 
+# Every flag main() understands. An argv token outside this set is a TYPO, and the
+# only safe reading of a typo on this command is "do nothing" — see main().
+_FLAGS = {"--uninstall", "--dry-run", "--dev", "--help", "-h"}
+
+USAGE = """usage: python3 -m herd.install [--dev] [--dry-run] [--uninstall]
+
+  (no flags)    wire herd from the installed copy in ~/.herd/hooks
+  --dev         wire the CHECKOUT directly, for hook development
+  --dry-run     show what would change, touch nothing
+  --uninstall   restore the pre-herd state
+  --help, -h    this message"""
+
+
 def main(argv=None):
+    """Unknown argv is REFUSED, not ignored.
+
+    This used to be `install(dry="--dry-run" in argv, ...)` — a membership test per
+    flag and no validation — so every unrecognized token fell through to a full
+    install. `--help` installed. `--dry-runn` installed, having been asked to touch
+    nothing. That is the worst possible reading of a typo on a command that rewrites
+    settings.json, rewires the statusline and restarts a systemd unit.
+
+    A flag this command does not understand means the caller wanted something we are
+    not doing, so the only safe move is to do NOTHING and say so.
+    """
     argv = argv if argv is not None else sys.argv[1:]
+    unknown = [a for a in argv if a not in _FLAGS]
+    if unknown:
+        print(f"herd install: unknown option {', '.join(repr(a) for a in unknown)}")
+        print("  Nothing was changed. This command rewrites settings.json and")
+        print("  restarts a service, so an option it cannot read means it stops.")
+        print()
+        print(USAGE)
+        return 2
+    if "--help" in argv or "-h" in argv:
+        print(USAGE)
+        return 0
     if "--uninstall" in argv:
         return uninstall()
     return install(dry="--dry-run" in argv, dev="--dev" in argv)

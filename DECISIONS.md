@@ -233,6 +233,25 @@ straddle — moving it into jq is what let that fallback go.
 reference the old code used), `test_now_pair_falls_back_when_date_has_no_percent_3n`,
 `test_stmt_bind_equals_stmt_then_bind`, `test_db_leaves_no_errfile_behind`.
 
+## 2026-07-18 — Unknown argv must install NOTHING {#install-argv}
+
+`main()` was `install(dry="--dry-run" in argv, dev="--dev" in argv)` — a membership
+test per known flag and no validation — so **every unrecognized token fell through
+to a full install**. `python3 -m herd.install --help` performed one. So did
+`--dry-runn`, having been asked to touch nothing.
+
+This is a command that rewrites `settings.json`, rewires the statusline wrapper and
+restarts a systemd unit. The blast radius of guessing wrong is a machine whose hooks
+now point somewhere the user did not choose — and the specific way it goes wrong is
+quiet, because an install *succeeds*.
+
+**Decided:** argv is validated against a closed set. Anything else prints what it
+could not read, states that nothing changed, prints usage, and exits 2. `--help` and
+`-h` are real flags now rather than accidental installs.
+
+**Protects:** `test_installer.py::test_unreadable_argv_installs_nothing` and
+`test_known_flags_still_route`.
+
 ## 2026-07-18 — Two preview formatters, pinned byte-for-byte {#preview-twins}
 
 The picker's `--preview` is re-run by fzf on **every highlight change**. Measured:
