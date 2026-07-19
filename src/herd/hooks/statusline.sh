@@ -67,13 +67,33 @@ $(jq_in -rj '[
         then (.rate_limits.seven_day.resets_at | strflocaltime("%m/%d %I:%M%p")
               | sub("^0"; "") | sub("/0"; "/") | sub(" 0"; " "))
         else "" end) catch "")
-] | map(. // "" | tostring) | join("\u001f")')
+]
+# STRIP NEWLINES, in every field. The 23 values are joined with \u001f and read by
+# ONE `read`, which stops at the first newline — so a single one anywhere emptied
+# every field AFTER it. A /rename can carry a newline, and a directory name may
+# legally contain one.
+#
+# The damage is a frozen statusline, NOT a corrupted row: W5_statusline COALESCEs
+# every column against its current value, so the NULLs those empty fields bind to
+# are ignored and the old values SURVIVE — verified. What breaks is that they
+# never move again. Cost, context, branch and both rate limits stop updating for
+# the life of the session, while the rendered line drops every segment after the
+# name and shows a permanent 0%. Nothing is logged, because nothing failed.
+| map(. // "" | tostring | gsub("[\\n\\r]"; " ")) | join("\u001f")')
 JQ
 
 # ── pure-bash git branch (zero forks): walk CWD -> .git/HEAD ───────────────
 BRANCH=""
 git_branch_of() {
     local dir="$1" g head ref
+    # ABSOLUTE ONLY. ${dir%/*} returns the string UNCHANGED when there is no slash
+    # left, so a relative cwd ("src", or anything with no leading /) never shrank
+    # and this spun forever — verified. In a hook that reruns about once a second
+    # and must never block, that is a core at 100% until Claude's timeout kills it.
+    case "$dir" in
+        /*) ;;
+        *)  return 1 ;;
+    esac
     while [ -n "$dir" ] && [ "$dir" != "/" ]; do
         if [ -e "$dir/.git" ]; then
             if [ -d "$dir/.git" ]; then
@@ -291,6 +311,8 @@ render "$SNAME" "$BURN"
 # ── cache atomically (tmp + rename — a torn write must not feed a false hit) ─
 { printf '%s\n%s\n%s\n' "$FP" "$L1S" "$L2S"; } > "$CACHE.tmp.$$" 2>/dev/null &&
     mv -f "$CACHE.tmp.$$" "$CACHE" 2>/dev/null
+rm -f "$CACHE.tmp.$$" 2>/dev/null      # the && skipped the mv: leave no debris,
+                                       # as post_tool_use.sh already does
 
 emit "$L1S" "$L2S"
 exit 0

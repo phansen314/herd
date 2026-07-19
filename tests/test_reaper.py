@@ -477,3 +477,45 @@ def test_a_refused_lock_does_not_leak_the_handle(tmp_path, monkeypatch):
     if before is not None:
         after = len(os.listdir(f"/proc/{os.getpid()}/fd"))
         assert after <= before, f"leaked {after - before} fds over 20 refusals"
+
+
+# ── the reaper cleans up after a silent death (session_end.sh cannot) ────────
+def test_reaping_removes_the_per_session_runtime_files(fresh, tmp_path, monkeypatch):
+    """session_end.sh deletes both files, but SessionEnd does not fire on kill -9, a
+    crash, or a closed terminal — the deaths this daemon exists to reap. So every
+    one of them leaked a pair: 34 herd-stline-* against 1 live session, measured."""
+    monkeypatch.setenv("HERD_RUNTIME", str(tmp_path))
+    c = fresh()
+    pk = mk_session(c, session_id="dead-1", pid=4242, status="working")
+    for n in ("herd-tool-dead-1", "herd-stline-dead-1"):
+        (tmp_path / n).write_text("x")
+    assert reap_once(c, {}, T1) == 1                      # pid absent -> dead
+    assert not list(tmp_path.glob("herd-*-dead-1"))
+
+
+def test_a_session_that_resumed_keeps_its_runtime_files(fresh, tmp_path, monkeypatch):
+    """A GUARD against over-sweeping — it also passes with no sweep at all.
+    W3d_reap re-asserts the pid, so a resume between the SELECT and the write is
+    a 0-row no-op — and a live session's files must not be swept out from under it."""
+    monkeypatch.setenv("HERD_RUNTIME", str(tmp_path))
+    c = fresh()
+    pk = mk_session(c, session_id="alive-1", pid=4242, status="working")
+    (tmp_path / "herd-stline-alive-1").write_text("x")
+
+    def resume_mid_tick(pid, procs):
+        # fires between reap_once's SELECT and its W3d_reap: the session came back
+        # on a new pid, so the write re-asserting the JUDGED pid matches nothing
+        c.execute("UPDATE sessions SET pid=9999 WHERE id=?", (pk,))
+        return True
+
+    monkeypatch.setattr(daemon, "_dead", resume_mid_tick)
+    assert reap_once(c, {}, T1) == 0                      # judged pid no longer held
+    assert (tmp_path / "herd-stline-alive-1").exists()
+
+
+@pytest.mark.parametrize("sid", ["../../etc/passwd", "", "a/b", "x;rm -rf"])
+def test_the_sweep_refuses_a_session_id_that_is_not_a_filename(sid, tmp_path, monkeypatch):
+    """A session_id comes from the payload and becomes a PATH here — the same reason
+    the hooks have valid_sid."""
+    monkeypatch.setenv("HERD_RUNTIME", str(tmp_path))
+    assert daemon.sweep_runtime_files(sid) == 0

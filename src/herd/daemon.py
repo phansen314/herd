@@ -235,20 +235,61 @@ def _dead(pid, procs):
     return False
 
 
+def _runtime_dir():
+    """Same anchor as lock_path(), cli._runtime_dir() and the hooks' HERD_RUNTIME."""
+    return os.environ.get("HERD_RUNTIME",
+                          os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+
+
+def _valid_sid(sid):
+    """The hooks' valid_sid, in python: a session_id becomes a FILENAME, so refuse
+    anything that could leave the runtime dir."""
+    return bool(sid) and all(c.isalnum() or c == "-" for c in sid)
+
+
+def sweep_runtime_files(session_id):
+    """Delete the per-session files the hooks keep — the throttle stamp and the
+    statusline cache.
+
+    session_end.sh already does this ("or they leak one pair per session forever
+    — bounded on a tmpfs $XDG_RUNTIME_DIR, unbounded under the /tmp fallback"),
+    but SessionEnd does not fire on kill -9, a crash, or a closed terminal. Those
+    are the deaths THIS DAEMON exists to reap, so every one of them left a pair
+    behind: 34 herd-stline-* files against 1 live session, measured. The reaper is
+    the only thing that learns about them, so the cleanup belongs here.
+    """
+    if not _valid_sid(session_id):
+        return 0
+    gone = 0
+    for name in (f"herd-tool-{session_id}", f"herd-stline-{session_id}"):
+        try:
+            os.unlink(os.path.join(_runtime_dir(), name))
+            gone += 1
+        except OSError:
+            pass                      # never created, or already cleaned
+    return gone
+
+
 def reap_once(conn, procs, now):
     """One reap tick over live, pid-bearing sessions. pid-NULL rows are skipped
     (liveness unknowable; clean death arrives via SessionEnd). Returns count."""
     reaped = 0
     rows = conn.execute(
-        "SELECT id, pid FROM sessions WHERE stopped_at IS NULL AND pid IS NOT NULL"
+        "SELECT id, pid, session_id FROM sessions "
+        "WHERE stopped_at IS NULL AND pid IS NOT NULL"
     ).fetchall()
     for r in rows:
         if _dead(r["pid"], procs):
             # Pass the pid we JUDGED, not the row's current one — W3d_reap re-asserts
             # it, so a resume that landed since the SELECT is a 0-row no-op instead of
             # a live session reaped on evidence about a pid it no longer holds.
-            reaped += conn.execute(
+            n = conn.execute(
                 W["W3d_reap"], {"pk": r["id"], "now": now, "pid": r["pid"]}).rowcount
+            reaped += n
+            # Only when the reap actually landed: a 0-row result means the session
+            # resumed since the SELECT, and its files are live again.
+            if n:
+                sweep_runtime_files(r["session_id"])
     return reaped
 
 

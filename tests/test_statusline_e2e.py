@@ -310,3 +310,81 @@ def test_a_bad_resets_at_type_loses_only_its_own_segment(hook_env, resets):
     row = c.execute("SELECT context_percent,total_cost_usd FROM sessions "
                     "WHERE session_id='s1'").fetchone()
     assert row["context_percent"] == 42 and row["total_cost_usd"] == 1.5
+
+
+# ── a newline in any payload field must not truncate the field read ──────────
+def test_a_newline_in_the_name_does_not_freeze_every_other_field(hook_env):
+    """The 23 jq outputs are \\x1f-joined and read by ONE `read`, which stops at the
+    first newline — so one \\n emptied every field after it. Not corruption:
+    W5_statusline COALESCEs each column, so the empties bind NULL and the OLD values
+    survive. They just never move again — cost, context, branch and both rate limits
+    freeze for the life of the session while the line renders a permanent 0%. A
+    /rename can carry a newline, and a directory name may legally contain one."""
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/code/herd")
+    out = _statusline(hook_env, {**SL_FULL, "session_name": "my\nsession"}).stdout
+    row = c.execute("SELECT session_name, context_percent, total_cost_usd, cwd, "
+                    "rate_limit_5h_percent FROM sessions WHERE session_id='s1'").fetchone()
+    # 42, not 43: the column CASTs (truncates) while the render rounds — the two
+    # disagree by design, and asserting both pins that.
+    assert row["context_percent"] == 42            # fields AFTER the newline landed
+    assert row["total_cost_usd"] == 1.50
+    assert row["cwd"] == "/code/herd"
+    assert row["rate_limit_5h_percent"] == 73.5
+    assert row["session_name"] == "my session"     # newline folded to a space
+    assert "🧠 43%" in out and "💰 $1.50" in out    # and the render is whole
+
+
+def test_a_newline_in_the_cwd_does_not_lose_the_fields_after_it(hook_env):
+    """Not just the name — the strip is in the map, so it covers all 23. The
+    assertion has to name a field that comes AFTER the damaged one in the jq array
+    (cwd is 10th, api duration 11th); asserting on an earlier one passes with or
+    without the fix and proves nothing."""
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/code/herd")
+    out = _statusline(hook_env, {**SL_FULL, "cwd": "/code/her\nd"}).stdout
+    assert "⌛" in out, "the field after cwd was lost to a newline"
+    row = c.execute("SELECT api_duration_ms FROM sessions WHERE session_id='s1'").fetchone()
+    assert row["api_duration_ms"] == 2300
+
+
+def test_a_carriage_return_is_folded_too(hook_env):
+    """\r does not terminate `read`, so this one is cosmetic rather than a
+    truncation — a bare CR in a name still garbles the rendered line."""
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/code/herd")
+    out = _statusline(hook_env, {**SL_FULL, "session_name": "a\rb"}).stdout
+    assert "\r" not in out and "a b" in out
+
+
+# ── the branch walk must terminate on a relative cwd ─────────────────────────
+def test_a_relative_cwd_does_not_hang_the_statusline(hook_env):
+    """${dir%/*} returns the string UNCHANGED with no slash left, so a relative cwd
+    never shrank and the walk spun forever — in a hook that reruns ~1/sec and must
+    never block. The timeout in hook_env.run is the assertion; without the guard
+    this pins a core until Claude kills it."""
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="relative-no-slash")
+    # NOT hook_env.run: it has no timeout, so a regression here would hang the whole
+    # suite instead of failing this test. The timeout IS the assertion.
+    env = dict(os.environ, HERD_DB=hook_env.path, HERD_RUNTIME=hook_env.runtime,
+               HERD_ERRLOG=f"{hook_env.runtime}/err.log")
+    for k in ("KITTY_WINDOW_ID", "KITTY_LISTEN_ON", "HERD_JOB"):
+        env.pop(k, None)
+    r = subprocess.run(["bash", str(HOOKS / "statusline.sh")],
+                       input=json.dumps({**SL_FULL, "cwd": "relative-no-slash"}),
+                       capture_output=True, text=True, env=env, timeout=15)
+    assert "🧠 43%" in r.stdout                     # rendered, and rendered promptly
+    assert "🌿" not in r.stdout                     # no branch: nothing to walk to
+
+
+def test_the_statusline_leaves_no_tmp_debris(hook_env):
+    """A GUARD — it passes against the pre-fix script too, because the rename
+    normally succeeds and takes the tmp with it. What it pins is the case that only
+    shows up when the mv is skipped or the hook is killed mid-write: post_tool_use.sh
+    rm -f's its tmp for exactly that reason, and this one did not."""
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/code/herd")
+    _statusline(hook_env, SL_FULL)
+    runtime = pathlib.Path(hook_env.runtime)
+    assert not list(runtime.glob("herd-stline-*.tmp.*")), "left a cache tmp behind"
