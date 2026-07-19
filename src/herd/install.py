@@ -106,7 +106,10 @@ def _is_managed(cmd):
         return True
     if cmd.startswith(str(HOOKS_DIR)) or cmd.startswith(str(INSTALLED_HOOKS)):
         return True
-    path = cmd.split()[0]
+    parts = cmd.split()
+    if not parts:                       # whitespace-only: `not cmd` misses it, and
+        return False                    # split()[0] on it is an IndexError
+    path = parts[0]
     return path.rsplit("/", 1)[-1] in _OUR_SCRIPTS and ("/herd/" in path or "/.herd/" in path)
 
 
@@ -248,6 +251,29 @@ def _has_systemd_user():
     return bool(shutil.which("systemctl") and os.environ.get("XDG_RUNTIME_DIR"))
 
 
+def _systemctl(*args):
+    """systemctl --user, never raising and never hanging. The Linux twin of
+    _launchctl, and it exists for the same reason: `check=False` suppresses only
+    CalledProcessError, while `timeout=` still RAISES TimeoutExpired — the one case
+    the bound is here for, a wedged/degraded manager. install() calls
+    install_service() *after* rewriting settings.json and the statusline wrapper, so
+    an escaping exception left the config changed, no daemon installed, and a
+    traceback where the summary should be. Four systemctl calls run per install, so
+    that was up to 60s of hang before the crash.
+
+    A failure is reported the way a nonzero exit already is, so callers need no new
+    branch."""
+    try:
+        return subprocess.run(["systemctl", "--user", *args], check=False,
+                              capture_output=True, text=True,
+                              timeout=SYSTEMCTL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args, 124, "", f"systemctl {args[0]} timed out after {SYSTEMCTL_TIMEOUT}s")
+    except OSError as e:                      # systemctl vanished mid-install, fork limit
+        return subprocess.CompletedProcess(args, 127, "", f"systemctl: {e}")
+
+
 def service_unit_text():
     """The systemd --user unit. Pure — testable without touching systemd."""
     return (
@@ -385,11 +411,8 @@ def install_service(dry=False):
     SERVICE.parent.mkdir(parents=True, exist_ok=True)
     SERVICE.write_text(service_unit_text())
     for args in (["daemon-reload"], ["enable", "herd.service"], ["restart", "herd.service"]):
-        subprocess.run(["systemctl", "--user", *args], check=False,
-                       capture_output=True, timeout=SYSTEMCTL_TIMEOUT)
-    active = subprocess.run(["systemctl", "--user", "is-active", "herd.service"],
-                            capture_output=True, text=True,
-                            timeout=SYSTEMCTL_TIMEOUT).stdout.strip()
+        _systemctl(*args)
+    active = (_systemctl("is-active", "herd.service").stdout or "").strip()
     return f"herd.service written + enabled ({active or 'unknown'})"
 
 
@@ -409,11 +432,9 @@ def uninstall_service():
         return "no herd.service to remove"
     if not SERVICE.exists():
         return "no herd.service to remove"
-    subprocess.run(["systemctl", "--user", "disable", "--now", "herd.service"],
-                   check=False, capture_output=True, timeout=SYSTEMCTL_TIMEOUT)
+    _systemctl("disable", "--now", "herd.service")
     SERVICE.unlink(missing_ok=True)
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False,
-                   capture_output=True, timeout=SYSTEMCTL_TIMEOUT)
+    _systemctl("daemon-reload")
     return f"removed {SERVICE}"
 
 
@@ -823,14 +844,30 @@ def install(dry=False, dev=False):
         print("  wiring them would have broken every Claude session silently.")
         return 1
 
+    had_bell = "preferredNotifChannel" in new_settings
     bell_note = _offer_bell(new_settings)   # interactive opt-in; may set the key before we write
     # Re-read: _offer_bell blocks on input(), and Claude Code writes settings.json
     # (permission grants) while we wait. Merging onto the on-disk copy at write time
     # keeps a grant made during the prompt from being clobbered by our stale read.
+    #
+    # Merge ONLY the keys herd owns, onto the fresh copy. `fresh.update(new_settings)`
+    # did the reverse of what this comment promises: update() replaces whole top-level
+    # VALUES, so a `permissions` key that already existed at our stale read was
+    # overwritten wholesale by the stale value — clobbering exactly the grant this
+    # re-read exists to preserve. Only brand-new keys survived it. statusLine is ours
+    # only when the plan said 'set'; on 'wrapper'/'foreign' rewire_settings left it
+    # alone and copying it here would push a stale value back over a fresh one.
+    owned = ["hooks"]
+    if plan == "set":
+        owned.append("statusLine")
+    if "preferredNotifChannel" in new_settings and not had_bell:
+        owned.append("preferredNotifChannel")
     if SETTINGS.exists():
         try:
             fresh = json.loads(SETTINGS.read_text())
-            fresh.update(new_settings)
+            for k in owned:
+                if k in new_settings:
+                    fresh[k] = new_settings[k]
             new_settings = fresh
         except (OSError, json.JSONDecodeError):
             pass                                # unreadable now — go with what we built
@@ -840,10 +877,21 @@ def install(dry=False, dev=False):
     print(f"  rewired {SETTINGS} (backup: *.herd-bak.{ts})")
     print(f"  {sl_note}")
     if WRAPPER.exists():
-        backup_original(WRAPPER, WRAPPER.read_text())
-        backup(WRAPPER, ts)
-        _atomic_write(WRAPPER, wrapper_text)
-        print(f"  rewired {WRAPPER} statusline -> herd")
+        # wrap_ok, not WRAPPER.exists(). This wrote and printed "rewired"
+        # unconditionally, so it claimed success in the two cases that matter: the
+        # wrapper names no statusline at all, and rewire_wrapper's parse check
+        # REFUSED the rewrite to avoid handing back a bash syntax error. In both,
+        # wrapper_text IS the input text — there is nothing to write, and a backup
+        # of an unchanged file is noise.
+        if wrap_ok:
+            backup_original(WRAPPER, WRAPPER.read_text())
+            backup(WRAPPER, ts)
+            _atomic_write(WRAPPER, wrapper_text)
+            print(f"  rewired {WRAPPER} statusline -> herd")
+        else:
+            print(f"  {WRAPPER} LEFT AS-IS — no statusline invocation herd could rewire")
+            print("    safely (the rewrite would not have parsed). Point it at")
+            print(f"    {sl_target} by hand if you want herd's statusline.")
 
     print("  " + install_service())
     print("  " + install_cli())

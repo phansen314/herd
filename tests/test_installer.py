@@ -1032,3 +1032,93 @@ def test_a_wedged_launchd_reports_instead_of_crashing_the_install(tmp_path, monk
     msg = inst.install_launchd()
     assert "FAILED" in msg and "launchctl bootstrap" in msg   # names the manual fix
     assert (tmp_path / "herd.plist").exists()                 # plist still written
+
+
+# ── _systemctl must degrade, not raise (the Linux twin of the above) ─────────
+def _fake_bin(tmp_path, name, body):
+    d = tmp_path / "bin"
+    d.mkdir(exist_ok=True)
+    p = d / name
+    p.write_text(f"#!/bin/sh\n{body}\n")
+    p.chmod(0o755)
+    return d
+
+
+@pytest.mark.shell
+def test_systemctl_never_raises_on_a_wedged_manager(tmp_path, monkeypatch):
+    """Same bug as _launchctl's, fixed only on macOS for a while: `check=False`
+    suppresses CalledProcessError, `timeout=` still RAISES TimeoutExpired. Four
+    systemctl calls run AFTER settings.json and the wrapper are rewritten."""
+    monkeypatch.setenv("PATH", f"{_fake_bin(tmp_path, 'systemctl', 'sleep 30')}:{os.environ['PATH']}")
+    monkeypatch.setattr(inst, "SYSTEMCTL_TIMEOUT", 1)
+    r = inst._systemctl("is-active", "herd.service")     # must not raise
+    assert r.returncode != 0 and "timed out" in r.stderr
+
+
+def test_systemctl_never_raises_when_the_binary_is_gone(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    r = inst._systemctl("daemon-reload")
+    assert r.returncode != 0 and "systemctl" in r.stderr
+
+
+@pytest.mark.shell
+def test_a_wedged_systemd_reports_instead_of_crashing_the_install(tmp_path, monkeypatch):
+    """The installer finishes and SAYS what state the unit is in."""
+    monkeypatch.setattr(inst, "SERVICE", tmp_path / "herd.service")
+    monkeypatch.setattr(inst, "_has_systemd_user", lambda: True)
+    monkeypatch.setattr(inst, "_systemctl",
+                        lambda *a: subprocess.CompletedProcess(a, 124, "", "timed out"))
+    msg = inst.install_service()                          # must not raise
+    assert "herd.service written" in msg and "unknown" in msg
+    assert (tmp_path / "herd.service").exists()
+    monkeypatch.setattr(inst, "_systemctl",
+                        lambda *a: subprocess.CompletedProcess(a, 124, "", "timed out"))
+    assert "removed" in inst.uninstall_service()          # must not raise either
+
+
+# ── the write-time re-read must not clobber what changed during the prompt ───
+def test_a_grant_made_during_the_bell_prompt_survives(home, capsys, monkeypatch):
+    """_offer_bell blocks on input() and Claude Code writes settings.json while we
+    wait, so install() re-reads at write time. `fresh.update(new_settings)` did the
+    OPPOSITE of what that re-read is for: update() replaces whole top-level values,
+    so an EXISTING key (permissions — where grants land) was overwritten by our
+    stale copy. Only brand-new keys survived."""
+    inst.SETTINGS.write_text(json.dumps({"permissions": {"allow": ["Bash(ls:*)"]}}))
+
+    def grant_then_ask(new_settings):                     # stands in for _offer_bell
+        d = json.loads(inst.SETTINGS.read_text())
+        d["permissions"]["allow"].append("Bash(rg:*)")    # Claude grants mid-prompt
+        d["newKey"] = 1
+        inst.SETTINGS.write_text(json.dumps(d))
+        return "bell stubbed"
+
+    monkeypatch.setattr(inst, "_offer_bell", grant_then_ask)   # after the home fixture's stub
+    assert inst.install() == 0
+    out = json.loads(inst.SETTINGS.read_text())
+    assert out["permissions"]["allow"] == ["Bash(ls:*)", "Bash(rg:*)"]
+    assert out["newKey"] == 1
+    assert _wired(out)                                    # and herd is still wired
+
+
+# ── the wrapper report must match what was written ──────────────────────────
+def test_install_does_not_claim_to_rewire_a_wrapper_it_left_alone(home, capsys):
+    """rewire_wrapper refuses a rewrite that would not parse, and returns the input
+    unchanged. install() printed 'rewired ... -> herd' regardless — the same class of
+    lie as a wrapper with no statusline invocation at all."""
+    wrapper = home / "custom-status-line.sh"
+    wrapper.write_text("#!/usr/bin/env bash\necho no-statusline-here\n")
+    before = wrapper.read_text()
+    assert inst.install() == 0
+    out = capsys.readouterr().out
+    assert f"{wrapper} LEFT AS-IS" in out
+    assert f"rewired {wrapper} statusline" not in out
+    assert wrapper.read_text() == before                  # untouched, no backup churn
+    assert not list(home.glob("custom-status-line.sh.herd-bak.*"))
+
+
+# ── _is_managed on a whitespace-only command ────────────────────────────────
+def test_is_managed_survives_a_whitespace_only_command():
+    """`if not cmd` misses ' ', and split()[0] on it is an IndexError — reached from
+    a hand-edited settings.json via _strip_managed."""
+    assert inst._is_managed("   ") is False
+    inst._strip_managed({"Stop": [{"hooks": [{"type": "command", "command": " "}]}]})
