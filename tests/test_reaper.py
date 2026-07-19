@@ -6,10 +6,12 @@ import sqlite3
 import subprocess
 import sys
 
+import pytest
+
 import herd.daemon as daemon
 from herd.daemon import reap_once, boot_sweep, _parse_proc_table, _dead, read_proc_table
 
-from helpers import T0, T1, T2, W, mk_session, stopped_at
+from helpers import T0, T1, T2, W, SOCK, mk_session, stopped_at
 
 SRC = pathlib.Path(__file__).resolve().parent.parent / "src"
 
@@ -305,3 +307,27 @@ def test_reap_does_not_fire_when_the_pid_changed_since_the_select(fresh):
     assert stopped_at(c, pk) is None
     # and the ordinary case still reaps
     assert c.execute(W["W3d_reap"], {"pk": pk, "now": T2, "pid": 7777}).rowcount == 1
+
+
+@pytest.mark.parametrize("raw,expect", [("-60", 120), ("-1", 120), ("0", 0), ("45", 45),
+                                        ("fast", 120), ("", 120)])
+def test_int_env_rejects_negatives(monkeypatch, raw, expect):
+    """HERD_STRANDED_SECS=-60 put sweep_stranded's cutoff in the FUTURE, so it
+    deleted every spawn reservation the instant it was created — each `herd spawn`
+    lost its row while kitty was still starting. int() accepts -60; nothing else
+    about it is meaningful."""
+    if raw == "":
+        monkeypatch.delenv("HERD_STRANDED_SECS", raising=False)
+    else:
+        monkeypatch.setenv("HERD_STRANDED_SECS", raw)
+    assert daemon._int_env("HERD_STRANDED_SECS", 120) == expect
+
+
+def test_a_negative_stranded_secs_does_not_sweep_an_inflight_reservation(fresh, monkeypatch):
+    """The end of that chain: the reservation must survive its own launch."""
+    monkeypatch.setenv("HERD_STRANDED_SECS", "-60")
+    c = fresh()
+    now = daemon._now_iso()
+    pk = c.execute(W["W1_spawn_session"], {"cwd": "/x", "now": now}).lastrowid
+    c.execute(W["W1_spawn_herd"], {"pk": pk, "job": "inflight", "now": now, "socket": SOCK})
+    assert daemon.sweep_stranded(c, now, daemon._int_env("HERD_STRANDED_SECS", 120)) == 0

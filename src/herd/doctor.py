@@ -200,10 +200,17 @@ def check_env(environ):
         if raw is None or raw == "":
             continue
         try:
-            int(raw)
-            out.append((OK, name, raw))
+            val = int(raw)
         except ValueError:
             out.append((WARN, f"{name} is not an integer", f"{raw!r} — using the default"))
+            continue
+        # Kept in step with daemon._int_env, which rejects these: a negative grace
+        # period is a cutoff in the FUTURE, and doctor reporting it as OK while the
+        # daemon ignores it is the worst of both.
+        if val < 0:
+            out.append((WARN, f"{name} is negative", f"{raw!r} — using the default"))
+        else:
+            out.append((OK, name, raw))
     return out or [(OK, "env", "no HERD_* overrides")]
 
 

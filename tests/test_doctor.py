@@ -245,3 +245,15 @@ def test_a_dev_install_is_not_mistaken_for_broken_wiring():
     out = doctor.check_wiring(_mode_settings(TREE), (INST, TREE),
                               (f"{INST}/statusline.sh", f"{TREE}/statusline.sh"), ("Stop",))
     assert not any(l == FAIL and "not wired" in h for l, h, _ in out)
+
+
+def test_negative_threshold_warns():
+    """A negative grace period is a cutoff in the FUTURE, not a shorter grace.
+    doctor must not report it OK while the daemon ignores it."""
+    out = doctor.check_env({"HERD_STRANDED_SECS": "-60"})
+    assert WARN in _levels(out) and "HERD_STRANDED_SECS" in _text(out)
+
+
+def test_zero_threshold_is_accepted():
+    """Zero is a coherent 'no grace' choice, unlike a negative."""
+    assert WARN not in _levels(doctor.check_env({"HERD_WAIT_SECS": "0"}))

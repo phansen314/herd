@@ -47,10 +47,22 @@ def _int_env(name, default):
     if raw == "":
         return default
     try:
-        return int(raw)
+        val = int(raw)
     except ValueError:
         _log(f"{name}={raw!r} is not an integer — using {default}")
         return default
+    # A NEGATIVE grace period is not a shorter grace period, it is a cutoff in the
+    # FUTURE. HERD_STRANDED_SECS=-60 made sweep_stranded delete every spawn
+    # reservation the instant it was created — verified: a brand-new in-flight
+    # reservation swept on the first tick, so every `herd spawn` loses its row while
+    # kitty is still starting. The negative attention thresholds are milder (arm
+    # instantly, always) but equally not what anyone meant. This function exists so a
+    # malformed threshold cannot break things; -60 is malformed in every sense except
+    # int() accepting it. Zero is left alone — "no grace" is a coherent choice.
+    if val < 0:
+        _log(f"{name}={raw!r} is negative — using {default}")
+        return default
+    return val
 
 
 # Same identity anchor as claude_pid(); a node-based install overrides both via
