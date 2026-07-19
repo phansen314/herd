@@ -39,7 +39,15 @@ def _now_iso():
 # documents) alongside the LaunchAgent is therefore a permanent 5s restart loop
 # writing one line each time: ~17k lines/day, forever, into the file README points
 # you at. 0 disables. See DECISIONS.md#launchd-log.
-# (value set below, once _int_env exists — _log resolves it at call time)
+#
+# BOUND FIRST, as a literal, and overridden below once _int_env exists. "_log
+# resolves it at call time" is true of every call except the ones that happen
+# DURING the constant block: _int_env reports a malformed value through _log, and
+# _log reads this name, so a bad HERD_WAIT_SECS raised NameError at import instead
+# of the ValueError _int_env was written to swallow — and cli.py imports this
+# module, so `HERD_WAIT_SECS=fast herd ls` tracebacked. Same for a bad
+# HERD_DAEMON_LOG_MAX, which reports through _log while defining itself.
+DAEMON_LOG_MAX = 1048576
 
 
 def _stderr_is_a_regular_file():
@@ -109,6 +117,12 @@ def _int_env(name, default):
 # HERD_CLAUDE_NAME so hook and reaper stay consistent.
 CLAUDE_NAME = os.environ.get("HERD_CLAUDE_NAME", "claude")
 
+# Linux caps a process's comm at TASK_COMM_LEN-1 = 15 chars (`ps -o comm=` reads
+# /proc/pid/stat), so a CLAUDE_NAME of 16+ can NEVER equal what ps reports. _dead
+# reads a comm mismatch as a recycled pid, so that override reaped every live
+# session on the first tick. macOS reports the full basename, hence both forms.
+_COMM_MAX = 15
+
 # Attention: "needs attention" is DERIVED each tick from status + time-in-status
 # (now - last_event_at), never stored. Thresholds in seconds, env-overridable.
 # Statuses not listed are never page-worthy. See DESIGN.md#attention.
@@ -124,7 +138,8 @@ ATTENTION_SECS = {
 STRANDED_SECS = _int_env("HERD_STRANDED_SECS", 120)
 
 # Bound for a stderr that is a FILE — see _truncate_stderr_if_huge. 0 disables.
-DAEMON_LOG_MAX = _int_env("HERD_DAEMON_LOG_MAX", 1048576)
+# The literal above is the default this overrides; both must stay in step.
+DAEMON_LOG_MAX = _int_env("HERD_DAEMON_LOG_MAX", DAEMON_LOG_MAX)
 
 # One tick's `ps` must not outlive the tick. Generous — a loaded box can be slow —
 # but finite, because a hung ps freezes the reaper while the process stays alive,
@@ -196,6 +211,14 @@ def boot_time_iso():
 
 
 # ── liveness + the tick ──────────────────────────────────────────────────────
+def _is_claude(comm):
+    """Does this comm name our process? Exact, or the Linux-truncated form of a
+    CLAUDE_NAME too long to survive /proc — see _COMM_MAX. Truncating the STORED
+    name (not the observed one) keeps this from matching a short impostor: `cla`
+    never passes for `claude`."""
+    return comm == CLAUDE_NAME or comm == CLAUDE_NAME[:_COMM_MAX]
+
+
 def _dead(pid, procs):
     """A stored pid is DEAD unless it is a live, non-zombie claude. Reap if:
     absent; zombie (state Z passes kill -0 but is gone); or comm != CLAUDE_NAME (a
@@ -207,7 +230,7 @@ def _dead(pid, procs):
     state, comm = p
     if state == "Z":
         return True
-    if comm != CLAUDE_NAME:
+    if not _is_claude(comm):
         return True
     return False
 
@@ -325,8 +348,9 @@ def attention_tick(conn, now):
             armed += conn.execute(
                 W["W6a_arm"], {"pk": r["id"], "now": now, "cutoff": cutoff}).rowcount
         elif not na and r["is_armed"]:
-            conn.execute(W["W6d_rearm"], {"pk": r["id"]})
-            disarmed += 1
+            # rowcount, like `armed` — this counted intent, not effect, so a W6d
+            # that matched nothing still reported a disarm.
+            disarmed += conn.execute(W["W6d_rearm"], {"pk": r["id"]}).rowcount
         elif na and r["is_armed"] and r["ack_at"]:
             # RE-NOTIFY. A jump acks the silence and the CLI stops rendering the mark,
             # but the session is still silent and still unanswered. ack_at restarts
@@ -340,8 +364,7 @@ def attention_tick(conn, now):
             # which is still old — it would re-arm immediately and flap every tick.
             over = _silent_for(r["status"], r["ack_at"], now)
             if over is not None and over >= 0:
-                conn.execute(W["W6d_rearm"], {"pk": r["id"]})
-                disarmed += 1
+                disarmed += conn.execute(W["W6d_rearm"], {"pk": r["id"]}).rowcount
     return armed, disarmed
 
 
@@ -369,10 +392,19 @@ def acquire_single_instance(path=None):
     """Take the daemon lock. True if we now hold it, False if another daemon does."""
     global _LOCK_FH
     path = path or lock_path()
+    fh = None
     try:
         fh = open(path, "a+")
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        if fh is not None:
+            # The open SUCCEEDED and the flock did not, so this handle was left to
+            # the garbage collector. CPython's refcounting closes it at return, so
+            # this was never an observable leak — it is explicit because the
+            # guarantee is an implementation detail, not a promise. Safe either way:
+            # flock is per open-file-description, so dropping ours cannot disturb
+            # the daemon that holds the lock.
+            fh.close()
         return False
     fh.seek(0); fh.truncate(); fh.write(f"{os.getpid()}\n"); fh.flush()
     _LOCK_FH = fh                        # MUST outlive this function — see above
@@ -454,8 +486,34 @@ def run(interval=2.0, db_path=None, once=False, attend=None):
         time.sleep(interval)
 
 
+_FLAGS = {"--once", "--help", "-h"}
+
+USAGE = """usage: python3 -m herd.daemon [--once]
+
+  (no flags)    reaper + attention tick, every 2s, until killed
+  --once        one tick, then exit
+  --help, -h    this message
+
+  HERD_ATTENTION=0   core-only: reaper runs, herd_attention untouched"""
+
+
 def main(argv=None):
+    """Unknown argv is REFUSED, not ignored — as in herd.install.main.
+
+    `run(once="--once" in argv)` was a membership test with no validation, so
+    `--onec` started a daemon that never exits where a single tick was asked for,
+    and `--help` started one too. --once is the flag you reach for while debugging,
+    which is exactly when a silently-ignored typo costs the most.
+    """
     argv = argv if argv is not None else sys.argv[1:]
+    unknown = [a for a in argv if a not in _FLAGS]
+    if unknown:
+        _log(f"unknown option {', '.join(repr(a) for a in unknown)} — not starting")
+        print(USAGE, file=sys.stderr)
+        return 2
+    if "--help" in argv or "-h" in argv:
+        print(USAGE, file=sys.stderr)
+        return 0
     if not acquire_single_instance():
         other = holder_pid()
         _log(f"another herd daemon is already running{f' (pid {other})' if other else ''}"

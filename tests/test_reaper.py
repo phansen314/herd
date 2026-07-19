@@ -384,3 +384,96 @@ def test_daemon_log_bound_can_be_disabled(tmp_path, monkeypatch):
         fh.flush()
         daemon._log("still appended")
     assert len(log.read_text()) > 5000
+
+
+# ── env-parsing must not take the process down (daemon.py#_int_env) ─────────
+def _import_daemon_with(env, tmp_path):
+    """Import herd.daemon fresh in a child, with `env` set. Returns CompletedProcess.
+    A child, because these constants are read at IMPORT time — the whole point of
+    the bug is that it fires before anything can catch it."""
+    e = dict(os.environ, PYTHONPATH=str(SRC), **env)
+    return subprocess.run(
+        [sys.executable, "-c",
+         "from herd import daemon as d;"
+         "print(d.ATTENTION_SECS['waiting'], d.STRANDED_SECS, d.DAEMON_LOG_MAX)"],
+        capture_output=True, text=True, env=e, timeout=30)
+
+
+@pytest.mark.parametrize("var,bad", [
+    ("HERD_WAIT_SECS", "fast"), ("HERD_APPROVAL_SECS", "-1"),
+    ("HERD_STUCK_SECS", ""), ("HERD_STRANDED_SECS", "-60"),
+    ("HERD_DAEMON_LOG_MAX", "big"),
+])
+def test_a_malformed_threshold_falls_back_instead_of_raising(var, bad, tmp_path):
+    """_int_env exists so a bad threshold cannot break every herd command. Its own
+    error path called _log, which read DAEMON_LOG_MAX — assigned BELOW the constants
+    that report through it — so a bad value raised NameError at import. cli.py
+    imports daemon, so `HERD_WAIT_SECS=fast herd ls` tracebacked."""
+    r = _import_daemon_with({var: bad}, tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "NameError" not in r.stderr
+    assert r.stdout.split() == ["30", "120", "1048576"]        # all defaults intact
+    if bad != "":                                              # "" means 'unset', silent
+        assert var in r.stderr                                 # and it SAYS which knob
+
+
+def test_the_daemon_still_starts_under_a_malformed_threshold(tmp_path):
+    """Not just the CLI: the reaper itself is what stops if import raises, and a
+    daemon that will not start is silent-death reaping that never happens."""
+    e = dict(os.environ, PYTHONPATH=str(SRC), HERD_WAIT_SECS="fast",
+             HERD_RUNTIME=str(tmp_path), HERD_DB=str(tmp_path / "t.db"))
+    r = subprocess.run([sys.executable, "-m", "herd.daemon", "--once"],
+                       capture_output=True, text=True, env=e, timeout=30)
+    assert r.returncode == 0, r.stderr
+
+
+# ── comm truncation: Linux caps comm at 15 chars, CLAUDE_NAME is not capped ──
+def test_a_long_claude_name_does_not_reap_every_session(monkeypatch):
+    """`ps -o comm=` reads /proc/pid/stat, capped at TASK_COMM_LEN-1 = 15, so a
+    16+ char HERD_CLAUDE_NAME can never equal what ps reports. _dead reads a comm
+    mismatch as a recycled pid — so the override reaped every live session."""
+    monkeypatch.setattr(daemon, "CLAUDE_NAME", "claude-code-node-runner")
+    assert not _dead(1, {1: ("S", "claude-code-nod")})   # what Linux ps can report
+    assert not _dead(1, {1: ("S", "claude-code-node-runner")})   # what macOS reports
+    assert _dead(1, {1: ("S", "cla")})                   # a short impostor still dies
+    assert _dead(1, {1: ("Z", "claude-code-nod")})       # zombie still dies
+
+
+def test_a_short_name_is_not_matched_by_a_prefix(monkeypatch):
+    """Truncating the STORED name, never the observed one — the other direction
+    would let `cla` pass for `claude`."""
+    monkeypatch.setattr(daemon, "CLAUDE_NAME", "claude")
+    assert _dead(1, {1: ("S", "clau")})
+    assert not _dead(1, {1: ("S", "claude")})
+
+
+# ── argv: an unknown flag must not start a daemon ───────────────────────────
+def test_daemon_refuses_an_unknown_flag(tmp_path, monkeypatch, capsys):
+    """`run(once='--once' in argv)` ran forever on `--onec` — a typo of the one
+    flag you use while debugging — and started a daemon on `--help`."""
+    monkeypatch.setattr(daemon, "acquire_single_instance",
+                        lambda *a, **k: pytest.fail("must not reach the lock"))
+    assert daemon.main(["--onec"]) == 2
+    assert daemon.main(["--help"]) == 0
+    assert "usage" in capsys.readouterr().err
+
+
+# ── the lock handle must not leak when someone else holds it ────────────────
+def test_a_refused_lock_does_not_leak_the_handle(tmp_path, monkeypatch):
+    """A GUARD, not a regression test — it passes against the pre-fix code too.
+    CPython refcounts the unclosed handle away at return, so the 'leak' was never
+    observable; the explicit close is there because that is an implementation
+    detail. What this pins is the part that would really hurt: a refusal must not
+    disturb the holder's lock (flock is per open-file-description) and must stay
+    repeatable."""
+    lock = tmp_path / "herd-daemon.lock"
+    monkeypatch.setattr(daemon, "lock_path", lambda: str(lock))
+    held = daemon._LOCK_FH
+    monkeypatch.setattr(daemon, "_LOCK_FH", held, raising=False)   # restored after
+    assert daemon.acquire_single_instance()              # we hold it
+    before = len(os.listdir(f"/proc/{os.getpid()}/fd")) if os.path.isdir("/proc/self/fd") else None
+    for _ in range(20):
+        assert daemon.acquire_single_instance() is False  # a second taker is refused
+    if before is not None:
+        after = len(os.listdir(f"/proc/{os.getpid()}/fd"))
+        assert after <= before, f"leaked {after - before} fds over 20 refusals"
