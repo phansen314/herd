@@ -339,9 +339,17 @@ WHERE id = (SELECT h.session_pk FROM herd_sessions h
 -- ── W6. ATTENTION (daemon.py). "Needs attention" is derived each tick; only the
 -- action/edge persists here. See DESIGN.md#attention.
 -- W6a: arm — the rule tripped. COALESCE preserves the edge across ticks.
+-- The SELECT re-asserts what the caller's snapshot observed. attention_tick reads
+-- every live row, then writes; a hook firing in between made it arm a session that
+-- had just gone active, so the mark appeared on a working session and cleared on
+-- the next tick. Small, but it is a mark that means "look at me" appearing when
+-- there is nothing to look at. :cutoff is now minus that status's threshold, so
+-- "still silent" is re-checked at write time rather than trusted from the read.
 -- :name W6a_arm
 INSERT INTO herd_attention(session_pk, attention_at)
-VALUES(:pk, :now)
+SELECT id, :now FROM sessions
+ WHERE id = :pk AND stopped_at IS NULL
+   AND last_event_at IS NOT NULL AND last_event_at <= :cutoff
 ON CONFLICT(session_pk) DO UPDATE SET attention_at = COALESCE(attention_at, :now);
 
 -- (no W6b: there is no page action to record. herd owns no actuator, so the

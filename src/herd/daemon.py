@@ -186,17 +186,26 @@ def reap_once(conn, procs, now):
     return reaped
 
 
+def _shift_iso(now, secs):
+    """`now` minus `secs`, as an ISO-UTC stamp comparable to the stored ones, or
+    None when `now` will not parse. Shared by sweep_stranded and the arm rule so a
+    cutoff is computed one way."""
+    at = _epoch(now)
+    if at is None:
+        return None
+    return (datetime.datetime.fromtimestamp(at - secs, datetime.timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
+
+
 def sweep_stranded(conn, now, max_age=None):
     """Drop spawn reservations that never became a session. reap_once cannot: its
     pid predicate skips them by design, so without this they hold their job_name
     live until the next boot sweep. Independent of `ps` — nothing to check, the row
     names no process. Returns count."""
     age = STRANDED_SECS if max_age is None else max_age
-    at = _epoch(now)
-    if at is None:
+    cutoff = _shift_iso(now, age)
+    if cutoff is None:
         return 0
-    cutoff = (datetime.datetime.fromtimestamp(at - age, datetime.timezone.utc)
-              .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
     return conn.execute(W["W3f_sweep_stranded"], {"cutoff": cutoff}).rowcount
 
 
@@ -264,8 +273,14 @@ def attention_tick(conn, now):
     for r in rows:
         na = needs_attention(r["status"], r["last_event_at"], now)
         if na and not r["is_armed"]:
-            conn.execute(W["W6a_arm"], {"pk": r["id"], "now": now})
-            armed += 1
+            # Re-assert the silence at write time — see W6a_arm. A hook firing
+            # between this tick's SELECT and this write means the session is no
+            # longer silent, and the statement declines rather than marking it.
+            cutoff = _shift_iso(now, ATTENTION_SECS[r["status"]])
+            if cutoff is None:
+                continue
+            armed += conn.execute(
+                W["W6a_arm"], {"pk": r["id"], "now": now, "cutoff": cutoff}).rowcount
         elif not na and r["is_armed"]:
             conn.execute(W["W6d_rearm"], {"pk": r["id"]})
             disarmed += 1
@@ -380,7 +395,12 @@ def run(interval=2.0, db_path=None, once=False, attend=None):
             sweep_stranded(conn, now)                 # tier 1 — needs no proc table
             if attend:
                 attention_tick(conn, now)             # tier 2 — herd's opinion
-                sweep_dead_attention(conn)            # tier 2 — reclaim the dead
+            # NOT gated on `attend`. W6e is garbage collection, not an opinion: it
+            # deletes herd_attention rows whose session is already stopped. Gating
+            # it meant HERD_ATTENTION=0 leaked those rows forever — verified — which
+            # is the unbounded growth W6e exists to prevent, in the one mode where
+            # nothing else would ever clear them.
+            sweep_dead_attention(conn)
             fails = 0
         except Exception as e:                        # noqa: BLE001 — a daemon outlives its errors
             fails += 1

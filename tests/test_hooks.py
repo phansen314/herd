@@ -524,3 +524,38 @@ def test_the_window_route_still_wins_when_the_stamp_is_there(hook_env):
                  {"KITTY_WINDOW_ID": "5", "KITTY_LISTEN_ON": SOCK, "HERD_JOB": "api"})
     got = c.execute("SELECT id FROM sessions WHERE session_id='uuid-D'").fetchone()[0]
     assert got == real, "took the job route when the window route was available"
+
+
+def test_a_transient_date_failure_does_not_downgrade_later_stamps(tmp_path):
+    """__HERD_FMT latches to the whole-second format when `date` leaves %3N
+    unexpanded (BSD). It used to latch on EMPTY output too — a single transient
+    failure cost every later stamp in the process its millisecond resolution, with
+    no way back. No output is not evidence about the format."""
+    marker = tmp_path / "failed_once"
+    fake = tmp_path / "date"
+    fake.write_text(f'#!/bin/bash\n'
+                    f'if [ ! -f "{marker}" ]; then touch "{marker}"; exit 1; fi\n'
+                    f'exec /usr/bin/date "$@"\n')
+    fake.chmod(0o755)
+    r = subprocess.run(
+        ["bash", "-c", f'. "{HOOKS}/common.sh"; now_pair; echo "1:$NOW_ISO"; '
+                       f'now_pair; echo "2:$NOW_ISO"'],
+        capture_output=True, text=True,
+        env=dict(os.environ, PATH=f"{tmp_path}:{os.environ['PATH']}"))
+    first, second = [l.split(":", 1)[1] for l in r.stdout.strip().splitlines()]
+    assert first == "", "the failing call should yield no stamp at all"
+    assert second.endswith("Z") and not second.endswith(".000Z"), \
+        f"millis lost after a transient failure: {second!r}"
+
+
+def test_a_date_without_percent_3n_still_latches(tmp_path):
+    """The other side — a real BSD date must still be detected once and reused."""
+    fake = tmp_path / "date"
+    fake.write_text('#!/bin/bash\nargs=(); for a in "$@"; do args+=("${a//%3N/3N}"); done\n'
+                    'exec /usr/bin/date "${args[@]}"\n')
+    fake.chmod(0o755)
+    r = subprocess.run(
+        ["bash", "-c", f'. "{HOOKS}/common.sh"; now_pair; echo "$NOW_ISO"'],
+        capture_output=True, text=True,
+        env=dict(os.environ, PATH=f"{tmp_path}:{os.environ['PATH']}"))
+    assert r.stdout.strip().endswith(".000Z")

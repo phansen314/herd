@@ -41,7 +41,16 @@ printf '.mode list\n.separator "%s" "%s"\n%s\n' $'\037' $'\036' "$SQL" | db | aw
         mark["needs_approval"] = "🔐"; reason["needs_approval"] = "needs approval"
         mark["working"] = "🥱"; reason["working"] = "stuck — no activity"
     }
-    NF != 20 { next }
+    # A record with the wrong field count means a VALUE contained \x1f or \x1e —
+    # session_name is arbitrary /rename text and cwd is an arbitrary path. Skipping
+    # it is right (rendering a mis-split row would show another session data), but
+    # counting it matters: without that, an unparseable row is indistinguishable
+    # from a dead one and the pane says "(session gone)" about a live session.
+    # Only OUR row being unreadable is worth reporting. The id is field 1 and the
+    # corruption is always later in the row, so $1 still identifies the record even
+    # when a value split it — which keeps "(session gone)" exact for an id that
+    # genuinely is not there, in a DB that happens to hold some other broken row.
+    NF != 20 { if ($1 == want) bad++; next }
     $1 != want { next }
     {
         id=$1; sid=$2; pid=$3; cwd=$4; status=$5; ssrc=$6; model=$7; sname=$8
@@ -78,6 +87,10 @@ printf '.mode list\n.separator "%s" "%s"\n%s\n' $'\037' $'\036' "$SQL" | db | aw
         found = 1
         exit
     }
-    END { if (!found) print "(session gone)" }
+    # "gone" is a claim about the session. Only make it when the data was readable.
+    END {
+        if (!found)
+            print bad ? "(preview unavailable — unreadable row)" : "(session gone)"
+    }
 '
 exit 0

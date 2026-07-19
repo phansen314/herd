@@ -252,6 +252,46 @@ could not read, states that nothing changed, prints usage, and exits 2. `--help`
 **Protects:** `test_installer.py::test_unreadable_argv_installs_nothing` and
 `test_known_flags_still_route`.
 
+## 2026-07-18 — Four small lies the system told {#small-lies}
+
+The tail of the audit. None of these lose data; each one states something untrue,
+which is its own cost in a system whose whole job is answering "what is happening".
+
+**The mark appeared on a working session.** `attention_tick` reads every live row,
+then writes. A hook firing in between meant `W6a_arm` armed a session that had just
+gone active — 🙋 on something actively working, cleared on the next tick.
+Reproduced. `W6a_arm` is now an `INSERT ... SELECT` that re-asserts liveness and
+`last_event_at <= :cutoff`, so "still silent" is checked at write time rather than
+trusted from the read. It also declines a NULL clock, matching `needs_attention`,
+which reads that as "no signal" rather than as infinite silence.
+
+**`HERD_ATTENTION=0` leaked attention rows forever.** `sweep_dead_attention` was
+inside `if attend:`. But `W6e` is garbage collection, not an opinion — it deletes
+rows whose session is already stopped — and gating it meant the one mode where
+nothing else would ever clear them was the mode that never ran it. Reproduced: an
+orphan row survived a full tick. Now runs unconditionally.
+
+**One bad `date` cost every later stamp its millis.** `now_pair` latches
+`__HERD_FMT` to the whole-second format when `date` leaves `%3N` unexpanded (BSD).
+It latched on EMPTY output too, so a single transient failure downgraded every
+subsequent stamp in the process with no way back. No output is not evidence about
+the format — the latch now requires output that actually arrived.
+
+**The preview called a live session dead.** `\x1f`/`\x1e` are the field and record
+separators and `session_name` is arbitrary `/rename` text, so a name containing one
+made the row unparseable. Skipping it is right — rendering a mis-split row would
+show *another session's* data — but the pane then said `(session gone)`, a claim
+about the session rather than about the data. It now distinguishes the two, and
+does so precisely: the id is field 1 and the corruption is always later in the row,
+so an id that genuinely is absent still reads `(session gone)` in a DB that happens
+to hold some other broken row.
+
+**Protects:** `test_arm_declines_a_session_that_went_active_since_the_read` and its
+three siblings, `test_dead_attention_is_reclaimed_even_with_attention_disabled`,
+`test_a_transient_date_failure_does_not_downgrade_later_stamps` (paired with
+`test_a_date_without_percent_3n_still_latches`, which holds the BSD detection the
+first one must not break), and the two `preview.sh` unreadable-row tests.
+
 ## 2026-07-18 — A spawned session carries its own identity {#spawn-identity}
 
 `herd spawn` reserves the job name, launches kitty, then stamps the window id onto

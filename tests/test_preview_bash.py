@@ -161,3 +161,28 @@ def test_preview_survives_a_session_with_no_herd_row(hook_env):
     conn = connect(hook_env.path, readonly=True)
     row = next(x for x in cli._live(conn) if x["id"] == pk)
     assert r.stdout == cli._preview_text(row) + "\n"
+
+
+# ── an unreadable row is not a dead session ──────────────────────────────────
+@pytest.mark.parametrize("name", ["na\x1fme", "na\x1eme"],
+                         ids=["unit-separator", "record-separator"])
+def test_a_control_char_in_a_name_reports_unreadable_not_gone(hook_env, name):
+    """\\x1f/\\x1e are the field and record separators, and session_name is arbitrary
+    /rename text. The row cannot be parsed — skipping it is right, since rendering a
+    mis-split row would show ANOTHER session's data — but calling a live session
+    "gone" is a false statement about the session rather than about the data."""
+    c = hook_env.conn()
+    pk = mk_session(c, session_id="s1", cwd="/x", session_name=name)
+    r = hook_env.run("preview.sh", None, args=[str(pk)])
+    assert r.stdout.strip() == "(preview unavailable — unreadable row)"
+    assert r.returncode == 0
+
+
+def test_an_absent_id_still_reads_gone_despite_another_broken_row(hook_env):
+    """Precision: only OUR row being unreadable is worth reporting. The id is field
+    1 and the corruption is always later in the row, so an id that genuinely is not
+    there still reads "(session gone)" in a DB holding some other broken row."""
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/x", session_name="na\x1fme")
+    r = hook_env.run("preview.sh", None, args=["4242"])
+    assert r.stdout.strip() == "(session gone)"

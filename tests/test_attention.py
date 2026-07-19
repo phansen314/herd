@@ -204,12 +204,31 @@ def test_preview_names_the_reason_not_just_attention(fresh):
 # ── the statement-level lifecycle: arm (edge-preserving), ack, re-arm ────────
 # The tests above drive the daemon's tick; these drive W6a/W6c/W6d directly, so a
 # statement can't rot behind a tick that stopped calling it.
+def _fresh_at(path):
+    """A connection to a specific DB path — the daemon opens its own, so the test
+    needs one pointing at the same file."""
+    import sqlite3
+    from herd.db import apply_schema
+    c = sqlite3.connect(path)
+    c.isolation_level = None
+    apply_schema(c)
+    c.row_factory = sqlite3.Row
+    return c
+
+
+def _arm(c, pk, now, cutoff=T2):
+    """W6a_arm re-asserts the silence at write time, so it takes the status
+    threshold's cutoff. These tests drive the statement directly; the daemon
+    computes the real cutoff per status in attention_tick."""
+    return c.execute(W["W6a_arm"], {"pk": pk, "now": now, "cutoff": cutoff}).rowcount
+
+
 def test_statement_lifecycle(fresh):
     c = fresh()
     pk = mk_session(c, session_id="s1", status="waiting", last_event_at=T0, last_event_type="stop")
 
-    c.execute(W["W6a_arm"], {"pk": pk, "now": T1})
-    c.execute(W["W6a_arm"], {"pk": pk, "now": T2})   # tick again — must not move the edge
+    _arm(c, pk, T1)
+    _arm(c, pk, T2)   # tick again — must not move the edge
     assert c.execute("SELECT attention_at FROM herd_attention WHERE session_pk=?", (pk,)).fetchone()[0] == T1
 
     c.execute(W["W6c_ack"], {"now": T2, "pk": pk, "focus_started_at": T2})
@@ -219,7 +238,7 @@ def test_statement_lifecycle(fresh):
     c.execute(W["W6d_rearm"], {"pk": pk})
     assert c.execute("SELECT COUNT(*) FROM herd_attention WHERE session_pk=?", (pk,)).fetchone()[0] == 0
 
-    c.execute(W["W6a_arm"], {"pk": pk, "now": T2})   # rule can trip fresh after re-arm
+    _arm(c, pk, T2)   # rule can trip fresh after re-arm
     assert c.execute("SELECT attention_at FROM herd_attention WHERE session_pk=?", (pk,)).fetchone()[0] == T2
 
 
@@ -234,8 +253,8 @@ def _ack_returning(c, pk, focus_started_at, now):
 
 def test_ack_clears_attention_raised_before_the_jump_started(fresh):
     c = fresh()
-    pk = mk_session(c, session_id="s1", status="waiting")
-    c.execute(W["W6a_arm"], {"pk": pk, "now": T0})       # raised first
+    pk = mk_session(c, session_id="s1", status="waiting", last_event_at=T0)
+    _arm(c, pk, T0)       # raised first
     assert _ack_returning(c, pk, focus_started_at=T0_10, now=T0_20) == T0_20
 
 
@@ -244,16 +263,16 @@ def test_ack_does_not_clear_attention_raised_mid_jump(fresh):
     attention raised AFTER the jump began has not been seen by the user, so acking
     it would silently swallow a genuine notification."""
     c = fresh()
-    pk = mk_session(c, session_id="s1", status="waiting")
-    c.execute(W["W6a_arm"], {"pk": pk, "now": T0_20})    # raised DURING the jump
+    pk = mk_session(c, session_id="s1", status="waiting", last_event_at=T0)
+    _arm(c, pk, T0_20)    # raised DURING the jump
     assert _ack_returning(c, pk, focus_started_at=T0_10, now=T1) is None
 
 
 def test_ack_is_idempotent(fresh):
     """ack_at IS NULL keeps a second focus from overwriting the first ack time."""
     c = fresh()
-    pk = mk_session(c, session_id="s1", status="waiting")
-    c.execute(W["W6a_arm"], {"pk": pk, "now": T0})
+    pk = mk_session(c, session_id="s1", status="waiting", last_event_at=T0)
+    _arm(c, pk, T0)
     first = _ack_returning(c, pk, focus_started_at=T0_10, now=T0_10)
     assert _ack_returning(c, pk, focus_started_at=T1, now=T2) == first
 
@@ -320,4 +339,55 @@ def test_the_sweep_runs_on_the_tick(fresh, tmp_path):
     c.close()
     daemon.run(interval=0, db_path=str(tmp_path / "att.db"), once=True, attend=True)
     c = sqlite3.connect(str(tmp_path / "att.db"))
+    assert c.execute("SELECT COUNT(*) FROM herd_attention").fetchone()[0] == 0
+
+
+# ── the arm rule re-asserts silence at write time ────────────────────────────
+def test_arm_declines_a_session_that_went_active_since_the_read(fresh):
+    """attention_tick reads every live row, then writes. A hook firing in between
+    means the session is no longer silent — arming it anyway put the 🙋 mark on a
+    working session until the next tick cleared it."""
+    c = fresh()
+    pk = mk_session(c, session_id="s1", status="waiting", last_event_at=T0)
+    # the daemon decided this row was silent; then PostToolUse landed:
+    c.execute(W["W4_event"], {"session_id": "s1", "now": T2, "status": "working",
+                              "etype": "tool"})
+    assert _arm(c, pk, T2, cutoff=T1) == 0
+    assert c.execute("SELECT COUNT(*) FROM herd_attention").fetchone()[0] == 0
+
+
+def test_arm_still_fires_for_a_genuinely_silent_session(fresh):
+    c = fresh()
+    pk = mk_session(c, session_id="s1", status="waiting", last_event_at=T0)
+    assert _arm(c, pk, T2, cutoff=T1) == 1
+
+
+def test_arm_declines_a_stopped_session(fresh):
+    """An orphan armed on a row that died between the read and the write."""
+    c = fresh()
+    pk = mk_session(c, session_id="s1", status="waiting", last_event_at=T0,
+                    stopped_at=T1)
+    assert _arm(c, pk, T2, cutoff=T1) == 0
+
+
+def test_arm_ignores_a_session_with_no_clock(fresh):
+    """needs_attention() reads a NULL last_event_at as 'no signal'; the statement
+    must agree rather than arming on an unknowable silence."""
+    c = fresh()
+    pk = mk_session(c, session_id="s1", status="waiting", last_event_at=None)
+    assert _arm(c, pk, T2, cutoff=T1) == 0
+
+
+def test_dead_attention_is_reclaimed_even_with_attention_disabled(fresh, tmp_path):
+    """W6e is garbage collection, not an opinion — it deletes rows whose session is
+    already stopped. Gating it on `attend` meant HERD_ATTENTION=0 leaked them
+    forever, which is the unbounded growth W6e exists to prevent, in the one mode
+    where nothing else would ever clear them."""
+    import herd.daemon as D
+    db = str(tmp_path / "a.db")
+    c = _fresh_at(db)
+    pk = mk_session(c, session_id="s1", pid=4242, status="waiting", last_event_at=T0)
+    mk_attention(c, pk, attention_at=T0)
+    c.execute("UPDATE sessions SET stopped_at=? WHERE id=?", (T1, pk))
+    D.run(interval=0, db_path=db, once=True, attend=False)
     assert c.execute("SELECT COUNT(*) FROM herd_attention").fetchone()[0] == 0

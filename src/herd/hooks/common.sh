@@ -50,12 +50,18 @@ now_pair() {
     __o=$(date -u "$__HERD_FMT")
     # millis field of "<iso>.<ms>Z <epoch>". Non-digits (or empty) mean this date
     # left %3N unexpanded — BSD renders it literally, e.g. "...:00.3NZ".
-    __ms="${__o%Z *}"; __ms="${__ms##*.}"
-    case "$__ms" in
-        ''|*[!0-9]*)
-            __HERD_FMT='+%Y-%m-%dT%H:%M:%S.000Z %s'
-            __o=$(date -u "$__HERD_FMT") ;;
-    esac
+    # Latch ONLY on a positive BSD detection — output that arrived and left %3N
+    # unexpanded. An EMPTY $__o means `date` failed, which says nothing about the
+    # format, and latching on it downgraded every later stamp in the process to
+    # whole seconds after a single transient failure. No output, no conclusion.
+    if [ -n "$__o" ]; then
+        __ms="${__o%Z *}"; __ms="${__ms##*.}"
+        case "$__ms" in
+            ''|*[!0-9]*)
+                __HERD_FMT='+%Y-%m-%dT%H:%M:%S.000Z %s'
+                __o=$(date -u "$__HERD_FMT") ;;
+        esac
+    fi
     NOW_ISO="${__o% *}"
     NOW_EPOCH="${__o##* }"
 }
