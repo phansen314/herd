@@ -72,13 +72,31 @@ Undo it — hooks, statusline, service, and the CLI symlinks — with:
 PYTHONPATH=src python3 -m herd.install --uninstall
 ```
 
-This works by **restoring the pre-herd `*.herd-bak.original` snapshot** of each file it
-edited, not by reversing the edits — that snapshot is taken once, on the first install,
-and never overwritten, so re-installing any number of times doesn't affect what you get
-back. (Installs predating that snapshot fall back to the oldest `*.herd-bak.<ts>`.) If
-no pre-herd copy survives it says so, exits nonzero, and leaves the file wired for you
-to unwire by hand. Your data survives
-either way: `~/.herd/herd.db` is never deleted.
+This **reverses herd's edits on the live files** — it strips the hook entries herd
+owns, hands `statusLine` back to whatever held it before, and restores the wrapper's
+original statusline invocation. Everything else in `settings.json` is left exactly as
+it is: permission grants, MCP servers, and other tools' hooks all survive, including
+ones added long after the install. Each file is backed up (`*.herd-bak.<ts>`) before
+it is written.
+
+One key is deliberately left behind. If `preferredNotifChannel` is set, uninstall
+names it and moves on: herd's opt-in and your own setting are the same value on disk,
+so it can't tell them apart, and deleting a real preference is the worse mistake.
+
+If you'd rather revert wholesale to the **pre-herd `*.herd-bak.original` snapshot** —
+taken once on the first install and never overwritten, so re-installing any number of
+times doesn't affect it — add `--restore-original`:
+
+```bash
+PYTHONPATH=src python3 -m herd.install --uninstall --restore-original
+```
+
+That discards anything added to the file since the install, which is why it isn't the
+default; the backup taken first is your way back. (Installs predating that snapshot
+fall back to the oldest `*.herd-bak.<ts>`.) If no pre-herd copy survives it says so,
+exits nonzero, and leaves the file wired for you to unwire by hand.
+
+Your data survives either way: `~/.herd/herd.db` is never deleted.
 
 ## Using it
 

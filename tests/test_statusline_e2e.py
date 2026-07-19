@@ -275,3 +275,29 @@ def test_reset_segment_is_omitted_when_the_payload_has_no_resets_at(hook_env):
     assert "5h 50%" in out and "7d 10%" in out
     assert "resets" not in out, out
     assert "%I" not in out and "%-I" not in out, out
+
+
+@pytest.mark.parametrize("resets", ['"1784000000"', '"garbage"', "true", "[1,2]", "{}"],
+                         ids=["numeric-string", "text", "bool", "array", "object"])
+def test_a_bad_resets_at_type_loses_only_its_own_segment(hook_env, resets):
+    """strflocaltime RAISES on a non-number, and a raise aborts the WHOLE jq
+    filter — so one unexpected field type emptied all 23 outputs, rendered a bare
+    `🧠 0%` and sank NOTHING to the DB. The `date -d` forks this replaced lost only
+    their own segment; moving the formatting into jq must not couple one optional
+    nested field to every other field."""
+    pay = json.loads(
+        '{"session_id":"s1","model":{"id":"claude-opus-4-8"},"session_name":"n",'
+        '"cwd":"/code/herd","context_window":{"used_percentage":42},'
+        '"cost":{"total_cost_usd":1.5},'
+        '"rate_limits":{"five_hour":{"used_percentage":50,"resets_at":' + resets + '},'
+        '"seven_day":{"used_percentage":10}}}')
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/code/herd")
+    out = _statusline(hook_env, pay).stdout
+    # everything that does not depend on resets_at still renders...
+    assert "⬢ n" in out and "🧠 42%" in out and "$1.50" in out and "5h 50%" in out
+    assert "resets" not in out                      # ...and only that segment is gone
+    # ...and the DB sink still ran, which is the half no one would notice was missing
+    row = c.execute("SELECT context_percent,total_cost_usd FROM sessions "
+                    "WHERE session_id='s1'").fetchone()
+    assert row["context_percent"] == 42 and row["total_cost_usd"] == 1.5

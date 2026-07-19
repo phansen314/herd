@@ -197,14 +197,122 @@ def test_the_original_backup_is_never_overwritten(home):
 
 def test_uninstall_migrates_a_legacy_double_install(home):
     """An install predating ORIGINAL_SUFFIX has no pristine snapshot — only
-    timestamped backups. The OLDEST is the one install #1 took, i.e. pre-herd."""
+    timestamped backups. The OLDEST is the one install #1 took, i.e. pre-herd.
+
+    That backup-selection rule is now reached via --restore-original: the default
+    uninstall reverses the edits on the live file and never reads a snapshot to
+    write. This is the escape hatch, so it is where the rule has to keep working."""
     wired = {"hooks": {"Stop": [{"hooks": [
         {"type": "command", "command": str(inst.HOOKS_DIR / "stop.sh")}]}]}}
     (home / "settings.json.herd-bak.20250101-000000").write_text(json.dumps(PRISTINE))
     (home / "settings.json.herd-bak.20250202-000000").write_text(json.dumps(wired))
     inst.SETTINGS.write_text(json.dumps(wired))
-    inst.uninstall()
+    inst.uninstall(restore_original=True)
     assert json.loads(inst.SETTINGS.read_text()) == PRISTINE
+
+
+# ── uninstall reverses the edits; it does not revert the file ────────────────
+# The bug: uninstall wrote the pre-herd snapshot over the live settings.json with
+# no backup, so a month of accumulated config was reverted AND unrecoverable.
+
+def _month_of_use(path):
+    """Everything a user accumulates between install and uninstall."""
+    d = json.loads(path.read_text())
+    d["permissions"] = {"allow": ["Bash(rg)", "Bash(pytest)"]}
+    d["mcpServers"] = {"jetbrains": {"command": "jb-mcp"}}
+    d["hooks"].setdefault("SessionStart", []).append(
+        {"hooks": [{"type": "command", "command": "/opt/other-tool.sh"}]})
+    path.write_text(json.dumps(d, indent=2))
+
+
+def test_uninstall_keeps_what_was_added_after_the_install(home):
+    """The whole point. Herd's five hook entries come out; permission grants, MCP
+    servers and another tool's SessionStart hook stay. Restoring the pre-herd
+    snapshot wholesale destroyed all three to undo the five."""
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+    inst.install()
+    _month_of_use(inst.SETTINGS)
+    inst.uninstall()
+
+    d = json.loads(inst.SETTINGS.read_text())
+    assert d["permissions"] == {"allow": ["Bash(rg)", "Bash(pytest)"]}
+    assert d["mcpServers"] == {"jetbrains": {"command": "jb-mcp"}}
+    assert d["model"] == "opus"                                   # from PRISTINE
+    assert not _wired(d)                                          # herd is gone
+    cmds = [h.get("command") for bs in d["hooks"].values() for b in bs for h in b["hooks"]]
+    assert "/opt/other-tool.sh" in cmds and "/opt/audit.sh" in cmds
+    assert d != PRISTINE, "a surgical unwire must not reproduce the pre-herd file"
+
+
+def test_uninstall_backs_up_before_writing(home):
+    """Recoverability, independent of which path ran. The old code took no backup at
+    all on the one write that could destroy a month of config."""
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+    inst.install()
+    _month_of_use(inst.SETTINGS)
+    before = inst.SETTINGS.read_text()
+    inst.uninstall()
+
+    baks = [p for p in home.glob("settings.json.herd-bak.*")
+            if not p.name.endswith(inst.ORIGINAL_SUFFIX)]
+    assert any(p.read_text() == before for p in baks), \
+        "no backup holds the file as it was immediately before uninstall"
+
+
+def test_restore_original_still_reverts_wholesale_but_backs_up(home):
+    """The escape hatch keeps its old semantics — and gains the backup, so the
+    discarded month is recoverable instead of gone."""
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+    inst.install()
+    _month_of_use(inst.SETTINGS)
+    before = inst.SETTINGS.read_text()
+    inst.uninstall(restore_original=True)
+
+    assert json.loads(inst.SETTINGS.read_text()) == PRISTINE      # wholesale revert
+    baks = [p for p in home.glob("settings.json.herd-bak.*")
+            if not p.name.endswith(inst.ORIGINAL_SUFFIX)]
+    assert any(p.read_text() == before for p in baks)
+
+
+def test_unwire_restores_the_statusline_it_replaced(home):
+    """install's 'set' plan claims klawde's statusLine. Uninstall must hand it back,
+    not delete the key — and must keep any sibling keys it never owned."""
+    start = dict(PRISTINE, statusLine={"type": "command",
+                                       "command": "/home/u/.klawde/statusline.sh",
+                                       "padding": 1})
+    inst.SETTINGS.write_text(json.dumps(start) + "\n")
+    inst.install()
+    assert inst.statusline_cmd() in inst.SETTINGS.read_text()      # precondition
+    inst.uninstall()
+    assert json.loads(inst.SETTINGS.read_text())["statusLine"] == start["statusLine"]
+
+
+def test_unwire_drops_a_statusline_key_herd_added(home):
+    """No statusLine before the install -> the key is ours, so it goes."""
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+    inst.install()
+    inst.uninstall()
+    assert "statusLine" not in json.loads(inst.SETTINGS.read_text())
+
+
+def test_unwire_leaves_a_foreign_statusline_alone(home):
+    """install refuses to claim a statusline it does not own ('foreign'), so
+    uninstall must not touch it either."""
+    foreign = {"type": "command", "command": "/usr/bin/starship"}
+    inst.SETTINGS.write_text(json.dumps(dict(PRISTINE, statusLine=foreign)) + "\n")
+    inst.install()
+    inst.uninstall()
+    assert json.loads(inst.SETTINGS.read_text())["statusLine"] == foreign
+
+
+def test_uninstall_refuses_an_unparseable_settings_file(home, capsys):
+    """settings.json is the file whose truncation stops Claude Code from starting.
+    A broken one must produce an instruction, not a traceback, and no write."""
+    inst.SETTINGS.write_text("{not json at all")
+    rc = inst.uninstall()
+    assert rc == 1
+    assert inst.SETTINGS.read_text() == "{not json at all"        # untouched
+    assert "--restore-original" in capsys.readouterr().out
 
 
 def test_a_failed_selftest_aborts_before_touching_settings(home, monkeypatch):
@@ -551,6 +659,23 @@ def test_known_flags_still_route(monkeypatch, argv, expect):
     assert called == [expect]
 
 
+def test_restore_original_routes_to_the_wholesale_path(monkeypatch):
+    called = []
+    monkeypatch.setattr(inst, "install", lambda **k: called.append(("install", k)))
+    monkeypatch.setattr(inst, "uninstall",
+                        lambda **k: called.append(("uninstall", k)))
+    inst.main(["--uninstall", "--restore-original"])
+    assert called == [("uninstall", {"restore_original": True})]
+
+
+def test_restore_original_alone_does_nothing(monkeypatch, capsys):
+    """It modifies --uninstall; on its own it is closer to a typo than a request,
+    and this command does not act on argv it cannot read."""
+    rc, called = _main_never_installs(monkeypatch, ["--restore-original"])
+    assert rc == 2 and called == []
+    assert "without --uninstall" in capsys.readouterr().out
+
+
 # ── the wrapper rewrite must not claim OTHER tools' statuslines ───────────────
 # The real composed wrapper, verbatim from a machine where this broke.
 _CAVEMAN_WRAPPER = '''#!/usr/bin/env bash
@@ -607,3 +732,128 @@ def test_wrapper_rewrite_does_not_swallow_an_assignment_of_the_real_statusline()
 def test_wrapper_rewrite_is_idempotent_on_the_composed_wrapper():
     once, _ = inst.rewire_wrapper(_CAVEMAN_WRAPPER)
     assert inst.rewire_wrapper(once)[0] == once
+
+
+# ── unwire_wrapper: the mirror ───────────────────────────────────────────────
+
+def test_unwire_wrapper_round_trips_the_composed_wrapper():
+    """rewire then unwire must land back on the original text — the composed
+    wrapper is the case where a line-level rewrite already destroyed `exec`/`"$@"`
+    once, so the reverse has to be equally surgical."""
+    wired, _ = inst.rewire_wrapper(_CAVEMAN_WRAPPER)
+    back, changed = inst.unwire_wrapper(wired, _CAVEMAN_WRAPPER)
+    assert changed
+    assert back == _CAVEMAN_WRAPPER.rstrip("\n") + "\n"
+    assert inst.statusline_cmd() not in back
+
+
+def test_unwire_wrapper_without_an_original_changes_nothing():
+    """The pre-herd token is the one thing the rewired file no longer records.
+    Guessing a path would leave the wrapper calling something that never existed;
+    left alone it still calls herd's, which the user can see and edit."""
+    wired, _ = inst.rewire_wrapper(_CAVEMAN_WRAPPER)
+    assert inst.unwire_wrapper(wired, None) == (wired, False)
+    assert inst.unwire_wrapper(wired, "#!/bin/sh\necho hi\n") == (wired, False)
+
+
+def test_unwired_wrapper_is_valid_bash(tmp_path):
+    """Same reasoning as the rewrite: the failure mode is a syntax error."""
+    wired, _ = inst.rewire_wrapper(_CAVEMAN_WRAPPER)
+    back, _ = inst.unwire_wrapper(wired, _CAVEMAN_WRAPPER)
+    p = tmp_path / "w.sh"
+    p.write_text(back)
+    r = subprocess.run(["bash", "-n", str(p)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_uninstall_unwires_the_wrapper_and_backs_it_up(home):
+    """End to end on the second file uninstall touches — it had the identical
+    no-backup problem."""
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+    inst.WRAPPER.write_text(_CAVEMAN_WRAPPER)
+    inst.install()
+    wired = inst.WRAPPER.read_text()
+    assert inst.statusline_cmd() in wired                          # precondition
+    inst.uninstall()
+
+    back = inst.WRAPPER.read_text()
+    assert inst.statusline_cmd() not in back
+    assert ".klawde/statusline.sh" in back                         # the original token
+    assert any(p.read_text() == wired
+               for p in home.glob("custom-status-line.sh.herd-bak.*")
+               if not p.name.endswith(inst.ORIGINAL_SUFFIX))
+
+
+def test_uninstall_leaves_a_wrapper_it_cannot_unwire(home, capsys):
+    """No pre-herd snapshot -> no original token -> refuse and say so, nonzero."""
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+    inst.WRAPPER.write_text(f'exec "{inst.statusline_cmd()}" "$@"\n')
+    wired = inst.WRAPPER.read_text()
+    assert inst.uninstall() == 1
+    assert inst.WRAPPER.read_text() == wired
+    assert "LEFT AS-IS" in capsys.readouterr().out
+
+
+# ── the wrapper rewrite must never produce unparseable bash ───────────────────
+_WRAPPER_IDIOMS = [
+    ('exec "$(dirname "$0")/statusline.sh" "$@"\n', True),
+    ("exec $(dirname $0)/statusline.sh \"$@\"\n", True),
+    ('exec "$HOME/.klawde/statusline.sh" "$@" 2>/dev/null\n', True),
+    ('echo "hi" ; exec "$SL/statusline.sh"\n', True),
+    ("SL=$HOME/.klawde/statusline.sh\n", True),
+    ('exec statusline.sh "$@"\n', True),          # cwd-relative: must still rewire
+    ('# exec "/old/statusline.sh"\n', False),     # a comment is not an invocation
+    ('echo hello\n', False),                      # nothing to do
+]
+
+
+@pytest.mark.parametrize("src,expect_replaced", _WRAPPER_IDIOMS,
+                         ids=[s.strip()[:28] for s, _ in _WRAPPER_IDIOMS])
+def test_wrapper_rewrite_never_emits_broken_bash(src, expect_replaced, tmp_path):
+    """Two separate regexes have now turned a working wrapper into a SYNTAX ERROR,
+    and the blast radius is identical each time: bash prints nothing, so the
+    statusline silently disappears from every running session with nothing logged.
+
+    The nested-quote case is the one that survived the first fix:
+        exec "$(dirname "$0")/statusline.sh" "$@"
+    the quoted alternative anchored on the INNER quotes, matched `")/statusline.sh"`
+    and ate the `)` closing the substitution."""
+    out, replaced = inst.rewire_wrapper(src)
+    assert replaced is expect_replaced
+    p = tmp_path / "w.sh"
+    p.write_text(out)
+    r = subprocess.run(["bash", "-n", str(p)], capture_output=True, text=True)
+    assert r.returncode == 0, f"{src!r} -> {out!r}\n{r.stderr}"
+    if expect_replaced:
+        assert inst.statusline_cmd() in out
+    else:
+        assert out == src
+
+
+def test_wrapper_rewrite_refuses_rather_than_break_a_working_wrapper(monkeypatch):
+    """The backstop, independent of any regex: if substitution would produce
+    something that does not parse and the input did, change nothing and report it."""
+    monkeypatch.setattr(inst, "_SL_TOKEN", __import__("re").compile(r'statusline\.sh"'))
+    src = 'exec "/x/statusline.sh"\n'             # this token eats the closing quote
+    out, replaced = inst.rewire_wrapper(src)
+    assert out == src and replaced is False
+
+
+def test_wrapper_rewrite_leaves_a_comment_unwired():
+    """Rewriting inside `#` changes nothing executable, but it used to return
+    replaced=True, so install() reported a wrapper it had not wired."""
+    out, replaced = inst.rewire_wrapper('# "/old/statusline.sh"\nexec "/old/statusline.sh"\n')
+    assert replaced
+    assert out.splitlines()[0] == '# "/old/statusline.sh"'
+    assert inst.statusline_cmd() in out.splitlines()[1]
+
+
+@pytest.mark.parametrize("argv", [["--dry-run", "--uninstall"],
+                                  ["--uninstall", "--dry-run"],
+                                  ["--dev", "--uninstall"]])
+def test_uninstall_refuses_conflicting_flags(monkeypatch, argv):
+    """Per-token validation passed both, then --uninstall won the dispatch — so
+    `--dry-run --uninstall` deleted the service and unwired settings.json having
+    been told to touch nothing. uninstall() has no dry mode to honour."""
+    rc, called = _main_never_installs(monkeypatch, argv)
+    assert rc == 2 and called == []

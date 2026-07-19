@@ -397,14 +397,14 @@ def statusline_plan(data, wrapper_exists, hooks_dir=None):
     return "foreign"
 
 
-def rewire_settings(data, wrapper_exists=False, hooks_dir=None):
-    """Return a NEW settings dict with herd wired and klawde unwired. Pure —
-    caller decides whether to write it."""
-    data = json.loads(json.dumps(data))          # deep copy
-    hooks = data.setdefault("hooks", {})
+def _strip_managed(hooks):
+    """Remove every herd-managed command in place, dropping blocks and then events
+    that become empty. cdh / PreToolUse-HTTP / others are untouched.
 
-    # 1. strip every herd-managed command (klawde + any prior herd), drop the
-    #    blocks that become empty. cdh / PreToolUse-HTTP / others are untouched.
+    Shared by rewire_settings (which re-adds herd afterwards) and unwire_settings
+    (which does not). It lives in one place because the two must agree on what herd
+    owns — a strip that drifts from the re-add either doubles every hook or strands
+    one behind."""
     for event in list(hooks):
         blocks = hooks[event]
         for block in blocks:
@@ -415,6 +415,16 @@ def rewire_settings(data, wrapper_exists=False, hooks_dir=None):
             hooks[event] = kept
         else:
             del hooks[event]
+
+
+def rewire_settings(data, wrapper_exists=False, hooks_dir=None):
+    """Return a NEW settings dict with herd wired and klawde unwired. Pure —
+    caller decides whether to write it."""
+    data = json.loads(json.dumps(data))          # deep copy
+    hooks = data.setdefault("hooks", {})
+
+    # 1. strip every herd-managed command (klawde + any prior herd).
+    _strip_managed(hooks)
 
     # 2. add herd's authoritative entry for each event, in its OWN block at the
     #    front (so herd runs first; cdh keeps its block).
@@ -431,6 +441,43 @@ def rewire_settings(data, wrapper_exists=False, hooks_dir=None):
         sl.update({"type": "command", "command": statusline_cmd(hooks_dir)})
         data["statusLine"] = sl
 
+    return data
+
+
+def unwire_settings(data, original=None):
+    """Return a NEW settings dict with herd's edits REVERSED. Pure — the mirror of
+    rewire_settings: same strip, no re-add.
+
+    Reversing the edits, rather than restoring the pre-herd snapshot wholesale, is
+    the point. Uninstall used to write a months-old copy over the live file, so
+    every permission grant, MCP server and foreign hook added since the install was
+    reverted with it — and no backup was taken, so it was gone. Anything herd does
+    not own is carried through here untouched.
+
+    `original` is the pre-herd settings dict when one survives. It is consulted for
+    exactly ONE thing: what statusLine said before we set it. Nothing else is taken
+    from it, because nothing else in it is more current than what is on disk now."""
+    data = json.loads(json.dumps(data))          # deep copy
+    hooks = data.setdefault("hooks", {})
+    _strip_managed(hooks)
+    if not hooks:
+        del data["hooks"]            # we may have just created it; leave no residue
+
+    # statusLine: only ours to touch. _is_managed is the same ownership test
+    # install used to decide it could claim the key (klawde's counted as ours),
+    # so the two stay symmetric. 'foreign' and wrapper-pointing values fail it and
+    # are left exactly as found — install did not write them either.
+    if _is_managed(_statusline_cmd(data)):
+        prev = (original or {}).get("statusLine")
+        if prev is not None:
+            data["statusLine"] = prev            # verbatim, siblings and all
+        else:
+            data.pop("statusLine", None)         # the key was ours to add
+
+    # preferredNotifChannel is deliberately LEFT. _offer_bell never overwrites an
+    # existing value, so herd's opt-in and the user's own choice are the same two
+    # bytes on disk — indistinguishable here. Deleting a real preference is the
+    # worse error, so uninstall names the key instead and lets the user decide.
     return data
 
 
@@ -453,26 +500,100 @@ def rewire_settings(data, wrapper_exists=False, hooks_dir=None):
 # one unbroken run of non-space — and replaced the lot with a quoted herd path,
 # leaving a stray `"` behind. That is a bash SYNTAX ERROR, so the wrapper emitted
 # nothing at all and the statusline silently vanished from every session.
+#
+# `$( … )` MUST be part of the token, in both the quoted and bare forms. The
+# first fix for the above still broke the commonest wrapper idiom there is:
+#     exec "$(dirname "$0")/statusline.sh" "$@"
+# The quoted alternative anchored on the INNER quotes — it matched `")/statusline.sh"`,
+# the run from the closing quote of `"$0"` — and ate the `)` that closed the
+# substitution. Same syntax error, same silent disappearance, different idiom.
+# So a command substitution is matched as a unit (and may contain quotes), which
+# also stops the quoted alternative from starting mid-string on a line like
+#     echo "hi" ; exec "$SL/statusline.sh"
+# where a naive non-greedy `"..."` would swallow `hi" ; exec "`.
+_SUBST = r'\$\((?:[^()"\n]|"[^"\n]*")*\)'          # $( … ), quotes allowed inside
 _SL_TOKEN = re.compile(
-    r'"[^"\n]*/statusline\.sh"'
-    r"|'[^'\n]*/statusline\.sh'"
-    r'|[^\s"\'=]*/statusline\.sh'
+    rf'"(?:{_SUBST}|[^"\n])*/statusline\.sh"'      # "…/statusline.sh"
+    rf"|'(?:{_SUBST}|[^'\n])*/statusline\.sh'"     # '…/statusline.sh'
+    rf'|(?:{_SUBST}|[^\s"\'=])*/statusline\.sh'    # bare …/statusline.sh
+    r'|(?<![\w./-])statusline\.sh'                 # bare, cwd-relative, no path
 )
+
+
+def wrapper_parses(text):
+    """Does this wrapper parse as bash? Returns True when bash is unavailable —
+    this is a safety net, not a gate we can afford to fail closed on."""
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
+            fh.write(text)
+            path = fh.name
+    except OSError:
+        return True
+    try:
+        return subprocess.run(["bash", "-n", path], capture_output=True,
+                              timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def rewire_wrapper(text, hooks_dir=None):
     """Point the wrapper's statusline invocation at herd's, leaving the rest of
-    each line intact. Idempotent."""
+    each line intact. Idempotent.
+
+    Comment lines are skipped: rewriting inside `#` changes nothing executable, but
+    it still reported replaced=True, so the installer claimed to have wired a
+    wrapper it had not.
+
+    THE PARSE CHECK IS THE POINT. Twice now a regex that looked right has turned a
+    working wrapper into a bash syntax error, and the blast radius is the same both
+    times: a syntax error prints NOTHING, so the statusline silently disappears from
+    every running session with nothing in any log to explain it. Rather than trust
+    the third regex, refuse to hand back a wrapper that does not parse when the one
+    we were given did. The caller then leaves the file alone and says so.
+    """
     sl = statusline_cmd(hooks_dir)
     out = []
     replaced = False
     for line in text.splitlines():
+        if line.lstrip().startswith("#") or not _SL_TOKEN.search(line):
+            out.append(line)
+            continue
+        out.append(_SL_TOKEN.sub(lambda _: f'"{sl}"', line))
+        replaced = True
+    new = "\n".join(out) + "\n"
+    if replaced and not wrapper_parses(new) and wrapper_parses(text):
+        return text, False           # we would have broken it — change nothing
+    return new, replaced
+
+
+def unwire_wrapper(text, original_text):
+    """Point the wrapper's statusline invocation back at whatever it named before
+    herd. Returns (text, changed). Pure — the mirror of rewire_wrapper.
+
+    It needs the pre-herd text because the original token is the one thing the
+    rewired file no longer records. Without a usable original we change NOTHING and
+    say so: a wrapper pointed at a path we invented is worse than one still pointed
+    at herd, which the user can see and edit."""
+    if not original_text:
+        return text, False
+    m = _SL_TOKEN.search(original_text)
+    if not m:
+        return text, False
+    token = m.group(0)                  # lambda, not a replacement string: the
+    out = []                            # token is a path and may contain backslashes
+    changed = False
+    for line in text.splitlines():
         if _SL_TOKEN.search(line):
-            out.append(_SL_TOKEN.sub(lambda _: f'"{sl}"', line))
-            replaced = True
+            out.append(_SL_TOKEN.sub(lambda _: token, line))
+            changed = True
         else:
             out.append(line)
-    return "\n".join(out) + "\n", replaced
+    return "\n".join(out) + "\n", changed
 
 
 # ── self-test: run the WIRED hook against a temp DB ────────────────────────
@@ -612,34 +733,108 @@ def install(dry=False, dev=False):
     return 0
 
 
-def uninstall():
-    """Restore each edited file to its PRE-HERD state + remove service & CLI."""
+def _revert_to_original(path, ts):
+    """--restore-original: put the pre-herd snapshot back, wholesale. Backs up the
+    live file first — that omission is what made this path destructive."""
+    ref = _restore_source(path)
+    if not ref:
+        print(f"  NO PRE-HERD BACKUP for {path} — left as-is, edit it by hand")
+        return 1
+    backup(path, ts)
+    _atomic_write(path, ref.read_text())
+    print(f"  restored {path} from {ref.name}  (backup: *.herd-bak.{ts})")
+    return 0
+
+
+def _reference_settings(path):
+    """The pre-herd settings dict, or None. Only statusLine is read from it."""
+    ref = _restore_source(path)
+    if not ref:
+        return None
+    try:
+        return json.loads(ref.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None            # unusable reference -> statusLine key is dropped
+
+
+def _uninstall_settings(ts, restore_original):
+    if not SETTINGS.exists():
+        print(f"  no {SETTINGS} — nothing to unwire")
+        return 0
+    if restore_original:
+        return _revert_to_original(SETTINGS, ts)
+    try:
+        data = json.loads(SETTINGS.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        # Never traceback on the file whose truncation stops Claude from starting.
+        print(f"  CANNOT READ {SETTINGS} ({e}) — left as-is.")
+        print("    Remove herd's hook entries by hand, or re-run with --restore-original.")
+        return 1
+    new = unwire_settings(data, _reference_settings(SETTINGS))
+    backup(SETTINGS, ts)
+    _atomic_write(SETTINGS, json.dumps(new, indent=2) + "\n")
+    print(f"  unwired {SETTINGS}  (backup: *.herd-bak.{ts})")
+    if new.get("preferredNotifChannel"):
+        print(f"    left preferredNotifChannel={new['preferredNotifChannel']!r} — herd cannot")
+        print("    tell its own opt-in from your setting. Remove it by hand if unwanted.")
+    return 0
+
+
+def _uninstall_wrapper(ts, restore_original):
+    if not WRAPPER.exists():
+        print(f"  no {WRAPPER} — nothing to unwire")
+        return 0
+    if restore_original:
+        return _revert_to_original(WRAPPER, ts)
+    text = WRAPPER.read_text()
+    if not _SL_TOKEN.search(text):
+        print(f"  {WRAPPER} has no statusline invocation — nothing to unwire")
+        return 0
+    ref = _restore_source(WRAPPER)
+    new_text, changed = unwire_wrapper(text, ref.read_text() if ref else None)
+    if not changed:
+        print(f"  {WRAPPER} LEFT AS-IS — no pre-herd statusline invocation to restore.")
+        print("    It still calls herd's statusline; edit it by hand, or re-run with")
+        print("    --restore-original.")
+        return 1
+    backup(WRAPPER, ts)
+    _atomic_write(WRAPPER, new_text)
+    print(f"  unwired {WRAPPER} statusline  (backup: *.herd-bak.{ts})")
+    return 0
+
+
+def uninstall(restore_original=False):
+    """Reverse herd's edits to each file it wired, + remove service & CLI.
+
+    Default is SURGICAL: strip what herd owns from the live file and leave the rest.
+    --restore-original is the old wholesale revert to the pre-herd snapshot, kept as
+    an escape hatch for a settings.json this cannot parse.
+
+    Both paths back the file up before writing. Neither used to, and that was the
+    bug: the wholesale revert wrote a months-old snapshot over the live file with no
+    copy kept, so a month of permission grants, MCP servers and foreign hooks was
+    unrecoverable."""
     print("  " + uninstall_service())
     print("  " + uninstall_cli())
-    rc = 0
-    for path in (SETTINGS, WRAPPER):
-        src = _restore_source(path)
-        if src:
-            _atomic_write(path, src.read_text())
-            print(f"  restored {path} from {src.name}")
-        elif path.exists():
-            rc = 1
-            print(f"  NO PRE-HERD BACKUP for {path} — left as-is, edit it by hand")
-        else:
-            print(f"  no backup found for {path}")
-    return rc
+    ts = _ts()
+    rc = _uninstall_settings(ts, restore_original)
+    return rc | _uninstall_wrapper(ts, restore_original)
 
 
 # Every flag main() understands. An argv token outside this set is a TYPO, and the
 # only safe reading of a typo on this command is "do nothing" — see main().
-_FLAGS = {"--uninstall", "--dry-run", "--dev", "--help", "-h"}
+_FLAGS = {"--uninstall", "--restore-original", "--dry-run", "--dev", "--help", "-h"}
 
-USAGE = """usage: python3 -m herd.install [--dev] [--dry-run] [--uninstall]
+USAGE = """usage: python3 -m herd.install [--dev] [--dry-run]
+       python3 -m herd.install --uninstall [--restore-original]
 
   (no flags)    wire herd from the installed copy in ~/.herd/hooks
   --dev         wire the CHECKOUT directly, for hook development
   --dry-run     show what would change, touch nothing
-  --uninstall   restore the pre-herd state
+  --uninstall   reverse herd's edits, keeping everything else in settings.json
+  --restore-original
+                with --uninstall: revert wholesale to the pre-herd snapshot
+                instead. Discards anything added since the install.
   --help, -h    this message"""
 
 
@@ -664,11 +859,34 @@ def main(argv=None):
         print()
         print(USAGE)
         return 2
+    # Validating tokens INDIVIDUALLY was not enough. `--dry-run --uninstall` passed
+    # — both are real flags — and then `--uninstall` won the dispatch below, so it
+    # unwired settings.json, deleted the service and removed the symlinks, having
+    # been explicitly told to touch nothing. uninstall() takes no `dry`, so there is
+    # nothing to honour; the only safe answer is to refuse the combination.
+    if "--uninstall" in argv:
+        conflicts = [a for a in ("--dry-run", "--dev") if a in argv]
+        if conflicts:
+            print(f"herd install: --uninstall cannot be combined with "
+                  f"{', '.join(conflicts)}")
+            print("  Nothing was changed. --uninstall has no dry-run and ignores")
+            print("  --dev, so accepting these would have done something other than")
+            print("  what you asked for.")
+            return 2
     if "--help" in argv or "-h" in argv:
         print(USAGE)
         return 0
     if "--uninstall" in argv:
-        return uninstall()
+        # zero-arg on the common path: --restore-original only ever ADDS a keyword,
+        # so the plain call stays the plain call.
+        return uninstall(restore_original=True) if "--restore-original" in argv \
+            else uninstall()
+    if "--restore-original" in argv:
+        print("herd install: --restore-original means nothing without --uninstall.")
+        print("  Nothing was changed.")
+        print()
+        print(USAGE)
+        return 2
     return install(dry="--dry-run" in argv, dev="--dev" in argv)
 
 

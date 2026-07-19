@@ -332,3 +332,33 @@ def test_db_leaves_no_errfile_behind(hook_env):
     assert r.returncode == 0
     debris = list(pathlib.Path(hook_env.runtime).glob("herd-db-err.*"))
     assert debris == [], f"errfile debris: {debris}"
+
+
+@pytest.mark.parametrize("sig", ["TERM", "INT", "HUP"])
+def test_db_errfile_is_reaped_on_signal_death(hook_env, sig):
+    """`trap ... EXIT` does not run for SIGTERM, and the statusline is killed on
+    timeout as a matter of course. The per-call `rm` this replaced left nothing
+    behind; an EXIT-only trap leaked one file per killed hook with no sweeper."""
+    import pathlib, signal, time
+    # Signal the whole PROCESS GROUP, which is what killing a hook actually does.
+    # Bash defers a trap until the running foreground command returns, so signalling
+    # only bash while it waits on a child proves nothing about the trap.
+    script = (f'. "{HOOKS}/common.sh"; '
+              'printf "%s" "$__HERD_ERRFILE" > "$HERD_RUNTIME/marker"; '
+              ': > "$__HERD_ERRFILE"; sleep 30')
+    p = subprocess.Popen(["bash", "-c", script], start_new_session=True,
+                         env=dict(os.environ, HERD_DB=hook_env.path,
+                                  HERD_RUNTIME=hook_env.runtime,
+                                  HERD_ERRLOG=f"{hook_env.runtime}/err.log"))
+    marker = pathlib.Path(hook_env.runtime) / "marker"
+    errfile = None
+    for _ in range(500):                      # wait for the errfile to exist
+        if marker.exists():
+            errfile = pathlib.Path(marker.read_text())
+            if errfile.exists():
+                break
+        time.sleep(0.01)
+    assert errfile is not None and errfile.exists(), "test setup: errfile never created"
+    os.killpg(os.getpgid(p.pid), getattr(signal, f"SIG{sig}"))
+    p.wait(timeout=10)
+    assert not errfile.exists(), f"errfile leaked on SIG{sig}"

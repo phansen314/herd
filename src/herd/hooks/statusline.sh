@@ -52,13 +52,21 @@ $(jq_in -rj '[
   # jq calls the system strftime, and BSD has no "-" flag, so asking for it on
   # macOS emits the format literally. sub() belongs to jq and behaves the same on
   # both — which is also why the old BSD "date -r" fallback disappears with it.
-  (if .rate_limits.five_hour.resets_at
-   then (.rate_limits.five_hour.resets_at | strflocaltime("%I:%M%p") | sub("^0"; ""))
-   else "" end),
-  (if .rate_limits.seven_day.resets_at
-   then (.rate_limits.seven_day.resets_at | strflocaltime("%m/%d %I:%M%p")
-         | sub("^0"; "") | sub("/0"; "/") | sub(" 0"; " "))
-   else "" end)
+  #
+  # GUARD ON TYPE, AND STILL WRAP IN try. strflocaltime raises on a non-number,
+  # and a raise ABORTS THE WHOLE FILTER — so one unexpected field type emptied
+  # all 23 outputs, rendered a bare context percentage and sank NOTHING to the
+  # DB. The `date -d` forks this replaced degraded far better: they lost only
+  # their own segment. Moving the formatting into jq coupled one optional nested
+  # field to every other field, so it has to fail like the forks did, per-field.
+  (try (if (.rate_limits.five_hour.resets_at | type) == "number"
+        then (.rate_limits.five_hour.resets_at | strflocaltime("%I:%M%p")
+              | sub("^0"; ""))
+        else "" end) catch ""),
+  (try (if (.rate_limits.seven_day.resets_at | type) == "number"
+        then (.rate_limits.seven_day.resets_at | strflocaltime("%m/%d %I:%M%p")
+              | sub("^0"; "") | sub("/0"; "/") | sub(" 0"; " "))
+        else "" end) catch "")
 ] | map(. // "" | tostring) | join("\u001f")')
 JQ
 

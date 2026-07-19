@@ -140,9 +140,17 @@ claude_pid() { ps -eo pid=,ppid=,comm= 2>/dev/null | _walk_claude "$$"; }
 # `rm` was ~1.8ms/tick spent deleting a file we immediately recreate. `>` is a
 # builtin truncate, so reuse costs nothing. No hook sets its own EXIT trap
 # (checked); if one ever does, it must call herd_db_cleanup itself.
+# Trapped on the SIGNALS too, not just EXIT: the statusline is killed on timeout
+# as a matter of course, and an EXIT-only trap does not run for SIGTERM — so the
+# old per-call `rm` left nothing behind while this leaked one file per killed
+# hook, forever, with no sweeper anywhere. SIGKILL still leaks (nothing can trap
+# it); those are zero-byte and rare enough to live with.
 __HERD_ERRFILE="$HERD_RUNTIME/herd-db-err.$$"
 herd_db_cleanup() { rm -f "$__HERD_ERRFILE" 2>/dev/null; }
 trap herd_db_cleanup EXIT
+trap 'herd_db_cleanup; exit 143' TERM
+trap 'herd_db_cleanup; exit 130' INT
+trap 'herd_db_cleanup; exit 129' HUP
 
 db() {
     local err="$__HERD_ERRFILE" rc
