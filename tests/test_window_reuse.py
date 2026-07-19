@@ -73,7 +73,7 @@ def _clear_to(c, session_id, pid, now, win=5):
     a NEW session_id starts in the same window, on the SAME process."""
     c.execute(W["W2b_insert"], {"session_id": session_id, "cwd": "/code/herd",
                                 "model": "opus", "transcript": "/t", "pid": pid, "now": now})
-    c.execute(W["W2b_placement"], {"session_id": session_id, "socket": SOCK,
+    c.execute(W["W2b_placement"], {"session_id": session_id, "job": None, "socket": SOCK,
                                    "win": win, "now": now})
 
 
@@ -141,6 +141,6 @@ def test_inheritance_does_not_mutate_an_existing_job_name(fresh):
     mk_herd(c, pk, job_name="mine", created_at=T0, kitty_socket=SOCK, window_id=5)
     dead = mk_session(c, session_id="u0", pid=555, cwd="/code/herd", stopped_at=T0)
     mk_herd(c, dead, job_name="theirs", created_at=T0, kitty_socket=SOCK, window_id=5)
-    c.execute(W["W2b_placement"], {"session_id": "u1", "socket": SOCK, "win": 5, "now": T2})
+    c.execute(W["W2b_placement"], {"session_id": "u1", "job": None, "socket": SOCK, "win": 5, "now": T2})
     assert c.execute("SELECT job_name FROM herd_sessions WHERE session_pk=?",
                      (pk,)).fetchone()[0] == "mine"

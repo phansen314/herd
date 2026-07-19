@@ -252,6 +252,47 @@ could not read, states that nothing changed, prints usage, and exits 2. `--help`
 **Protects:** `test_installer.py::test_unreadable_argv_installs_nothing` and
 `test_known_flags_still_route`.
 
+## 2026-07-18 — A spawned session carries its own identity {#spawn-identity}
+
+`herd spawn` reserves the job name, launches kitty, then stamps the window id onto
+the reservation (`W1_spawn_window`). Adoption at SessionStart joined on that stamp
+— so it depended on a write landing before the launched claude reached its first
+hook. Two ways that fails, both reachable:
+
+**The stamp is still in flight.** `kitten @ launch` returns the window id and
+`spawn.py` writes it immediately, but that write takes the WAL write lock, which
+under contention means up to the 3s `busy_timeout` — while claude is already
+starting. If SessionStart wins, `W2_adopt` matches nothing (`window_id` NULL),
+`W2b_insert` creates a SECOND row for the window, and 120s later `W3f` sweeps the
+reservation, taking the job name with it.
+
+**The reservation is already gone.** A claude held at the "do you trust the files
+in this folder?" prompt for longer than `HERD_STRANDED_SECS` (120s) has its
+reservation swept before SessionStart ever fires. There is then nothing to adopt
+and no predecessor to inherit from.
+
+**Decided:** the spawned process carries `HERD_JOB` in its **environment**
+(`launch.py --env`), so it can state which job it is instead of having herd infer
+it from placement. `--var` stays — that sets a kitty *window* user-var for window
+matching, which the hook cannot read; the two serve different consumers.
+
+Two consequences follow. `W2_adopt_job` adopts by job name when the window join
+misses, so a stamp still in flight costs nothing. And `W2b_placement` takes
+`COALESCE(:job, <pid-inherited>)`, so even with the reservation deleted outright
+the new row is still named — the env var is the only signal that survives that.
+
+Ordering is deliberate: window first (precise — it identifies one window), job
+second (identity, but `job_name` is not unique across dead rows, hence
+`ORDER BY session_pk DESC LIMIT 1`, newest wins).
+
+A user-started claude has no `HERD_JOB`, which binds to SQL NULL and makes every
+one of these paths a no-op — the behaviour is unchanged for it.
+
+**Protects:** `test_adopts_by_job_when_the_window_stamp_has_not_landed`,
+`test_adopts_by_job_when_the_reservation_was_already_swept`, and
+`test_launch_argv_carries_herd_job_in_the_environment`. Dropping `--env` silently
+reverts both hazards, and nothing else in the suite would notice.
+
 ## 2026-07-18 — The job name follows the pid across `/clear` {#clear-inherits-job}
 
 `/clear` is **Claude's**, not herd's. Claude ends the session and starts a new

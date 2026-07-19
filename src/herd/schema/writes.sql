@@ -63,6 +63,39 @@ WHERE id = (SELECT h.session_pk FROM herd_sessions h
   AND session_id IS NULL
   AND stopped_at IS NULL;
 
+-- W2_adopt_job. SECOND adoption route, by job identity rather than by placement.
+-- The spawned claude carries HERD_JOB in its ENVIRONMENT (launch.py --env), so the
+-- hook knows which reservation is its own without consulting the window stamp.
+--
+-- This exists because the window stamp is not reliably there yet. `kitten @ launch`
+-- returns the window id and W1_spawn_window writes it, but that write takes the WAL
+-- write lock — up to a 3s busy_timeout under contention — while the launched claude
+-- is already starting. If SessionStart wins that race, W2_adopt matches nothing
+-- (window_id still NULL), W2b_insert creates a SECOND row, and 120s later W3f sweeps
+-- the reservation and the job name with it.
+--
+-- ORDER BY ... DESC LIMIT 1 because job_name is not unique across dead rows and a
+-- resume can leave two live claimants (DECISIONS.md#clear-inherits-job) — newest
+-- wins, deterministically, rather than whatever the query plan yields.
+-- :name W2_adopt_job
+UPDATE sessions
+SET session_id      = :session_id,
+    cwd             = :cwd,
+    model           = :model,
+    transcript_path = :transcript,
+    pid             = :pid,
+    status          = 'working',
+    status_source   = 'hook',
+    last_event_at   = :now,
+    last_event_type = 'start',
+    updated_at      = :now
+WHERE id = (SELECT h.session_pk FROM herd_sessions h
+            JOIN sessions s ON s.id = h.session_pk
+            WHERE h.job_name = :job AND s.stopped_at IS NULL AND s.session_id IS NULL
+            ORDER BY h.session_pk DESC LIMIT 1)
+  AND session_id IS NULL
+  AND stopped_at IS NULL;
+
 -- W2b. Fallback when W2 matched nothing: upsert on Claude's own key. Resume
 -- revives a stopped row (stopped_at=NULL, fresh pid); started_at preserved so
 -- duration is total age.
@@ -120,13 +153,20 @@ WHERE pid = :pid AND stopped_at IS NULL
 -- :name W2b_placement
 INSERT INTO herd_sessions(session_pk, job_name, kitty_socket, window_id, source, verified_at)
 SELECT s.id,
+       -- :job is HERD_JOB from the environment, and it WINS. It is the session
+       -- stating its own identity, which beats inference. It is also the only thing
+       -- that survives the reservation being deleted outright: a claude held at the
+       -- "do you trust the files in this folder?" prompt for longer than
+       -- HERD_STRANDED_SECS has its reservation swept by W3f before SessionStart
+       -- ever fires, so there is no predecessor left to inherit from.
+       COALESCE(:job,
        (SELECT h2.job_name FROM herd_sessions h2
           JOIN sessions s2 ON s2.id = h2.session_pk
          WHERE h2.kitty_socket = :socket AND h2.window_id = :win
            AND s2.stopped_at IS NOT NULL
            AND s2.pid IS NOT NULL AND s2.pid = s.pid
            AND h2.job_name IS NOT NULL
-         ORDER BY s2.stopped_at DESC, s2.id DESC LIMIT 1),
+         ORDER BY s2.stopped_at DESC, s2.id DESC LIMIT 1)),
        :socket, :win, 'hook', :now
 FROM sessions s WHERE s.session_id = :session_id
 ON CONFLICT(session_pk) DO UPDATE SET

@@ -248,10 +248,33 @@ if [ "$CH" = "1" ]; then
     RB=$(run R_statusline 2>/dev/null)          # prev_cost|prev_sampled
     IFS='|' read -r PREV_COST PREV_AT <<< "$RB"
     if [ -n "$COST" ] && [ -n "$PREV_COST" ] && [ -n "$PREV_AT" ]; then
-        # mktime() returns -1 on an unparseable stamp; the a<=0/b<=0 guard stops a
+        # epoch() is hand-rolled because mktime() is a GAWK EXTENSION. macOS ships
+        # one-true-awk, which has no time functions and aborts at parse — and with
+        # stderr dropped that surfaced as BURN="" and a 🔥 segment that silently
+        # never rendered on a Mac. Only POSIX awk is used below.
+        #
+        # Both stamps are ISO-8601 UTC, so the days-from-civil arithmetic is exact
+        # (Hinnant's algorithm, era = 400-year cycle of 146097 days; -719468 shifts
+        # the 0000-03-01 epoch to 1970-01-01). Doing it in UTC also drops a bug the
+        # mktime version had: it fed UTC digits to a LOCAL-time parser, and the
+        # offset only cancelled in b-a outside a DST transition.
+        #
+        # epoch() returns -1 on an unparseable stamp; the a<=0/b<=0 guard stops a
         # bogus "$0.00/h". Sub-cent rates are noise, hidden rather than shown as 0.
         BURN=$(awk -v c="$COST" -v p="$PREV_COST" -v t0="$PREV_AT" -v now="$NOW_ISO" '
-            function epoch(s){ gsub(/[-T:Z]/," ",s); return mktime(substr(s,1,19)) }
+            function epoch(s,   y,mo,d,h,mi,se,era,yoe,doy,doe,days) {
+                if (s !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][T ][0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)
+                    return -1
+                y=substr(s,1,4)+0; mo=substr(s,6,2)+0; d=substr(s,9,2)+0
+                h=substr(s,12,2)+0; mi=substr(s,15,2)+0; se=substr(s,18,2)+0
+                if (mo<1 || mo>12 || d<1 || d>31) return -1
+                y -= (mo<=2)                       # March-based year
+                era = int(y/400); yoe = y - era*400
+                doy = int((153*(mo + (mo>2 ? -3 : 9)) + 2)/5) + d-1
+                doe = yoe*365 + int(yoe/4) - int(yoe/100) + doy
+                days = era*146097 + doe - 719468
+                return days*86400 + h*3600 + mi*60 + se
+            }
             BEGIN{
                 a=epoch(t0); b=epoch(now)
                 if (a<=0 || b<=0) exit

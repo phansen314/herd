@@ -224,3 +224,16 @@ def test_launch_times_out_against_a_socket_that_never_answers(tmp_path, monkeypa
         assert L.launch(_spec(), f"unix:{p}") is None
     finally:
         srv.close()
+
+
+# ── spawned sessions carry their own identity (DECISIONS.md#spawn-identity) ───
+def test_launch_argv_carries_herd_job_in_the_environment():
+    """--var sets a kitty WINDOW user-var, which the SessionStart hook cannot read.
+    --env puts it in the launched PROCESS, which is what makes adoption independent
+    of whether W1_spawn_window has committed. Both, for different consumers."""
+    argv = build_launch_argv(SpawnSpec(job="api", cwd="/x", launch_type="tab",
+                                       title="api", prompt=None, claude_args=[]),
+                             "unix:/tmp/kitty-1")
+    assert "--env" in argv and "HERD_JOB=api" in argv
+    assert argv[argv.index("--env") + 1] == "HERD_JOB=api"
+    assert argv[argv.index("--var") + 1] == "HERD_JOB=api"      # kept, not replaced

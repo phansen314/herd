@@ -442,3 +442,74 @@ def test_failed_adopt_outside_kitty_always_inserts(hook_env):
         restore()
     log = pathlib.Path(hook_env.runtime, "err.log").read_text()
     assert "no reservation to adopt, inserting" in log, log
+
+
+# ── adoption must not depend on the window stamp having landed ────────────────
+def _reserve(c, job="api", win=None):
+    """Phase 1 of `herd spawn`: the job name is claimed, the window is NOT yet
+    stamped (W1_spawn_window has not run, or is stuck behind the write lock)."""
+    pk = c.execute(W["W1_spawn_session"], {"cwd": "/code/herd", "now": T0}).lastrowid
+    c.execute(W["W1_spawn_herd"], {"pk": pk, "job": job, "now": T0, "socket": SOCK})
+    if win is not None:
+        c.execute(W["W1_spawn_window"], {"pk": pk, "win": win, "now": T0})
+    return pk
+
+
+def test_adopts_by_job_when_the_window_stamp_has_not_landed(hook_env):
+    """kitten @ launch returns the window id, but W1_spawn_window's write can sit
+    behind the WAL lock for up to the 3s busy_timeout while claude is already
+    starting. If SessionStart wins that race, adopting by window matches nothing —
+    W2b_insert then made a SECOND row and W3f swept the reservation 120s later,
+    taking the job name. HERD_JOB lets the session say which reservation is its own."""
+    c = hook_env.conn()
+    pk = _reserve(c, "api", win=None)                      # stamp not landed
+    hook_env.run("session_start.sh",
+                 {"session_id": "uuid-A", "cwd": "/code/herd", "model": "opus",
+                  "source": "startup", "transcript_path": "/t"},
+                 {"KITTY_WINDOW_ID": "5", "KITTY_LISTEN_ON": SOCK, "HERD_JOB": "api"})
+    rows = c.execute("SELECT id, session_id FROM sessions WHERE stopped_at IS NULL").fetchall()
+    assert len(rows) == 1 and rows[0]["id"] == pk, "created a duplicate row"
+    assert rows[0]["session_id"] == "uuid-A"
+    assert c.execute(W["R_job_live"], {"job": "api"}).fetchone() is not None
+    # and the placement is recorded now that the hook knows the window
+    assert c.execute("SELECT window_id FROM herd_sessions WHERE session_pk=?",
+                     (pk,)).fetchone()[0] == 5
+
+
+def test_adopts_by_job_when_the_reservation_was_already_swept(hook_env):
+    """A claude held at the "do you trust the files in this folder?" prompt past
+    HERD_STRANDED_SECS has its reservation DELETED before SessionStart fires. There
+    is nothing to adopt and no predecessor to inherit from — only HERD_JOB survives."""
+    c = hook_env.conn()
+    hook_env.run("session_start.sh",
+                 {"session_id": "uuid-B", "cwd": "/code/herd", "model": "opus",
+                  "source": "startup", "transcript_path": "/t"},
+                 {"KITTY_WINDOW_ID": "5", "KITTY_LISTEN_ON": SOCK, "HERD_JOB": "api"})
+    assert c.execute(W["R_job_live"], {"job": "api"}).fetchone() is not None, \
+        "a swept reservation must not cost the job name"
+
+
+def test_a_user_started_claude_is_unaffected_by_the_job_paths(hook_env):
+    """No HERD_JOB binds to SQL NULL, so every new path is a no-op."""
+    c = hook_env.conn()
+    hook_env.run("session_start.sh",
+                 {"session_id": "uuid-C", "cwd": "/code/herd", "model": "opus",
+                  "source": "startup", "transcript_path": "/t"},
+                 {"KITTY_WINDOW_ID": "5", "KITTY_LISTEN_ON": SOCK})
+    r = c.execute("SELECT h.job_name FROM sessions s JOIN herd_sessions h ON h.session_pk=s.id "
+                  "WHERE s.session_id='uuid-C'").fetchone()
+    assert r is not None and r["job_name"] is None
+
+
+def test_the_window_route_still_wins_when_the_stamp_is_there(hook_env):
+    """Window first, job second: the window is precise (it identifies ONE window),
+    job_name is not unique across dead rows."""
+    c = hook_env.conn()
+    stale = _reserve(c, "api", win=None)                    # same job, no window
+    real = _reserve(c, "other", win=5)                      # this window
+    hook_env.run("session_start.sh",
+                 {"session_id": "uuid-D", "cwd": "/code/herd", "model": "opus",
+                  "source": "startup", "transcript_path": "/t"},
+                 {"KITTY_WINDOW_ID": "5", "KITTY_LISTEN_ON": SOCK, "HERD_JOB": "api"})
+    got = c.execute("SELECT id FROM sessions WHERE session_id='uuid-D'").fetchone()[0]
+    assert got == real, "took the job route when the window route was available"

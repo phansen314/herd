@@ -28,11 +28,26 @@ export HERD_P_session_id="$SID" HERD_P_cwd="$CWD" HERD_P_model="$MODEL" \
 export HERD_P_pid="$(claude_pid)"
 run W2c_pid_claim >/dev/null 2>&1
 
+# HERD_JOB is set in the ENVIRONMENT of a spawned claude (launch.py --env), so a
+# spawned session can state its own job identity. Empty for a user-started claude,
+# which binds to SQL NULL and makes every use below a no-op.
+export HERD_P_job="${HERD_JOB:-}"
+
 ADOPTED=0; IN_KITTY=0; W2_RC=0
 if [ -n "${KITTY_WINDOW_ID:-}" ] && [ -n "${KITTY_LISTEN_ON:-}" ]; then
     IN_KITTY=1
     export HERD_P_socket="$KITTY_LISTEN_ON" HERD_P_win="$KITTY_WINDOW_ID"
     ADOPTED=$(run W2_adopt "SELECT changes();" 2>/dev/null); W2_RC=$?
+fi
+
+# Adoption by WINDOW missed, but this session knows which job it is. The window
+# stamp is written by W1_spawn_window AFTER kitten @ launch returns, and that write
+# can be stuck behind the WAL write lock for up to the 3s busy_timeout while this
+# claude is already starting — so "no row for my window" does not mean "no
+# reservation for me". Ask by name instead of creating a duplicate.
+if [ "$ADOPTED" != "1" ] && [ "$W2_RC" -eq 0 ] && [ -n "${HERD_JOB:-}" ]; then
+    ADOPTED=$(run W2_adopt_job "SELECT changes();" 2>/dev/null) || ADOPTED=0
+    [ "$ADOPTED" = "1" ] && [ "$IN_KITTY" = "1" ] && run W2b_placement >/dev/null 2>&1
 fi
 
 # W2 FAILED (a locked DB is the common case) — "0 rows changed" and "we never

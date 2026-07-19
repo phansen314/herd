@@ -12,7 +12,7 @@ def refired(fresh):
     pk = mk_session(c, session_id="u1")
     mk_herd(c, pk, job_name="api-refactor", created_at=T0,
             kitty_socket="unix:/tmp/kitty-1", window_id=7, herd_var="api-refactor")
-    c.execute(W["W2b_placement"], {"session_id": "u1", "socket": "unix:/tmp/kitty-9",
+    c.execute(W["W2b_placement"], {"session_id": "u1", "job": None, "socket": "unix:/tmp/kitty-9",
                                    "win": 42, "now": T2})
     return c.execute("SELECT job_name,created_at,kitty_socket,window_id,source,herd_var,"
                      "verified_at FROM herd_sessions WHERE session_pk=?", (pk,)).fetchone()
@@ -37,7 +37,7 @@ def test_w2b_placement_records_hook_window(fresh):
     c = fresh()
     c.execute(W["W2b_insert"], {"session_id": "u1", "cwd": "/code/herd", "model": "opus",
                                 "transcript": "/t.jsonl", "now": T0, "pid": None})
-    c.execute(W["W2b_placement"], {"session_id": "u1", "socket": SOCK, "win": 8, "now": T0})
+    c.execute(W["W2b_placement"], {"session_id": "u1", "job": None, "socket": SOCK, "win": 8, "now": T0})
     r = c.execute("SELECT h.source,h.kitty_socket,h.window_id,h.job_name "
                   "FROM herd_sessions h JOIN sessions s ON s.id=h.session_pk "
                   "WHERE s.session_id='u1'").fetchone()

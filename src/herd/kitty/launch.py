@@ -19,11 +19,17 @@ def build_launch_argv(spec, socket):
     """The `kitten @ launch` argv for a SpawnSpec. Pure. Options precede the
     program; claude_args thread verbatim; --prompt is appended LAST as claude's
     trailing positional (an initial message for the interactive session)."""
+    # --var sets a kitty WINDOW user-var (visible to `kitten @ ls`, used for window
+    # matching). --env sets it in the launched PROCESS, which is the only form the
+    # SessionStart hook can read — and reading it is what makes adoption independent
+    # of whether W1_spawn_window has committed yet. Both, deliberately: they address
+    # different consumers. See DECISIONS.md#spawn-identity.
     argv = ["kitten", "@", "--to", socket, "launch",
             "--type", _KITTY_TYPE.get(spec.launch_type, "tab"),
             "--cwd", spec.cwd,
             "--tab-title", spec.title,
-            "--var", f"HERD_JOB={spec.job}"]
+            "--var", f"HERD_JOB={spec.job}",
+            "--env", f"HERD_JOB={spec.job}"]
     for k, v in (spec.vars or {}).items():
         argv += ["--var", f"{k}={v}"]
     argv += [CLAUDE_NAME, *spec.claude_args]
