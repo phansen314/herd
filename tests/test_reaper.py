@@ -93,27 +93,32 @@ class _FakePs:
         return subprocess.CompletedProcess(a[0], self.rc, self.out, "")
 
 
+@pytest.mark.shell
 def test_read_proc_table_none_on_nonzero_ps(monkeypatch):
     monkeypatch.setattr(daemon.subprocess, "run", _FakePs(rc=1, out=""))
     assert read_proc_table() is None
 
 
+@pytest.mark.shell
 def test_read_proc_table_none_on_empty_table(monkeypatch):
     """rc==0 but nothing parseable — a broken/blocked ps, not an empty machine."""
     monkeypatch.setattr(daemon.subprocess, "run", _FakePs(rc=0, out="\nbogus\n"))
     assert read_proc_table() is None
 
 
+@pytest.mark.shell
 def test_read_proc_table_none_when_ps_is_missing(monkeypatch):
     monkeypatch.setattr(daemon.subprocess, "run", _FakePs(exc=FileNotFoundError("ps")))
     assert read_proc_table() is None
 
 
+@pytest.mark.shell
 def test_read_proc_table_parses_a_good_table(monkeypatch):
     monkeypatch.setattr(daemon.subprocess, "run", _FakePs(rc=0, out="100 S claude\n"))
     assert read_proc_table() == {100: ("S", "claude")}
 
 
+@pytest.mark.shell
 def test_broken_ps_reaps_nothing(fresh, monkeypatch):
     """The whole point: one failed probe must not stop every live session."""
     c = fresh()
@@ -234,6 +239,7 @@ def test_main_refuses_to_start_a_second_daemon(tmp_path, monkeypatch, capsys):
     assert "already running" in capsys.readouterr().err
 
 
+@pytest.mark.shell
 def test_the_lock_dies_with_its_holder(tmp_path):
     """flock, not a pidfile: the kernel drops it however the process dies, so a -9
     or a crash can never leave a stale lock that blocks every future start."""

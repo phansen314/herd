@@ -10,6 +10,7 @@
 import json
 import os
 import pathlib
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -23,6 +24,43 @@ sys.path.insert(0, str(HERE.parent / "src"))
 
 from herd.db import apply_schema                      # noqa: E402
 from helpers import HOOKS                             # noqa: E402
+
+
+# ── external toolchain: SKIP what cannot run, don't fail it ──────────────────
+# The hook tests exec real bash against real jq and sqlite3 — that fidelity is the
+# point (a mocked hook proves nothing about the one production runs). But a
+# contributor missing jq used to get a wall of subprocess failures that read like
+# herd is broken, when the correct message is "this machine cannot run these".
+#
+# Two conditions, deliberately not one blanket check. A hook needs all three tools;
+# a test that only shells out to bash (`bash -n`, sourcing common.sh) needs only
+# bash, and skipping it for a missing jq would be a lie about coverage.
+HOOK_TOOLS = ("bash", "jq", "sqlite3")
+MISSING_HOOK_TOOLS = [t for t in HOOK_TOOLS if shutil.which(t) is None]
+BASH_MISSING = shutil.which("bash") is None
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "shell: shells out to bash directly (not via the hook fixtures)")
+
+
+def pytest_runtest_setup(item):
+    """Skip on a missing toolchain rather than failing. Fixture-driven for the hook
+    tests (no per-test marker to forget), marker-driven for the direct callers."""
+    if item.get_closest_marker("shell") and BASH_MISSING:
+        pytest.skip("needs bash")
+    if MISSING_HOOK_TOOLS and {"hook_env", "bash_stmt"} & set(getattr(item, "fixturenames", ())):
+        pytest.skip(f"needs {', '.join(MISSING_HOOK_TOOLS)} (real hooks run here)")
+
+
+def pytest_report_header(config):
+    """Say it ONCE, up top. A run that silently skipped 300 tests looks the same as
+    a run that passed them."""
+    if MISSING_HOOK_TOOLS:
+        return (f"herd: MISSING {', '.join(MISSING_HOOK_TOOLS)} — the hook tests will "
+                f"SKIP. Install them for a full run; see CONTRIBUTING.md.")
+    return None
 
 
 def _open(path, tier2=True):

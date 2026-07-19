@@ -21,6 +21,7 @@ def _walk(start, table, want=None):
 _NESTED = ["100 200 bash", "200 300 sh", "300 400 claude", "400 500 sh", "500 600 claude", "600 1 kitty"]
 
 
+@pytest.mark.shell
 @pytest.mark.parametrize("start,table,want,expect", [
     ("100", _NESTED, None, "300"),                                              # nearest ancestor
     ("100", ["100 200 bash", "200 300 sh", "300 400 /usr/bin/claude"], None, "300"),  # basenamed
@@ -131,6 +132,7 @@ def test_session_end_stops_and_frees_handles(hook_env):
 
 
 # ── 54. bind(): refuse unbound, never rescan ─────────────────────────────────
+@pytest.mark.shell
 def test_bind_refuses_unbound_param():
     r = subprocess.run(
         ["bash", "-c", f'. "{HOOKS}/common.sh"; bind "UPDATE sessions SET cwd = :cwd WHERE session_id = :session_id;"'],
@@ -138,6 +140,7 @@ def test_bind_refuses_unbound_param():
     assert r.returncode != 0 and ":session_id" in r.stderr
 
 
+@pytest.mark.shell
 def test_bind_does_not_rescan_substituted_values():
     r = subprocess.run(
         ["bash", "-c", f'. "{HOOKS}/common.sh"; bind "UPDATE sessions SET cwd = :cwd, updated_at = :now;"'],
@@ -239,6 +242,7 @@ def _sh(script, env=None, stdin=""):
                           input=stdin, capture_output=True, text=True, env=e)
 
 
+@pytest.mark.shell
 @pytest.mark.parametrize("name", sorted(W))
 def test_stmt_bind_equals_stmt_then_bind(name):
     """run()/run_tx() extract-and-bind in ONE awk fork now. stmt() and bind() still
@@ -260,6 +264,7 @@ def test_stmt_bind_equals_stmt_then_bind(name):
     assert (merged.returncode == 0) == (composed.returncode == 0)
 
 
+@pytest.mark.shell
 def test_stmt_bind_reports_unbound_like_bind_does():
     """An unbound param must still fail the statement rather than sending `:name`
     to sqlite as a literal."""
@@ -268,6 +273,7 @@ def test_stmt_bind_reports_unbound_like_bind_does():
     assert "unbound param" in r.stderr
 
 
+@pytest.mark.shell
 def test_stmt_bind_cuts_on_the_raw_semicolon_not_a_bound_value():
     """The `;` that ends a statement is found on the RAW line. A bound VALUE may
     contain one — a cwd or a /rename can — and cutting there would ship a truncated
@@ -280,6 +286,7 @@ def test_stmt_bind_cuts_on_the_raw_semicolon_not_a_bound_value():
     assert "'a;DROP TABLE sessions;--'" in r.stdout    # quoted, inert, intact
 
 
+@pytest.mark.shell
 def test_unknown_statement_is_empty_not_an_unbound_error():
     """run() distinguishes these by emptiness, so stmt_bind must return nothing
     (not an error line) for a name that does not exist."""
@@ -287,6 +294,7 @@ def test_unknown_statement_is_empty_not_an_unbound_error():
     assert r.stdout == ""
 
 
+@pytest.mark.shell
 def test_read_input_slurps_stdin_without_a_fork():
     """Replaced `INPUT=$(cat)`. NOT $(</dev/stdin) — Claude's invocation leaves that
     empty, which is why the comment in session_start.sh warns about it."""
@@ -295,6 +303,7 @@ def test_read_input_slurps_stdin_without_a_fork():
     assert r.stdout == payload
 
 
+@pytest.mark.shell
 def test_read_input_keeps_interior_whitespace_and_blank_lines():
     """IFS= matters: without it read strips leading/trailing whitespace."""
     payload = '  {"a":\n\n  1}  '
@@ -302,6 +311,7 @@ def test_read_input_keeps_interior_whitespace_and_blank_lines():
     assert r.stdout == f"[{payload}]"
 
 
+@pytest.mark.shell
 def test_now_pair_falls_back_when_date_has_no_percent_3n(tmp_path):
     """macOS/BSD date leaves %3N unexpanded. The old code paid a `date -u +%3N`
     probe at SOURCE time — every hook fire, ~1/sec/session — to learn this; now the
@@ -319,6 +329,7 @@ def test_now_pair_falls_back_when_date_has_no_percent_3n(tmp_path):
     assert epoch.isdigit()
 
 
+@pytest.mark.shell
 def test_now_pair_gives_millis_on_gnu_date():
     r = _sh('now_pair; echo "$NOW_ISO"')
     iso = r.stdout.strip()

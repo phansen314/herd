@@ -534,6 +534,7 @@ def test_service_install_is_a_graceful_noop_without_systemd(monkeypatch, tmp_pat
     assert inst.uninstall_service() == "no herd.service to remove"
 
 
+@pytest.mark.shell
 def test_uninstall_service_removes_the_unit(monkeypatch, tmp_path):
     unit = tmp_path / "herd.service"
     unit.write_text("[Unit]\n")
@@ -589,6 +590,7 @@ def test_wrapper_rewrite_is_still_idempotent():
     assert inst.rewire_wrapper(once)[0] == once
 
 
+@pytest.mark.shell
 def test_bin_herd_resolves_symlinks_without_readlink_f(tmp_path):
     """`readlink -f` is GNU-only and herd claims macOS support; there SELF came
     back empty and the wrapper resolved to the wrong directory."""
@@ -711,6 +713,7 @@ def test_wrapper_rewrite_leaves_another_tools_statusline_alone():
     assert '""' not in out
 
 
+@pytest.mark.shell
 def test_rewritten_wrapper_is_valid_bash(tmp_path):
     """The failure mode was a SYNTAX error, which no assertion about substrings
     would have caught. Parse the result."""
@@ -756,6 +759,7 @@ def test_unwire_wrapper_without_an_original_changes_nothing():
     assert inst.unwire_wrapper(wired, "#!/bin/sh\necho hi\n") == (wired, False)
 
 
+@pytest.mark.shell
 def test_unwired_wrapper_is_valid_bash(tmp_path):
     """Same reasoning as the rewrite: the failure mode is a syntax error."""
     wired, _ = inst.rewire_wrapper(_CAVEMAN_WRAPPER)
@@ -807,6 +811,7 @@ _WRAPPER_IDIOMS = [
 ]
 
 
+@pytest.mark.shell
 @pytest.mark.parametrize("src,expect_replaced", _WRAPPER_IDIOMS,
                          ids=[s.strip()[:28] for s, _ in _WRAPPER_IDIOMS])
 def test_wrapper_rewrite_never_emits_broken_bash(src, expect_replaced, tmp_path):

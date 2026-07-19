@@ -13,6 +13,8 @@ import sqlite3
 import subprocess
 import threading
 import time
+
+import pytest
 from concurrent.futures import ThreadPoolExecutor
 
 from herd.spawn import SpawnSpec, spawn
@@ -143,6 +145,7 @@ def _spawn_conn(path):
     return c
 
 
+@pytest.mark.shell
 def test_concurrent_spawns_of_one_job_name_only_one_wins(fresh, tmp_path):
     """The TOCTOU: the live-job check used to sit outside the transaction, with a
     kitty launch (subprocess + socket round trip) between it and the INSERT. Two

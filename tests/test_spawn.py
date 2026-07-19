@@ -159,6 +159,7 @@ def test_cmd_spawn_tab_and_pane_conflict(monkeypatch, fresh):
     assert cli.cmd_spawn(fresh(), ["api", "--tab", "--pane"]) == 2   # usage error
 
 
+@pytest.mark.shell
 def test_a_raising_launcher_frees_the_job_name(fresh):
     """subprocess.run raises FileNotFoundError when `kitten` is not on PATH. Letting
     that propagate skipped the abort and left a pid-NULL reservation the reaper's
@@ -210,6 +211,7 @@ def test_launch_passes_the_built_argv_through():
     assert seen["argv"] == build_launch_argv(_spec(job="api", cwd="/code/app"), SOCK)
 
 
+@pytest.mark.shell
 def test_launch_times_out_against_a_socket_that_never_answers(tmp_path, monkeypatch):
     """The real path: a stale unix:/tmp/kitty-<pid> whose kitty is gone. Drives the
     actual subprocess call, not a stub, so the TimeoutExpired -> "" -> None chain

@@ -98,6 +98,7 @@ def _bind(sql, params, extra_env=None):
     return r.returncode, r.stdout
 
 
+@pytest.mark.shell
 def test_bind_escapes_embedded_single_quote():
     """DESIGN.md justifies bind() over sqlite3's `.param set` with exactly this
     case. A naive binder emits ...'/tmp/o'brien'... and corrupts the statement."""
@@ -106,6 +107,7 @@ def test_bind_escapes_embedded_single_quote():
     assert "'/tmp/o''brien'" in out
 
 
+@pytest.mark.shell
 def test_bind_escapes_sql_injection_attempt():
     rc, out = _bind("SELECT :x;", {"x": "'; DROP TABLE sessions; --"})
     assert rc == 0
@@ -113,6 +115,7 @@ def test_bind_escapes_sql_injection_attempt():
     assert "''; DROP TABLE sessions; --'" in out
 
 
+@pytest.mark.shell
 def test_bind_empty_value_becomes_null_not_empty_string():
     """COALESCE(:x, col) throughout writes.sql depends on this: an absent payload
     field must be NULL (keep prior value), never '' (wipe it)."""
@@ -120,6 +123,7 @@ def test_bind_empty_value_becomes_null_not_empty_string():
     assert rc == 0 and "NULL" in out and "''" not in out
 
 
+@pytest.mark.shell
 def test_bind_fails_loudly_on_an_unbound_param():
     """Silent NULL-binding is the failure mode that motivated not using .param set."""
     rc, _ = _bind("SELECT :never_set_anywhere;", {})
@@ -133,6 +137,7 @@ def _valid_sid(sid):
     return r.returncode == 0
 
 
+@pytest.mark.shell
 @pytest.mark.parametrize("sid", [
     "abc123", "07c6e17d-1a44-40d9-9e41-07d896ace781", "A-1",
 ])
@@ -140,6 +145,7 @@ def test_valid_sid_accepts_real_uuids(sid):
     assert _valid_sid(sid)
 
 
+@pytest.mark.shell
 @pytest.mark.parametrize("sid", [
     "", "../../etc/passwd", "a/b", "a b", "a;rm -rf /", "a$(id)", "a`id`",
     "a'b", 'a"b', "a\nb", ".", "..", "a.b",

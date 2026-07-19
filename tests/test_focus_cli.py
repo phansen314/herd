@@ -216,6 +216,7 @@ def test_free_port_is_usable_and_distinct():
         s.bind(("127.0.0.1", a))            # actually bindable, i.e. really free
 
 
+@pytest.mark.shell
 def test_watch_and_jump_share_one_fzf_flag_list(monkeypatch, fresh):
     """watch must reuse _fzf_pick, or --delimiter/--with-nth drift breaks _parse_pick."""
     c, _ = _watch_fixture(fresh)
@@ -472,6 +473,7 @@ def _preview_arg(monkeypatch):
     return seen["argv"][seen["argv"].index("--preview") + 1]
 
 
+@pytest.mark.shell
 def test_fzf_command_strings_survive_a_script_path_with_a_space(monkeypatch, tmp_path):
     """fzf hands --preview and reload(...) to `sh -c`. Unquoted, a path under a
     directory with a space broke the preview pane and ctrl-r refresh. The path is
@@ -485,6 +487,7 @@ def test_fzf_command_strings_survive_a_script_path_with_a_space(monkeypatch, tmp
     assert shlex.split(_preview_arg(monkeypatch))[0] == str(sh)
 
 
+@pytest.mark.shell
 def test_preview_falls_back_to_python_when_the_script_is_not_executable(monkeypatch, tmp_path):
     """A pip/zip install can drop the mode bit. The pane must degrade to the slow
     python verb, not render blank — and that path needs the same quoting."""
