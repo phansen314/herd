@@ -245,8 +245,27 @@ def _watch_driver(monkeypatch, outs):
     fzf spawn and the loop spin forever (it did, and hung the suite)."""
     killed, seen = [], []
     monkeypatch.setattr(cli, "_has_fzf", lambda: True)
-    monkeypatch.setattr(cli, "_spawn_poker",
-                        lambda port: type("P", (), {"terminate": lambda s: killed.append(port)})())
+
+    class P:
+        """Stands in for Popen, and must answer everything _reap_poker calls — a
+        double that only had terminate() let a missing wait() pass here and fail in
+        production, where the un-waited child stays defunct until the next Popen."""
+        def terminate(self):
+            killed.append(port_of[0])
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    port_of = [None]
+
+    def spawn(port):
+        port_of[0] = port
+        return P()
+
+    monkeypatch.setattr(cli, "_spawn_poker", spawn)
 
     def fake_run(rows, query, extra=()):
         seen.append(extra)
@@ -610,3 +629,172 @@ def test_rows_file_survives_a_runtime_dir_with_a_space(fresh, monkeypatch, tmp_p
     payload = [d for d in sent if d is not None][0].decode()
     inner = payload[len("reload("):-1]                 # strip reload( ... )
     assert shlex.split(inner) == ["cat", cli._rows_file("1234")]
+
+
+# ── watch must resolve the pick against LIVE rows, not the seed ─────────────
+def test_watch_focuses_a_session_that_appeared_after_the_picker_opened(monkeypatch, fresh):
+    """watch's whole point is a dashboard left open, and the poker reloads the pane
+    from the rows file while it is. Resolving the selection against the SEED list
+    meant enter on a session that arrived since did nothing at all — no focus, no
+    message, straight back to the picker. Auto-refresh made its own results
+    unselectable."""
+    c, pk = _watch_fixture(fresh)
+    late = mk_session(c, session_id="w2", cwd="/x/late", status="working")
+    mk_herd(c, late, job_name="late", kitty_socket=SOCK, window_id=2)
+
+    focused = []
+    monkeypatch.setattr(cli, "_do_focus", lambda conn, row: focused.append(row["id"]))
+    seeded = []
+
+    def fake_run(rows, query, extra=()):
+        seeded.append([r["id"] for r in rows])
+        # fzf returns the LATE session — on screen via reload, absent from the seed
+        return f"\n{late}\t! #{late}  late\n" if len(seeded) == 1 else "ctrl-q\n"
+
+    monkeypatch.setattr(cli, "_has_fzf", lambda: True)
+    monkeypatch.setattr(cli, "_spawn_poker",
+                        lambda port: type("P", (), {"terminate": lambda s: None,
+                                                    "wait": lambda s, timeout=None: 0,
+                                                    "kill": lambda s: None})())
+    monkeypatch.setattr(cli, "_fzf_run", fake_run)
+    monkeypatch.setattr(cli, "_live", _late_after_first_call(c, late))
+    assert cli.cmd_watch(c, []) == 0
+    assert focused == [late], "enter on a newly-arrived session must focus it"
+
+
+def _late_after_first_call(conn, late_pk):
+    """_live that hides the late session from the SEED and reveals it afterwards —
+    the picker's list going stale, which is what the poker's reload causes."""
+    calls = [0]
+    real = cli._live
+
+    def live(c):
+        calls[0] += 1
+        rows = real(c)
+        return [r for r in rows if r["id"] != late_pk] if calls[0] == 1 else rows
+    return live
+
+
+def test_watch_leaves_no_rows_file_behind(monkeypatch, fresh, tmp_path):
+    """The integration half of test_reaping_the_poker_removes_its_rows_file: that one
+    calls _reap_poker directly, so it cannot fail against a cmd_watch that never
+    calls it. This pins the loop itself — one picker, one port, nothing left over."""
+    monkeypatch.setenv("HERD_RUNTIME", str(tmp_path))
+    c, pk = _watch_fixture(fresh)
+    ports = []
+    monkeypatch.setattr(cli, "_free_port", lambda: 45123)
+
+    def spawn(port):
+        ports.append(port)
+        cli._write_rows(cli._rows_file(port), "seed")   # what the real poker does
+        return type("P", (), {"terminate": lambda s: None,
+                              "wait": lambda s, timeout=None: 0,
+                              "kill": lambda s: None})()
+
+    monkeypatch.setattr(cli, "_has_fzf", lambda: True)
+    monkeypatch.setattr(cli, "_spawn_poker", spawn)
+    monkeypatch.setattr(cli, "_fzf_run", lambda rows, q, extra=(): "ctrl-q\n")
+    assert cli.cmd_watch(c, []) == 0
+    assert ports == [45123]
+    assert not list(tmp_path.glob("herd-rows-*")), "watch left its poker's rows file"
+
+
+def test_watch_says_so_when_the_pick_cannot_be_resolved(monkeypatch, fresh, capsys):
+    """A session that really did end between the pick and the lookup must not be a
+    silent no-op either."""
+    c, pk = _watch_fixture(fresh)
+    _watch_driver(monkeypatch, [f"\n9999\t! #9999  gone\n", "ctrl-q\n"])
+    assert cli.cmd_watch(c, []) == 0
+    assert "gone" in capsys.readouterr().out
+
+
+# ── the poker's rows file must not survive its SIGTERM ──────────────────────
+def test_reaping_the_poker_removes_its_rows_file(tmp_path, monkeypatch):
+    """_poke_loop's finally CANNOT run under terminate() — SIGTERM's default
+    disposition kills the interpreter without unwinding, verified. So watch left one
+    herd-rows-<port> per picker, each on a fresh random port, in the runtime dir."""
+    monkeypatch.setenv("HERD_RUNTIME", str(tmp_path))
+    port = 45999
+    cli._write_rows(cli._rows_file(port), "seed")
+    assert pathlib.Path(cli._rows_file(port)).exists()
+
+    class P:
+        def terminate(self): self.term = True
+        def wait(self, timeout=None): return 0
+        def kill(self): pass
+
+    cli._reap_poker(P(), port)
+    assert not pathlib.Path(cli._rows_file(port)).exists()
+
+
+def test_reap_poker_kills_a_poker_that_ignores_sigterm(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERD_RUNTIME", str(tmp_path))
+    events = []
+
+    class Stubborn:
+        def terminate(self): events.append("term")
+        def wait(self, timeout=None):
+            if len(events) < 2:
+                raise __import__("subprocess").TimeoutExpired("poke", timeout)
+            return 0
+        def kill(self): events.append("kill")
+
+    cli._reap_poker(Stubborn(), 46000)            # must not raise
+    assert events == ["term", "kill"]
+
+
+def test_reap_poker_never_raises_on_a_dead_poker(tmp_path, monkeypatch):
+    """It runs in a finally — an exception here would replace watch's real outcome."""
+    monkeypatch.setenv("HERD_RUNTIME", str(tmp_path))
+
+    class Dead:
+        def terminate(self): raise OSError("no such process")
+        def wait(self, timeout=None): return 0
+        def kill(self): pass
+
+    cli._reap_poker(Dead(), 46001)
+
+
+# ── FZF_PORT lands in a path, so it is validated ────────────────────────────
+@pytest.mark.parametrize("bad", ["", "  ", "../../etc/x", "80; rm -rf /", "abc"])
+def test_poke_refuses_a_port_that_is_not_a_number(bad, monkeypatch, fresh):
+    """_rows_file interpolates the port into a filename, so a non-numeric value
+    writes and unlinks outside the runtime dir."""
+    monkeypatch.setenv("FZF_PORT", bad)
+    monkeypatch.setattr(cli, "_poke_loop",
+                        lambda *a, **k: pytest.fail("must not start a poke loop"))
+    assert cli.cmd_poke(fresh(), []) == 1
+
+
+# ── argv: a flag the CLI cannot read is refused, not repurposed ─────────────
+@pytest.mark.parametrize("argv,why", [
+    (["ls", "--help"], "ls ignored the flag and listed"),
+    (["ls", "extra"], "ls takes no operand"),
+    (["watch", "--foo"], "watch takes no arguments"),
+    (["jump", "--foo"], "searched for a session named '--foo'"),
+    (["preview", "-1"], "not an id"),
+])
+def test_cli_refuses_unknown_arguments(argv, why, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "connect",
+                        lambda *a, **k: pytest.fail(f"must not open the DB: {why}"))
+    assert cli.main(argv) == 2, why
+    assert "usage" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h", "help"])
+def test_cli_help_is_help(flag, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "connect", lambda *a, **k: pytest.fail("must not open the DB"))
+    assert cli.main([flag]) == 0
+    assert "herd <command>" in capsys.readouterr().out
+
+
+def test_a_real_query_is_still_a_query(monkeypatch, fresh):
+    """The guard is for LEADING dashes only — a query is otherwise arbitrary text."""
+    c = fresh()
+    seen = []
+    monkeypatch.setattr(cli, "connect", lambda *a, **k: c)
+    # the COMMANDS dict binds the function at import — patching cli.cmd_jump alone
+    # leaves main() dispatching the real one
+    monkeypatch.setitem(cli.COMMANDS, "jump", lambda conn, args: (seen.append(args), 0)[1])
+    assert cli.main(["jump", "my-session"]) == 0
+    assert seen == [["my-session"]]

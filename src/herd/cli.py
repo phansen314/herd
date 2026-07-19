@@ -371,8 +371,12 @@ def cmd_poke(conn, args):
     see the variable, so auto-refresh worked on one picker and not the next. See
     DECISIONS.md#poker."""
     import time
-    port = os.environ.get("FZF_PORT")
-    if not port:
+    port = (os.environ.get("FZF_PORT") or "").strip()
+    # isdigit, because the port is not only a URL: _rows_file interpolates it into
+    # a PATH, so FZF_PORT=../../x would write and then unlink outside the runtime
+    # dir. watch always sets it from _free_port, so this is a guard on a value we
+    # control, not a hole — but the file write is the kind that deserves one.
+    if not port.isdigit():
         return 1
     _poke_loop(conn, port, _http_send, time.sleep)
     return 0
@@ -417,6 +421,36 @@ def _spawn_poker(port):
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def _reap_poker(poker, port):
+    """Stop the poker AND clean up after it. Never raises — this runs in a finally.
+
+    The unlink is here, not only in _poke_loop's finally, because that finally
+    CANNOT RUN on the path that actually happens: terminate() is SIGTERM, whose
+    default disposition kills the interpreter without unwinding. Verified — the
+    rows file survived every terminate, so watch left one herd-rows-<port> behind
+    per picker, each with a fresh random port, in the runtime dir. That is the
+    accumulation the finally was written to prevent.
+
+    wait() as well as terminate(): without it each iteration leaves a defunct child
+    until the next Popen happens to reap it, so an idle dashboard sits on a zombie.
+    """
+    try:
+        poker.terminate()
+        poker.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        poker.kill()                        # ignoring SIGTERM: stop being polite
+        try:
+            poker.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+    except OSError:
+        pass                                # already gone; nothing to reap
+    try:
+        os.unlink(_rows_file(port))
+    except OSError:
+        pass                                # never created, or the poker got there
+
+
 def cmd_watch(conn, args):
     """The jump picker, looping forever, self-refreshing — a tab you can't fall out of.
     Esc re-enters the picker; ctrl-q (or ctrl-c) is the way out."""
@@ -450,13 +484,22 @@ def cmd_watch(conn, args):
             return 130                      # belt-and-braces: a ctrl-c that lands
                                             # before fzf has taken the terminal
         finally:
-            poker.terminate()               # one poker per picker, always reaped
+            _reap_poker(poker, port)        # one poker per picker, always reaped
         key, sel = _parse_expect(out)
         if key in _QUIT_KEYS:
             return 0
-        picked = _parse_pick(rows, sel)
+        # Resolve against a FRESH read, not the seed `rows` this picker opened with.
+        # The poker reloads the pane from the rows file and ctrl-r reloads from
+        # `herd.cli rows`, so by the time enter is pressed the list on screen can
+        # hold sessions the seed never had — and looking those up in the seed
+        # returned None, which the `is not None` below swallowed. Enter on a
+        # session that appeared while the dashboard was open did NOTHING: no focus,
+        # no message. watch's own auto-refresh made its results unselectable.
+        picked = _parse_pick(_live(conn), sel)
         if picked is not None:
             _do_focus(conn, picked)         # pick or cancel: either way, back in
+        elif sel.strip():                   # a selection we could not resolve at all
+            print("✗ that session is gone")  # (it ended between the pick and now)
 
 
 def _complete_tokens(rows):
@@ -566,16 +609,52 @@ def cmd_doctor(argv):
     return doctor.main(argv)
 
 
+# Verbs that take NO arguments at all. `spawn` parses its own (argparse, plus a
+# `--` passthrough), `jump`/`preview` take one operand — those validate themselves.
+_NO_ARGS = {"ls", "watch", "rows", "complete", "tcomplete", "poke"}
+
+USAGE = """usage: herd <command> [args]
+
+  ls              list live sessions (the default)
+  jump [query]    focus a session; fuzzy-pick when the query is not unique
+  spawn <job>     launch a named claude session in a kitty tab/pane
+  watch           the picker as a permanent dashboard
+  doctor          diagnose the install
+
+  query = herd id, name, job, uuid prefix, or cwd substring"""
+
+
 def main(argv=None):
+    """An unrecognized flag is REFUSED, not repurposed — as in herd.install.main
+    and herd.daemon.main. `herd ls --help` used to ignore the flag and list;
+    `herd jump --foo` searched for a session named '--foo' and, finding none,
+    opened the picker over everything. Neither is destructive, which is why this is
+    the third of these rather than the first, but a flag the CLI cannot read still
+    means the caller asked for something it is not doing.
+    """
     argv = argv if argv is not None else sys.argv[1:]
+    if argv and argv[0] in ("--help", "-h", "help"):
+        print(USAGE)
+        return 0
     cmd = argv[0] if argv else "ls"
     if cmd in _NO_DB:
         return cmd_doctor(argv[1:])
     if cmd not in COMMANDS:
         print(f"herd: unknown command {cmd!r} (try: {', '.join(USER_COMMANDS)})")
         return 2
+    rest = argv[1:]
+    if cmd in _NO_ARGS and rest:
+        print(f"herd {cmd}: takes no arguments (got {' '.join(repr(a) for a in rest)})")
+        print()
+        print(USAGE)
+        return 2
+    if cmd in ("jump", "preview") and rest and rest[0].startswith("-"):
+        print(f"herd {cmd}: unknown option {rest[0]!r} — a query is not a flag")
+        print()
+        print(USAGE)
+        return 2
     conn = connect(DEFAULT_DB, readonly=cmd in _READONLY)
-    return COMMANDS[cmd](conn, argv[1:])
+    return COMMANDS[cmd](conn, rest)
 
 
 if __name__ == "__main__":
