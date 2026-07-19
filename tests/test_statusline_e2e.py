@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import subprocess
+import time
 
 import pytest
 
@@ -249,17 +250,25 @@ def test_reset_stamps_match_what_date_produced(hook_env, epoch):
     """The two `date -d @epoch` forks are gone; jq formats these in the parse it
     already runs. GNU date is the reference the old code used, so the new output
     must be indistinguishable from it — including the %-I/%-m/%-d zero-stripping,
-    which jq cannot ask strftime for portably and does with sub() instead."""
-    import subprocess
+    which jq cannot ask strftime for portably and does with sub() instead.
+
+    The ORACLE IS COMPUTED HERE, not shelled out to `date`. It used to be
+    `date -d @epoch +%-I:%M%p` — and BSD date rejects both `-d` and `%-I`, so off
+    Linux `want5`/`want7` came back EMPTY and the assertions degraded to
+    `"5h 50% resets " in out`: true no matter how the stamp was formatted. A test
+    whose whole subject is portable formatting passed vacuously on the platform it
+    was meant to protect. time.localtime is the same wall clock jq's strflocaltime
+    reads, and AM/PM is derived rather than %p'd so a locale cannot move it.
+    """
     pay = {**SL_PAY, "rate_limits": {"five_hour": {"used_percentage": 50, "resets_at": epoch},
                                      "seven_day": {"used_percentage": 10, "resets_at": epoch}}}
     c = hook_env.conn()
     mk_session(c, session_id="s1", cwd="/code/herd")
     out = _statusline(hook_env, pay).stdout
-    want5 = subprocess.run(["date", "-d", f"@{epoch}", "+%-I:%M%p"],
-                           capture_output=True, text=True).stdout.strip()
-    want7 = subprocess.run(["date", "-d", f"@{epoch}", "+%-m/%-d %-I:%M%p"],
-                           capture_output=True, text=True).stdout.strip()
+    t = time.localtime(epoch)
+    hh = t.tm_hour % 12 or 12                      # %-I: 0h and 12h both render 12
+    want5 = f"{hh}:{t.tm_min:02d}{'AM' if t.tm_hour < 12 else 'PM'}"
+    want7 = f"{t.tm_mon}/{t.tm_mday} {want5}"      # %-m/%-d: no zero padding
     assert f"5h 50% resets {want5}" in out, out
     assert f"7d 10% resets {want7}" in out, out
 
