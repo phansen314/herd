@@ -59,13 +59,7 @@ jobs:
           for t in bash jq sqlite3; do
             command -v "$t" >/dev/null || { echo "::error::$t missing at test time"; exit 1; }
           done
-          skipped=$(python -c 'import xml.etree.ElementTree as E; r=E.parse("results.xml").getroot(); s=r if r.tag=="testsuite" else r.find("testsuite"); print(s.get("skipped","0"))')
-          total=$(python -c 'import xml.etree.ElementTree as E; r=E.parse("results.xml").getroot(); s=r if r.tag=="testsuite" else r.find("testsuite"); print(s.get("tests","0"))')
-          echo "ran $total tests, $skipped skipped"
-          if [ "$skipped" != "0" ]; then
-            echo "::error::$skipped of $total test(s) skipped — CI must run all of them"
-            exit 1
-          fi
+          python .github/check-skips.py results.xml
 
       # Advisory only: the hooks target bash 3.2 and shellcheck has opinions herd
       # has deliberately overruled, so this reports without gating the build.

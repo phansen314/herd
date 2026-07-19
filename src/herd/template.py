@@ -41,13 +41,17 @@ def load_template(name, *, dir=None):
     an unknown/mistyped key — never a bare stack trace on the CLI."""
     if not valid_template_name(name):
         raise ValueError(f"invalid template name {name!r}")
+    path = _dir(dir) / f"{name}.toml"
+    if not path.is_file():
+        raise ValueError(f"no template {name!r} at {path}")
+    # The interpreter check comes AFTER the name and file checks, so the error
+    # names the caller's actual mistake. Importing first meant `herd spawn -t typo`
+    # on 3.9 answered "templates need Python 3.11+" — true, but not the problem, and
+    # it sends you to upgrade python over a misspelling.
     try:
         import tomllib
     except ModuleNotFoundError:
         raise ValueError("templates need Python 3.11+ (stdlib tomllib)")
-    path = _dir(dir) / f"{name}.toml"
-    if not path.is_file():
-        raise ValueError(f"no template {name!r} at {path}")
     try:
         raw = tomllib.loads(path.read_text())
     except tomllib.TOMLDecodeError as e:
