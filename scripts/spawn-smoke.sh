@@ -62,13 +62,26 @@ verify() {
     [ -n "$job_sid" ] && ok "adopted Claude's uuid: $job_sid" \
                       || no "session_id still NULL — nothing adopted the reservation"
     # source='spawn' means the reservation ITSELF was adopted (W2_adopt or
-    # W2_adopt_job). 'hook' means W2b_insert made a new row and the name was
-    # inherited or carried by HERD_JOB — also a pass, but a different route.
+    # W2_adopt_job). source='hook' means W2b_insert made a new row — which is the
+    # EXPECTED outcome after a /clear, and only suspicious otherwise. Telling the
+    # two apart needs the predecessor: a /clear keeps the process, so the dead row
+    # it replaced shares this row's pid and window.
+    local pred
     if [ "$job_src" = "spawn" ]; then
         ok "route: adopted the reservation in place (source=spawn)"
     else
-        hm "route: a new row carries the name (source=$job_src)"
-        hm "  fine, but it means W2_adopt/W2_adopt_job missed — check the errlog"
+        pred=$(q "SELECT s.id FROM sessions s JOIN herd_sessions h ON h.session_pk=s.id
+                  WHERE h.job_name='$JOB' AND s.stopped_at IS NOT NULL
+                    AND s.pid = (SELECT pid FROM sessions WHERE id=$live_pk)
+                    AND h.window_id = (SELECT window_id FROM herd_sessions WHERE session_pk=$live_pk)
+                  ORDER BY s.id DESC LIMIT 1")
+        if [ -n "$pred" ]; then
+            ok "route: inherited from #$pred across /clear — same pid, same window"
+            ok "  (that is the expected path here: W2_adopt cannot match a stopped predecessor)"
+        else
+            hm "route: a new row carries the name (source=$job_src) with no predecessor"
+            hm "  it means W2_adopt/W2_adopt_job missed — check the errlog"
+        fi
     fi
     [ -n "$job_win" ] && ok "placement recorded: window $job_win" \
                       || hm "no window_id yet (focus will fall back)"
