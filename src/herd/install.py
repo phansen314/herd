@@ -440,7 +440,24 @@ def rewire_settings(data, wrapper_exists=False, hooks_dir=None):
 # whole line used to be replaced by the path alone, silently dropping `exec`,
 # `"$@"`, redirects and anything chained after it. A wrapper written as
 # `exec "$HOME/.klawde/statusline.sh" "$@"` lost both exec and its arguments.
-_SL_TOKEN = re.compile(r'"[^"\n]*statusline\.sh"|\'[^\'\n]*statusline\.sh\'|\S*statusline\.sh')
+#
+# The basename must be EXACTLY statusline.sh — `/statusline\.sh`, not a bare
+# suffix. A composed wrapper chains OTHER tools' statuslines, and matching the
+# suffix claimed them: the caveman plugin's `caveman-statusline.sh` looked like
+# herd's own invocation and got rewritten to point at herd.
+#
+# The bare alternative also excludes `=`, so it cannot start before one. It was
+# `\S*statusline\.sh`, which has no left boundary, so on
+#     CAVEMAN_SL="$HOME/.../caveman-statusline.sh"
+# it matched from column 0 — the assignment, the opening quote and the path are
+# one unbroken run of non-space — and replaced the lot with a quoted herd path,
+# leaving a stray `"` behind. That is a bash SYNTAX ERROR, so the wrapper emitted
+# nothing at all and the statusline silently vanished from every session.
+_SL_TOKEN = re.compile(
+    r'"[^"\n]*/statusline\.sh"'
+    r"|'[^'\n]*/statusline\.sh'"
+    r'|[^\s"\'=]*/statusline\.sh'
+)
 
 
 def rewire_wrapper(text, hooks_dir=None):

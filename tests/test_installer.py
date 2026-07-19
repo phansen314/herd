@@ -549,3 +549,61 @@ def test_known_flags_still_route(monkeypatch, argv, expect):
     """The refusal must not have broken the flags that DO work."""
     rc, called = _main_never_installs(monkeypatch, argv)
     assert called == [expect]
+
+
+# ── the wrapper rewrite must not claim OTHER tools' statuslines ───────────────
+# The real composed wrapper, verbatim from a machine where this broke.
+_CAVEMAN_WRAPPER = '''#!/usr/bin/env bash
+# herd + caveman composed statusline.
+# caveman reads a flag file (no stdin); herd inherits parent stdin directly.
+
+CAVEMAN_SL="$HOME/.claude/plugins/marketplaces/caveman/hooks/caveman-statusline.sh"
+if [ -f "$CAVEMAN_SL" ]; then
+  CAVEMAN_OUT=$(bash "$CAVEMAN_SL")
+  if [ -n "$CAVEMAN_OUT" ]; then
+    printf '%s ┃ ' "$CAVEMAN_OUT"
+  fi
+fi
+
+"$HOME/.klawde/statusline.sh"
+'''
+
+
+def test_wrapper_rewrite_leaves_another_tools_statusline_alone():
+    """`caveman-statusline.sh` is not herd's invocation. The token regex matched a
+    bare SUFFIX, so it claimed the plugin's path too — and because that path sits in
+    a `VAR="..."` assignment with no spaces in it, the unbounded `\\S*` alternative
+    matched from column 0 and ate the assignment and its opening quote:
+
+        CAVEMAN_SL="$HOME/.../caveman-statusline.sh"   ->   "<herd>""
+
+    That is a bash syntax error. The wrapper printed NOTHING, so the statusline
+    disappeared from every session at once, with no error anywhere to find."""
+    out, replaced = inst.rewire_wrapper(_CAVEMAN_WRAPPER)
+    assert replaced
+    assert 'CAVEMAN_SL="$HOME/.claude/plugins/marketplaces/caveman/hooks/caveman-statusline.sh"' in out
+    assert ".klawde" not in out and inst.statusline_cmd() in out
+    assert '""' not in out
+
+
+def test_rewritten_wrapper_is_valid_bash(tmp_path):
+    """The failure mode was a SYNTAX error, which no assertion about substrings
+    would have caught. Parse the result."""
+    out, _ = inst.rewire_wrapper(_CAVEMAN_WRAPPER)
+    p = tmp_path / "w.sh"
+    p.write_text(out)
+    r = subprocess.run(["bash", "-n", str(p)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_wrapper_rewrite_does_not_swallow_an_assignment_of_the_real_statusline():
+    """Even when the path IS a statusline.sh, only the path is the token — the
+    variable it is being assigned to is not part of it."""
+    out, _ = inst.rewire_wrapper('SL=$HOME/.klawde/statusline.sh\n')
+    assert out.startswith("SL=")
+    assert inst.statusline_cmd() in out
+
+
+def test_wrapper_rewrite_is_idempotent_on_the_composed_wrapper():
+    once, _ = inst.rewire_wrapper(_CAVEMAN_WRAPPER)
+    assert inst.rewire_wrapper(once)[0] == once
