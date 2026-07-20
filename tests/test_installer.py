@@ -196,6 +196,38 @@ def test_the_original_backup_is_never_overwritten(home):
     assert json.loads(orig.read_text()) == PRISTINE
 
 
+def test_atomic_write_preserves_the_executable_bit(tmp_path):
+    """os.replace swaps in a tmp file created at 0o666 & ~umask. Nothing carried the
+    destination's mode across, so rewiring custom-status-line.sh took it from 0755 to
+    0664 — Claude execs a non-executable file and the statusline vanishes with
+    nothing in any log. The wrapper is the file that has to survive this."""
+    wrapper = tmp_path / "custom-status-line.sh"
+    wrapper.write_text("#!/bin/bash\necho old\n")
+    wrapper.chmod(0o755)
+    inst._atomic_write(wrapper, "#!/bin/bash\necho new\n")
+    assert wrapper.read_text() == "#!/bin/bash\necho new\n"
+    assert wrapper.stat().st_mode & 0o777 == 0o755
+    assert os.access(wrapper, os.X_OK)
+
+
+def test_atomic_write_does_not_widen_a_private_settings_file(tmp_path):
+    """settings.json holds env vars and permission grants. A user who chmod 600'd it
+    meant it; the rewrite must not hand it to the group."""
+    s = tmp_path / "settings.json"
+    s.write_text("{}\n")
+    s.chmod(0o600)
+    inst._atomic_write(s, '{"a": 1}\n')
+    assert s.stat().st_mode & 0o777 == 0o600
+
+
+def test_atomic_write_creates_a_new_file_without_inventing_a_mode(tmp_path):
+    """No destination means no mode to preserve — the umask decides, as before. The
+    copymode path must not fault on a file that does not exist yet."""
+    fresh = tmp_path / "brand-new.json"
+    inst._atomic_write(fresh, "{}\n")
+    assert fresh.read_text() == "{}\n"
+
+
 def test_uninstall_migrates_a_legacy_double_install(home):
     """An install predating ORIGINAL_SUFFIX has no pristine snapshot — only
     timestamped backups. The OLDEST is the one install #1 took, i.e. pre-herd.

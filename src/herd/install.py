@@ -171,11 +171,22 @@ def _restore_source(path):
 def _atomic_write(path, text):
     """Write via tmp + rename in the same directory. settings.json is the one file
     whose truncation stops Claude Code from starting, and write_text() truncates in
-    place — a crash or ENOSPC mid-write leaves unparseable JSON."""
+    place — a crash or ENOSPC mid-write leaves unparseable JSON.
+
+    The REPLACEMENT INHERITS THE MODE OF WHAT IT REPLACES. os.replace swaps in a
+    file created by write_text(), i.e. 0o666 & ~umask, and the destination's own
+    mode is not carried across — so rewiring custom-status-line.sh dropped it from
+    0755 to 0664. Claude then execs a file it cannot execute and the statusline
+    silently disappears, which is the exact failure sync_hooks' chmod (+x, or the
+    hook is a silent no-op) and rewire_wrapper's parse check both exist to prevent;
+    this arrived by a third route. It also widened a 0600 settings.json — which
+    holds env vars and permission grants — to 0664."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + f".herd-tmp.{os.getpid()}")
     try:
         tmp.write_text(text)
+        if path.exists():
+            shutil.copymode(path, tmp)
         os.replace(tmp, path)
     finally:
         if tmp.exists():
