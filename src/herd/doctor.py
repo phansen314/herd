@@ -19,6 +19,7 @@ import sys
 
 from herd import MIN_PYTHON
 from herd import daemon
+from herd.db import missing_columns as _missing_columns
 from herd import settings as _settings
 
 OK, WARN, FAIL = "ok", "warn", "fail"
@@ -148,6 +149,18 @@ def check_db(path, connect_fn=None):
             out.append((FAIL, f"schema incomplete — no {', '.join(missing)}",
                         "tier-2 tables are missing; run: python3 -m herd.install"))
         else:
+            # COLUMNS, not just tables. A database created before a column was added
+            # has every table doctor checks for and still fails every statement
+            # naming that column — which the hooks log and exit 0 on, so the only
+            # symptom is metrics quietly going stale. install migrates these; saying
+            # so here is what turns "it just stopped working" into one command.
+            gaps = _missing_columns(c)
+            if gaps:
+                named = ", ".join(f"{t}.{col}" for t, cols in sorted(gaps.items())
+                                  for col, _ in cols)
+                out.append((FAIL, "schema is out of date", f"missing {named} — "
+                            "run: python3 -m herd.install"))
+        if "sessions" in tables and not missing:
             live = c.execute("SELECT COUNT(*) FROM sessions "
                              "WHERE stopped_at IS NULL").fetchone()[0]
             total = c.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]

@@ -130,6 +130,26 @@ exits nonzero, and leaves the file wired for you to unwire by hand.
 
 Your data survives either way: `~/.herd/herd.db` is never deleted.
 
+### Upgrading
+
+```bash
+cd ~/code/herd && git pull
+PYTHONPATH=src python3 -m herd.install
+```
+
+Re-running the installer **is** the upgrade: it refreshes the hook tree and
+migrates the database. Schema changes so far have all been new columns, and
+`CREATE TABLE IF NOT EXISTS` does nothing about those on a table that already
+exists — so the installer diffs your database against the shipped schema and adds
+what is missing, reporting each one. Anything it cannot add additively is reported
+as a failure at install time rather than becoming a write that fails on every tick
+afterwards.
+
+This matters because of how herd fails: a statement naming a column your database
+lacks fails, the hook logs it to `~/.herd/hook-errors.log` and exits 0 by design,
+and your metrics simply stop. `herd doctor` names the missing columns if you ever
+land in that state.
+
 ### kitty setup
 
 herd needs kitty's **remote control** to record *where* a session lives and to jump

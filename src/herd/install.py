@@ -28,7 +28,7 @@ import tempfile
 
 from herd import config as herd_config
 from herd import settings as _settings
-from herd.db import connect, apply_schema
+from herd.db import connect, apply_schema, migrate, missing_columns
 
 HOOKS_DIR = pathlib.Path(__file__).resolve().parent / "hooks"   # in the checkout
 SCHEMA_DIR = pathlib.Path(__file__).resolve().parent / "schema"
@@ -355,8 +355,26 @@ def hooks_are_current(hooks_dir=None):
 # ── DB bootstrap ───────────────────────────────────────────────────────────
 def bootstrap_db(dry=False):
     if dry:
-        return (f"would create {DB} and apply core.sql + herd.sql "
+        base = (f"would create {DB} and apply core.sql + herd.sql "
                 f"(+ templates dir, + {config_path()} if absent)")
+        # On an EXISTING database the interesting answer is what the upgrade would
+        # migrate — that is the whole point of asking before running it. Read-only:
+        # --dry-run must touch nothing.
+        if DB.exists():
+            try:
+                c = connect(str(DB), readonly=True)
+                try:
+                    gaps = missing_columns(c)
+                finally:
+                    c.close()
+            except Exception as e:                   # noqa: BLE001 — dry run never fails
+                return f"{base}\n  (could not inspect {DB} for pending migrations: {e})"
+            if gaps:
+                named = ", ".join(f"{t}.{col}" for t, cols in sorted(gaps.items())
+                                  for col, _ in cols)
+                return f"{base}\n  would migrate {DB}: add {named}"
+            return f"{base}\n  {DB} schema is current — nothing to migrate"
+        return base
     HERD_DIR.mkdir(parents=True, exist_ok=True)
     (HERD_DIR / "templates").mkdir(exist_ok=True)   # spawn presets (herd spawn -t)
     # NEVER overwritten: the user edits this. Written commented-out, so a fresh
@@ -367,8 +385,21 @@ def bootstrap_db(dry=False):
     # The ONE place allowed to bring the database into being — see db.connect.
     conn = connect(str(DB), create=True)
     apply_schema(conn)          # idempotent: CREATE TABLE IF NOT EXISTS
+    # ...which creates new TABLES and INDEXES on an existing database and silently
+    # does nothing about new COLUMNS. This is the upgrade path: without it, a user
+    # who installed before a column was added kept the old table forever, every
+    # statement naming that column failed, the hooks logged it and exited 0, and
+    # their metrics stopped with nothing saying why.
+    added, failed = migrate(conn)
     conn.close()
-    return f"bootstrapped {DB} + {HERD_DIR / 'templates'}/ + {cfg}"
+    note = ""
+    if added:
+        note += f"\n  migrated {DB}: added {', '.join(added)}"
+    for f in failed:
+        # Loud, and at install time. The alternative is a write that fails on every
+        # tick from here on, into a log nobody reads.
+        note += f"\n  MIGRATION FAILED — {f}"
+    return f"bootstrapped {DB} + {HERD_DIR / 'templates'}/ + {cfg}{note}"
 
 
 # ── daemon service (reaper + attention) ────────────────────────────────────

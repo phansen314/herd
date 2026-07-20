@@ -112,6 +112,27 @@ def test_a_tier1_only_db_is_not_reported_as_healthy(fresh, tmp_path):
     assert "herd_sessions" in _text(out) and "herd_attention" in _text(out)
 
 
+def test_a_db_missing_a_column_is_reported(fresh, tmp_path):
+    """Tables are not enough. A database created before a column was added has every
+    table doctor checks for, and still fails every statement naming that column —
+    which the hooks log and exit 0 on, so the only symptom is metrics quietly going
+    stale. Naming the column is what turns that into one command."""
+    import sqlite3
+    from helpers import CORE, HERD
+    core = CORE.replace("    api_duration_ms      INTEGER,\n", "")
+    assert core != CORE, "fixture is stale: api_duration_ms not in core.sql"
+    p = tmp_path / "old.db"
+    c = sqlite3.connect(p)
+    c.executescript(core)
+    c.executescript(HERD)
+    c.commit()
+    c.close()
+
+    out = doctor.check_db(str(p))
+    assert FAIL in _levels(out)
+    assert "api_duration_ms" in _text(out) and "herd.install" in _text(out)
+
+
 def test_required_tables_matches_the_schema(fresh):
     """REQUIRED_TABLES is hand-written, so pin it against what the schema actually
     creates — a new table must not be able to appear without this list noticing."""
