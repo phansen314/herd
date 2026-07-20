@@ -153,6 +153,13 @@ STRANDED_SECS = _int_env("HERD_STRANDED_SECS", 120)
 # The literal above is the default this overrides; both must stay in step.
 DAEMON_LOG_MAX = _int_env("HERD_DAEMON_LOG_MAX", DAEMON_LOG_MAX)
 
+# Ceiling for the retry backoff. A permanent fault — HERD_DB pointing at something
+# that is not a herd database, a full disk — used to retry at the normal 2s cadence
+# forever and log TWICE per tick (the failure, then "reconnected"): 86,400 journal
+# lines a day for a condition that will never resolve on its own. The daemon must
+# keep trying (a locked DB IS transient and recovers), just not at that price.
+BACKOFF_MAX_SECS = _int_env("HERD_BACKOFF_MAX_SECS", 60)
+
 # One tick's `ps` must not outlive the tick. Generous — a loaded box can be slow —
 # but finite, because a hung ps freezes the reaper while the process stays alive,
 # so systemd's Restart never fires.
@@ -571,6 +578,33 @@ def _drop(conn):
     return None
 
 
+def _backoff(fails, interval):
+    """How long to wait before the next tick, given consecutive failures.
+
+    fails <= 1 is the normal cadence on purpose: one bad tick is usually a held
+    write lock, which clears in milliseconds, and slowing down for it would make the
+    common case worse. Repeated failure is a fault that will not clear on its own —
+    retrying that every 2s logged 86,400 journal lines a day. Doubles, capped."""
+    if fails <= 1:
+        return interval
+    return min(interval * (2 ** min(fails - 1, 10)), BACKOFF_MAX_SECS)
+
+
+def _fault_hint(exc, db):
+    """Turn the two faults that are really configuration into the sentence that
+    fixes them. `no such table: sessions` repeated forever is technically accurate
+    and tells nobody that HERD_DB is pointing at the wrong file — which is now the
+    likely cause, since ~/.herd/config is where that gets set."""
+    msg = str(exc).lower()
+    if "no such table" in msg:
+        return (f"{db} is not a herd database (no schema) — check HERD_DB in "
+                f"~/.herd/config, or run: python3 -m herd.install")
+    if "unable to open database file" in msg:
+        return (f"cannot open {db} — check HERD_DB in ~/.herd/config, or run: "
+                f"python3 -m herd.install")
+    return None
+
+
 def run(interval=2.0, db_path=None, once=False, attend=None):
     """CORE reaper every tick; HERD attention tick only when enabled (attend, or
     HERD_ATTENTION when attend is None).
@@ -603,13 +637,13 @@ def run(interval=2.0, db_path=None, once=False, attend=None):
     conn = None
     swept = False                                     # boot sweep runs once, when we
     fails = 0                                         # first hold a usable connection
+    last_err = None                                   # dedupe the log line
     while True:
         now = _now_iso()
         try:
             if conn is None:
-                conn = connect(db)                    # RW: busy_timeout + WAL
-                if fails:
-                    _log("reconnected")
+                conn = connect(db)                    # RW: busy_timeout + WAL, no
+                                                      # create — see db.connect
             if not swept:
                 boot_sweep(conn, now, boot_time_iso())
                 # Right here, and not on every tick. boot_sweep just stopped every
@@ -634,14 +668,31 @@ def run(interval=2.0, db_path=None, once=False, attend=None):
             # is the unbounded growth W6e exists to prevent, in the one mode where
             # nothing else would ever clear them.
             sweep_dead_attention(conn)
+            # "recovered", and only on a tick that actually WORKED. This used to log
+            # "reconnected" as soon as a handle opened, which for a database that
+            # exists but has no schema is every single retry — so the fault printed
+            # twice per tick rather than once, and the word claimed a recovery that
+            # had not happened.
+            if fails:
+                _log(f"recovered after {fails} failed tick(s)")
             fails = 0
         except Exception as e:                        # noqa: BLE001 — a daemon outlives its errors
             fails += 1
-            _log(f"tick failed ({type(e).__name__}: {e}) — {fails} in a row, retrying")
+            msg = f"{type(e).__name__}: {e}"
+            # Say it when it CHANGES, and at the moments that matter (first, then
+            # thinning out), not 43,200 times a day. `fails` used to be incremented,
+            # printed, and never read for anything else.
+            if msg != last_err or fails in (1, 2, 3, 10, 30) or fails % 100 == 0:
+                hint = _fault_hint(e, db)
+                _log(f"tick failed ({msg}) — {fails} in a row, retrying"
+                     + (f". {hint}" if hint else ""))
+                last_err = msg
             conn = _drop(conn)                        # force a fresh handle next tick
         if once:
             return
-        time.sleep(interval)
+        # Back off on a REPEATED failure only. One bad tick is usually a held write
+        # lock, which clears in milliseconds; a hundred is a fault that will not.
+        time.sleep(_backoff(fails, interval))
 
 
 _FLAGS = {"--once", "--help", "-h"}

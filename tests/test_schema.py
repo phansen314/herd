@@ -67,7 +67,10 @@ def test_a_db_path_with_uri_metacharacters_opens_the_right_file(tmp_path):
     obscurely. Legal in a filename, so reachable via HERD_DB."""
     from herd.db import connect, apply_schema
     weird = tmp_path / "herd?v=2#tmp.db"
-    c = connect(str(weird)); apply_schema(c)
+    # create=True: connect() no longer conjures a missing database (that made a
+    # typo in HERD_DB an empty file and a permanent failure loop), so a test that
+    # brings one into existence has to say so, like the installer does.
+    c = connect(str(weird), create=True); apply_schema(c)
     c.execute("INSERT INTO sessions(session_id,cwd,status,started_at,updated_at) "
               "VALUES('s','/x','working','t','t')")
     c.close()

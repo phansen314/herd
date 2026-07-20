@@ -674,3 +674,62 @@ def test_orphan_sweep_ignores_files_that_are_not_ours(fresh, monkeypatch, tmp_pa
     # so counting entries measured the fixture as much as the behaviour.
     for n in ("herd-daemon.lock", "herd-rows-4321", "pulse-cookie", "herd-db-err.99"):
         assert (rt / n).exists(), f"{n} was swept"
+
+
+# ── a missing or schema-less database must not become a silent failure loop ──
+def test_connect_refuses_to_create_a_missing_database(tmp_path):
+    """A plain `file:` URI defaults to rwc, so a typo in HERD_DB was CREATED rather
+    than reported — and the daemon never applies the schema (that is the installer's
+    job), so the result was a 0-byte file, not even in WAL, and `no such table:
+    sessions` on every tick forever. Verified before the fix."""
+    from herd.db import connect
+    missing = tmp_path / "typo.db"
+    with pytest.raises(sqlite3.OperationalError):
+        connect(str(missing))
+    assert not missing.exists(), "connect() conjured the database it was asked about"
+
+
+def test_connect_creates_only_when_asked(tmp_path):
+    """The installer is the one caller allowed to bring a database into being."""
+    from herd.db import connect, apply_schema
+    p = tmp_path / "new.db"
+    c = connect(str(p), create=True)
+    apply_schema(c)
+    assert p.exists()
+    assert c.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    c.close()
+
+
+def test_a_schema_less_database_gets_an_actionable_message(tmp_path):
+    """`no such table: sessions`, repeated forever, is accurate and tells nobody
+    that HERD_DB points at the wrong file — the likely cause now that ~/.herd/config
+    is where it gets set."""
+    hint = daemon._fault_hint(sqlite3.OperationalError("no such table: sessions"),
+                              "/x/wrong.db")
+    assert "not a herd database" in hint and "/x/wrong.db" in hint
+    assert "herd.install" in hint
+
+
+def test_an_unopenable_database_gets_its_own_message(tmp_path):
+    hint = daemon._fault_hint(
+        sqlite3.OperationalError("unable to open database file"), "/x/gone.db")
+    assert "cannot open /x/gone.db" in hint
+
+
+def test_an_unrecognised_fault_gets_no_invented_hint():
+    """A locked DB is transient and normal. Attaching a config-error hint to it
+    would send the reader to the wrong place."""
+    assert daemon._fault_hint(sqlite3.OperationalError("database is locked"), "/x") is None
+
+
+@pytest.mark.parametrize("fails,expect", [(0, 2.0), (1, 2.0), (2, 4.0), (3, 8.0),
+                                          (6, 60.0), (50, 60.0)])
+def test_backoff_grows_then_caps(fails, expect):
+    """One bad tick is usually a held write lock, which clears in milliseconds — so
+    the FIRST failure must not slow anything down. A hundred is a fault that will
+    not clear, and retrying it every 2s cost 86,400 journal lines a day.
+
+    Calls daemon._backoff. The first version of this test recomputed the formula and
+    asserted it against itself, which would have passed against any implementation
+    at all — including none."""
+    assert daemon._backoff(fails, 2.0) == expect

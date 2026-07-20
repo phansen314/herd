@@ -260,7 +260,8 @@ def bootstrap_db(dry=False):
     cfg = config_path()
     if not cfg.exists():
         _atomic_write(cfg, herd_config.DEFAULT_TEXT)
-    conn = connect(str(DB))
+    # The ONE place allowed to bring the database into being — see db.connect.
+    conn = connect(str(DB), create=True)
     apply_schema(conn)          # idempotent: CREATE TABLE IF NOT EXISTS
     conn.close()
     return f"bootstrapped {DB} + {HERD_DIR / 'templates'}/ + {cfg}"
@@ -871,7 +872,7 @@ def selftest(hooks_dir=None):
     with tempfile.TemporaryDirectory(prefix="herd-selftest-") as tmp:
         env = dict(os.environ, HERD_DB=f"{tmp}/t.db", HERD_RUNTIME=tmp,
                    HERD_ERRLOG=f"{tmp}/err.log")
-        c = connect(f"{tmp}/t.db"); apply_schema(c); c.close()
+        c = connect(f"{tmp}/t.db", create=True); apply_schema(c); c.close()
 
         hd = hooks_dir or INSTALLED_HOOKS
         not_exec = [p.name for p in sorted(hd.glob("*.sh"))
@@ -894,7 +895,7 @@ def selftest(hooks_dir=None):
             # self-test now gates the write, this is the difference between
             # refusing to wire a hanging hook and wedging on it.
             return False, {"timed_out": e.cmd[0] if e.cmd else "?"}
-        c = connect(f"{tmp}/t.db")
+        c = connect(f"{tmp}/t.db", create=True)
         row = c.execute("SELECT status, context_percent FROM sessions "
                         "WHERE session_id=?", (SID,)).fetchone()
         c.close()

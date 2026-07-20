@@ -42,16 +42,24 @@ def load_statements():
     return out
 
 
-def connect(path, readonly=False):
+def connect(path, readonly=False, create=False):
     """Open a connection with herd's required pragmas. busy_timeout is NOT
     optional on ANY connection (incl. the bash hooks): WAL serialises writers, so
     without it a hook fails the moment the daemon/TUI holds the write lock, on
-    claude's tool loop where the user feels it."""
+    claude's tool loop where the user feels it.
+
+    create=False IS THE POINT. A plain `file:` URI defaults to rwc, so a path that
+    does not exist was silently CREATED — and the daemon does not apply the schema
+    (that is the installer's job), so a typo in HERD_DB produced an empty 0-byte
+    database, not even in WAL, and then `no such table: sessions` on every tick
+    forever. Verified. Only the installer may bring a database into being; everyone
+    else asking for a file that is not there is a mistake worth an error."""
     # The path goes into a URI, so `?` starts a query and `#` a fragment — an
     # unescaped HERD_DB containing either silently opened the WRONG file (or
     # failed obscurely). quote() leaves ordinary paths untouched.
     safe = urllib.parse.quote(str(path))
-    uri = f"file:{safe}?mode=ro" if readonly else f"file:{safe}"
+    mode = "ro" if readonly else ("rwc" if create else "rw")
+    uri = f"file:{safe}?mode={mode}"
     conn = sqlite3.connect(uri, uri=True, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=3000")

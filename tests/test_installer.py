@@ -773,7 +773,7 @@ def test_bin_herd_resolves_symlinks_without_readlink_f(tmp_path):
     # here is the symlink resolution in bin/herd, not the database.
     db = tmp_path / "herd.db"
     from herd.db import connect, apply_schema
-    conn = connect(str(db)); apply_schema(conn); conn.close()
+    conn = connect(str(db), create=True); apply_schema(conn); conn.close()
     env = dict(os.environ, HERD_DB=str(db))
     for entry in (inst.CLI_SRC, direct, chained):
         r = subprocess.run(["bash", str(entry), "ls"], capture_output=True,
