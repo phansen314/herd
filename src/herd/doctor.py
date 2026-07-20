@@ -302,6 +302,75 @@ def _pid_alive(pid):
         return False
 
 
+def check_config(environ, path=None, daemon_env=None):
+    """The config file, and whether the running daemon actually got it.
+
+    Two failures live here, and only the second is obvious. A malformed line is
+    reported by the parser. The quiet one is DIVERGENCE: the hooks are children of
+    your shell and the systemd daemon inherits nothing from it, so a key set in one
+    place and not the other is obeyed by half of herd. That is not hypothetical —
+    HERD_CLAUDE_NAME exported in .bashrc made the hooks store a pid the reaper then
+    read as recycled, stopping every live session on its first tick. Reading the
+    live daemon's /proc environ is the only way to state what it is REALLY running
+    with, rather than what this process happens to see."""
+    from herd import config as herd_config
+    out = []
+    values, problems = herd_config.load(path)
+    for msg in problems:
+        out.append((WARN, "config", msg))
+    if not values and not problems:
+        return out                              # no file, nothing to say
+
+    for key, val in sorted(values.items()):
+        cur = environ.get(key)
+        if cur is not None and cur != val:
+            out.append((WARN, f"{key} overridden by the environment",
+                        f"config says {val!r}, this process has {cur!r}"))
+        else:
+            out.append((OK, key, val))
+
+    # The daemon is the reader that CANNOT be checked from here by inference: it is
+    # a different process with a different environment. Ask it.
+    env = daemon_env if daemon_env is not None else _daemon_environ()
+    if env is None:
+        return out
+    for key, val in sorted(values.items()):
+        got = env.get(key)
+        if got is None:
+            out.append((FAIL, f"the running daemon does not have {key}",
+                        "restart it to pick up the config file "
+                        "(systemctl --user restart herd)"))
+        elif got != val:
+            out.append((WARN, f"the running daemon has a different {key}",
+                        f"config says {val!r}, the daemon has {got!r} — "
+                        "its unit or its shell set it"))
+    return out
+
+
+def _daemon_environ(lock_path=None, read=None):
+    """The live daemon's environment, or None when it cannot be read (not running,
+    not Linux, or a daemon owned by another user). Linux-only by design: /proc is
+    the only place a process's real environment is legible, and everywhere else
+    this check simply stays quiet rather than guessing."""
+    holder = None
+    try:
+        p = pathlib.Path(lock_path or daemon.lock_path())
+        holder = int(p.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    reader = read or (lambda pid: pathlib.Path(f"/proc/{pid}/environ").read_bytes())
+    try:
+        raw = reader(holder)
+    except OSError:
+        return None
+    env = {}
+    for chunk in raw.split(b"\0"):
+        if b"=" in chunk:
+            k, v = chunk.split(b"=", 1)
+            env[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
+    return env
+
+
 def check_env(environ):
     """A malformed threshold used to traceback every command; now it silently falls
     back to the default, so say which ones are being ignored."""
@@ -466,6 +535,7 @@ def collect(environ=None, settings_path=None):
                            install.INSTALLED_HOOKS, install.HOOKS_DIR)),
         ("kitty", _safe("kitty", check_kitty, environ)),
         ("daemon", _safe("daemon", check_daemon, daemon.lock_path())),
+        ("config", _safe("config", check_config, environ)),
         ("environment", _safe("environment", check_env, environ)),
         ("hook errors", _safe("hook error log", check_errlog, errlog)),
     ]
@@ -475,6 +545,11 @@ def report(sections, out=print):
     """Render, and return an exit code: nonzero when anything FAILed."""
     worst = OK
     for name, results in sections:
+        # A section with nothing to say prints nothing. "config" is empty in the
+        # common case (no file), and a bare header reads like a check that failed to
+        # run rather than one with no findings.
+        if not results:
+            continue
         out(f"\n  {name}")
         for level, headline, detail in results:
             out(f"    {_MARK[level]} {headline}" + (f"  —  {detail}" if detail else ""))

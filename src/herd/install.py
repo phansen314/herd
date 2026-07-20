@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 
+from herd import config as herd_config
 from herd.db import connect, apply_schema
 
 HOOKS_DIR = pathlib.Path(__file__).resolve().parent / "hooks"   # in the checkout
@@ -37,6 +38,18 @@ SETTINGS = HOME / ".claude" / "settings.json"
 WRAPPER = HOME / ".claude" / "custom-status-line.sh"
 HERD_DIR = HOME / ".herd"
 DB = HERD_DIR / "herd.db"
+
+
+def config_path():
+    """Settings the daemon and the hooks BOTH read — see config.py. NOT in the unit:
+    a unit file is not a thing anyone edits, and the hooks cannot read one.
+
+    A FUNCTION, not a module constant, so it follows a patched HERD_DIR. As a
+    constant it was bound at import to the real ~/.herd/config and the installer
+    tests wrote there for real — the hazard the `home` fixture already names for
+    INSTALLED_HOOKS ("unpatched, the suite writes to the real ~/.herd"). Deriving it
+    at call time means one patch covers it instead of one patch per path."""
+    return HERD_DIR / "config"
 
 # Where the hooks that actually RUN live, by default. Wiring settings.json at the
 # checkout makes every Claude session on the machine execute whatever is in the
@@ -236,13 +249,21 @@ def hooks_are_current(hooks_dir=None):
 # ── DB bootstrap ───────────────────────────────────────────────────────────
 def bootstrap_db(dry=False):
     if dry:
-        return f"would create {DB} and apply core.sql + herd.sql (+ templates dir)"
+        return (f"would create {DB} and apply core.sql + herd.sql "
+                f"(+ templates dir, + {config_path()} if absent)")
     HERD_DIR.mkdir(parents=True, exist_ok=True)
     (HERD_DIR / "templates").mkdir(exist_ok=True)   # spawn presets (herd spawn -t)
+    # NEVER overwritten. This is a file the user edits, and it is the only channel
+    # that reaches the daemon AND the hooks — clobbering it on a re-install would
+    # silently restore a default that the reaper acts on (see config.py on
+    # HERD_CLAUDE_NAME). Written commented-out, so a fresh file changes nothing.
+    cfg = config_path()
+    if not cfg.exists():
+        _atomic_write(cfg, herd_config.DEFAULT_TEXT)
     conn = connect(str(DB))
     apply_schema(conn)          # idempotent: CREATE TABLE IF NOT EXISTS
     conn.close()
-    return f"bootstrapped {DB} + {HERD_DIR / 'templates'}/"
+    return f"bootstrapped {DB} + {HERD_DIR / 'templates'}/ + {cfg}"
 
 
 # ── daemon service (reaper + attention) ────────────────────────────────────
@@ -299,7 +320,17 @@ def service_unit_text():
         "[Service]\n"
         "Type=simple\n"
         f"Environment=PYTHONPATH={PKG_SRC}\n"
-        f"Environment=HERD_DB={DB}\n"
+        # PYTHONPATH ONLY. The unit deliberately sets no herd setting, because a
+        # unit file is not a thing anyone edits and the hooks cannot read one — so
+        # anything named here is a value only half of herd can see, which is the
+        # divergence ~/.herd/config exists to end. HERD_DB used to be here and it
+        # WON over the file, making the one authoritative-looking setting silently
+        # not authoritative.
+        #
+        # Losing it costs nothing: daemon.DEFAULT_DB falls back to
+        # ~/.herd/herd.db, the same path this line named, and systemd --user does
+        # provide HOME (verified) so Path.home() resolves. To move the database,
+        # set HERD_DB in ~/.herd/config, where the hooks read it too.
         f"ExecStart={_service_python()} -m herd.daemon\n"
         # always, not on-failure: a clean exit still means nothing is reaping silent
         # deaths. StartLimitIntervalSec=0 disables the burst limit — a persistent

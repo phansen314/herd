@@ -58,7 +58,6 @@ def test_service_unit_is_well_formed():
     u = inst.service_unit_text()
     assert "-m herd.daemon" in u
     assert f"Environment=PYTHONPATH={inst.PKG_SRC}" in u
-    assert f"Environment=HERD_DB={inst.DB}" in u
     assert "WantedBy=default.target" in u
     assert inst.PKG_SRC.name == "src"
 
@@ -84,6 +83,21 @@ def test_service_unit_retries_forever():
     # applied and does nothing.
     assert _section(u, "Unit")["StartLimitIntervalSec"] == "0"
     assert "StartLimitIntervalSec" not in _section(u, "Service")
+
+
+def test_the_unit_sets_no_herd_settings():
+    """PYTHONPATH is not a herd setting; every HERD_* one belongs in ~/.herd/config.
+
+    A unit file is not a thing anyone edits and the hooks cannot read one, so a
+    setting named here reaches only the daemon — the divergence the config file
+    exists to end. HERD_DB was here, and because the environment wins over the
+    file, the file's HERD_DB was silently the losing copy."""
+    env = _section(inst.service_unit_text(), "Service")
+    herd_keys = [ln.split("=", 1)[1].split("=", 1)[0]
+                 for k, v in env.items() if k == "Environment"
+                 for ln in [f"{k}={v}"] if "HERD_" in v]
+    assert herd_keys == [], f"the unit sets herd settings: {herd_keys}"
+    assert "HERD_" not in inst.service_unit_text().split("[Service]", 1)[1]
 
 
 def test_cli_paths_resolve_and_completion_ships():
@@ -1154,3 +1168,32 @@ def test_is_managed_survives_a_whitespace_only_command():
     a hand-edited settings.json via _strip_managed."""
     assert inst._is_managed("   ") is False
     inst._strip_managed({"Stop": [{"hooks": [{"type": "command", "command": " "}]}]})
+
+
+def test_bootstrap_writes_the_config_inside_herd_dir_not_the_real_home(home):
+    """A path bound at IMPORT does not follow a patched HERD_DIR, so the suite wrote
+    to the developer's real ~/.herd/config — which actually happened, and is the
+    hazard this fixture already names for INSTALLED_HOOKS. Pin it: everything
+    bootstrap creates must land under the patched dir."""
+    inst.bootstrap_db()
+    assert (home / "config").exists()
+    assert inst.config_path() == home / "config"
+
+
+def test_bootstrap_never_overwrites_an_edited_config(home):
+    """The one file here the user edits, and the only channel that reaches both the
+    daemon and the hooks. Restoring a default on re-install would silently revert a
+    HERD_CLAUDE_NAME the reaper acts on."""
+    inst.bootstrap_db()
+    (home / "config").write_text("HERD_WAIT_SECS=90\n")
+    inst.bootstrap_db()
+    assert (home / "config").read_text() == "HERD_WAIT_SECS=90\n"
+
+
+def test_a_freshly_written_config_sets_nothing(home):
+    """Shipped fully commented out: installing herd must not change behaviour that
+    was not asked for."""
+    from herd import config as herd_config
+    inst.bootstrap_db()
+    values, problems = herd_config.load(home / "config")
+    assert values == {} and problems == []

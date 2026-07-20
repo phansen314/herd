@@ -5,6 +5,56 @@
 # schema/writes.sql and is NOT copied here (test_source_invariants.py forbids inline
 # DML; test_hooks.py guards bash/python drift).
 #
+# ── the config file (~/.herd/config), read BEFORE the defaults below ──────
+# The daemon and the hooks do not share an environment: these scripts are children
+# of your shell, the daemon is started by systemd and inherits nothing from it. A
+# setting that only reaches one of them is not a preference, it is a divergence —
+# HERD_CLAUDE_NAME exported in .bashrc made the hooks store a pid the reaper then
+# read as a recycled one, stopping every live session on its first tick. So both
+# sides read this file, by the same rules. herd/config.py is the python half;
+# test_source_invariants pins the two key lists together.
+#
+# NO FORKS. `read` is a builtin and the redirect costs no process, which matters on
+# the statusline path (~1/sec/session). Skipped entirely when there is no file.
+#
+# The environment WINS over the file — same precedence as config.py — so a test
+# that exports HERD_RUNTIME still redirects state, and a one-off override works.
+# `${!k+x}` is not used to test that: indirect expansion with a modifier is not
+# bash 3.2, and macOS ships 3.2. eval is safe here only because $k has already been
+# matched against the literal list below, never taken from the file as-is.
+herd_load_config() {
+    local f="${HERD_CONFIG:-$HOME/.herd/config}" line k v cur
+    [ -r "$f" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ""|"#"*) continue ;;
+            *"="*) ;;
+            *) continue ;;                  # no '=': config.py reports it, we skip
+        esac
+        k="${line%%=*}"; v="${line#*=}"
+        # trim surrounding whitespace, and the `export ` muscle memory invites
+        k="${k#"${k%%[! ]*}"}"; k="${k%"${k##*[! ]}"}"; k="${k#export }"
+        k="${k#"${k%%[! ]*}"}"
+        v="${v#"${v%%[! ]*}"}"; v="${v%"${v##*[! ]}"}"
+        case "$k" in
+            HERD_ATTENTION|HERD_WAIT_SECS|HERD_APPROVAL_SECS|HERD_STUCK_SECS|\
+            HERD_STRANDED_SECS|HERD_DAEMON_LOG_MAX|HERD_CLAUDE_NAME|HERD_RUNTIME|\
+            HERD_DB|HERD_TOOL_THROTTLE|HERD_ERRLOG|HERD_ERRLOG_MAX|HERD_TEMPLATES) ;;
+            *) continue ;;                  # unknown key: config.py names it
+        esac
+        # leading ~ only, matching config.py. eval assigns $v QUOTED below, so bash
+        # never expands it — and the shipped template shows ~/.herd/herd.db.
+        case "$v" in
+            "~") v="$HOME" ;;
+            "~/"*) v="$HOME/${v#\~/}" ;;
+        esac
+        eval "cur=\${$k+set}"
+        [ -n "$cur" ] && continue           # already in the environment: it wins
+        eval "$k=\$v"
+    done < "$f"
+}
+herd_load_config
+
 # Config is default-expansion (${X:-...}) ONLY, never unconditional assignment,
 # so tests can redirect state (HERD_RUNTIME earned this — see DESIGN.md).
 HERD_DB="${HERD_DB:-$HOME/.herd/herd.db}"

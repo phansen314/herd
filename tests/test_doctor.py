@@ -422,3 +422,59 @@ def test_attention_off_is_reported():
     r = doctor.check_env({"HERD_ATTENTION": "0"})
     assert _levels(r) == [WARN] and "core-only" in _text(r)
     assert _levels(doctor.check_env({"HERD_ATTENTION": "1"})) == [OK]   # the default
+
+
+# ── the config file, and whether the DAEMON actually got it ──────────────────
+def test_config_check_is_quiet_without_a_file(tmp_path):
+    assert doctor.check_config({}, tmp_path / "none") == []
+
+
+def test_config_check_reports_a_key_the_environment_overrides(tmp_path):
+    """Not an error — a one-off override is a feature, and the systemd unit setting
+    HERD_DB is normal. But never silent: the file says one thing and the process is
+    doing another, which is the whole class of bug the file replaced."""
+    p = tmp_path / "config"
+    p.write_text("HERD_WAIT_SECS=90\n")
+    out = doctor.check_config({"HERD_WAIT_SECS": "7"}, p, daemon_env={})
+    assert any(lvl == doctor.WARN and "overridden" in head for lvl, head, _ in out)
+
+
+def test_config_check_fails_when_the_running_daemon_lacks_the_key(tmp_path):
+    """THE check. The daemon is a different process with a different environment, so
+    inference from this one proves nothing — a config file edited but never picked
+    up looks identical to one being obeyed until you read /proc."""
+    p = tmp_path / "config"
+    p.write_text("HERD_CLAUDE_NAME=myclaude\n")
+    out = doctor.check_config({}, p, daemon_env={"HERD_DB": "/x"})
+    assert any(lvl == doctor.FAIL and "does not have HERD_CLAUDE_NAME" in head
+               for lvl, head, _ in out)
+
+
+def test_config_check_warns_when_the_daemon_disagrees(tmp_path):
+    p = tmp_path / "config"
+    p.write_text("HERD_CLAUDE_NAME=myclaude\n")
+    out = doctor.check_config({}, p, daemon_env={"HERD_CLAUDE_NAME": "claude"})
+    assert any(lvl == doctor.WARN and "different HERD_CLAUDE_NAME" in head
+               for lvl, head, _ in out)
+
+
+def test_config_check_passes_when_daemon_and_file_agree(tmp_path):
+    p = tmp_path / "config"
+    p.write_text("HERD_WAIT_SECS=90\n")
+    out = doctor.check_config({}, p, daemon_env={"HERD_WAIT_SECS": "90"})
+    assert [lvl for lvl, _, _ in out] == [doctor.OK]
+
+
+def test_daemon_environ_is_none_when_nothing_holds_the_lock(tmp_path):
+    """Not running, not Linux, or another user's daemon: the check stays quiet
+    rather than guessing. A doctor that invents findings is worse than one that
+    admits it cannot see."""
+    assert doctor._daemon_environ(lock_path=tmp_path / "no-lock") is None
+
+
+def test_daemon_environ_parses_proc_environ(tmp_path):
+    lock = tmp_path / "lock"
+    lock.write_text("4242\n")
+    env = doctor._daemon_environ(lock_path=lock,
+                                read=lambda pid: b"HERD_DB=/x\x00HERD_WAIT_SECS=90\x00")
+    assert env == {"HERD_DB": "/x", "HERD_WAIT_SECS": "90"}

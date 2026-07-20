@@ -336,7 +336,20 @@ Claude's activity clock. If you look and then answer nothing, the same timer run
 again from the moment you jumped and it speaks up once more — so an ack is a snooze,
 not a dismissal. See [DESIGN.md#ack](DESIGN.md#ack).
 
-**Tuning the attention rule** (env vars, defaults shown):
+**Tuning the attention rule.** Settings live in `~/.herd/config` (`KEY=value`, `#`
+comments), which the installer creates fully commented out. **Put them there, not in
+your shell.** The hooks are children of your shell and see what you export; the
+daemon is started by `systemctl --user` and inherits *nothing* from it, so a setting
+exported in `.bashrc` reaches half of herd. For `HERD_CLAUDE_NAME` that half-reach is
+destructive: the hooks record a pid the reaper then reads as recycled, and every live
+session is stopped on the daemon's next tick.
+
+An environment variable still wins over the file, for one-off overrides. `herd doctor`
+reads the running daemon's own environment and reports any key the file sets that the
+daemon did not actually get — restart the daemon after editing:
+`systemctl --user restart herd`.
+
+Defaults shown:
 
 | var | default | meaning |
 |---|---|---|
@@ -347,7 +360,7 @@ not a dismissal. See [DESIGN.md#ack](DESIGN.md#ack).
 | `HERD_STRANDED_SECS` | `120` | grace before a spawn reservation whose session never started is dropped |
 | `HERD_DB` | `~/.herd/herd.db` | database path |
 
-Read by the hooks and CLI rather than the daemon:
+Also read from the same file, by the hooks and CLI:
 
 | var | default | meaning |
 |---|---|---|

@@ -223,3 +223,31 @@ def test_every_statement_is_documented():
     design = (ROOT / "DESIGN.md").read_text()
     missing = sorted(n for n in W if n not in design)
     assert not missing, f"statements absent from DESIGN.md: {missing}"
+
+
+def test_config_keys_match_between_python_and_bash():
+    """~/.herd/config is the ONE channel that reaches both the daemon and the hooks,
+    and each parses it independently — config.py in python, herd_load_config in
+    common.sh. A key that only one side accepts is exactly the divergence the file
+    was written to end: it would be obeyed by the hooks and ignored by the reaper
+    (or the reverse), which is how HERD_CLAUDE_NAME in .bashrc made the daemon reap
+    every live session. Pin the two lists to each other."""
+    from herd import config as herd_config
+    src = (HOOKS / "common.sh").read_text()
+    body = src.split("herd_load_config()", 1)[1].split("herd_load_config\n", 1)[0]
+    # the whitelist `case` arm: HERD_* tokens between the case and its `) ;;`
+    bash_keys = set(re.findall(r"\bHERD_[A-Z_]+\b", body.split("case \"$k\" in", 1)[1]
+                                                        .split(") ;;", 1)[0]))
+    assert bash_keys == set(herd_config.KNOWN), (
+        f"only in bash: {sorted(bash_keys - set(herd_config.KNOWN))}; "
+        f"only in python: {sorted(set(herd_config.KNOWN) - bash_keys)}")
+
+
+def test_the_config_template_only_documents_real_keys():
+    """Every KEY= in the shipped default must be one herd actually reads. A commented
+    example naming a key that does nothing is worse than no example — it is a
+    documented no-op, which is the bug this file replaced."""
+    from herd import config as herd_config
+    named = set(re.findall(r"^#?(HERD_[A-Z_]+)=", herd_config.DEFAULT_TEXT, re.M))
+    assert named <= set(herd_config.KNOWN), \
+        f"template names unknown keys: {sorted(named - set(herd_config.KNOWN))}"

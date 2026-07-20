@@ -22,9 +22,21 @@ import subprocess
 import sys
 import time
 
+from herd import config as _config
 from herd.db import connect, load_statements
 
 W = load_statements()
+
+# BEFORE the constants below, which are read at import — a config file applied
+# after them would parse fine and change nothing, the silent no-op this file is
+# meant to end. cli.py imports this module, so every python entry point gets the
+# same settings from the same place the hooks read.
+#
+# Kept as module state rather than logged here: _log is not defined yet at this
+# point in the file, and a daemon that printed a config summary on every `herd ls`
+# would be noise. run() reports it once at startup; `herd doctor` reports it on
+# demand.
+CONFIG_APPLIED, CONFIG_SHADOWED, CONFIG_PROBLEMS = _config.apply()
 
 
 def _now_iso():
@@ -514,6 +526,15 @@ def run(interval=2.0, db_path=None, once=False, attend=None):
     """
     if attend is None:
         attend = _attention_enabled()
+    # Say what the config file did, ONCE, where a wrong threshold is actionable. A
+    # shadowed key is the interesting line: the file says one thing and this process
+    # is doing another, which used to be invisible.
+    for key, val in sorted(CONFIG_APPLIED.items()):
+        _log(f"config: {key}={val}")
+    for key, (want, got) in sorted(CONFIG_SHADOWED.items()):
+        _log(f"config: {key}={want} IGNORED — the environment sets {key}={got}")
+    for msg in CONFIG_PROBLEMS:
+        _log(f"config: {msg}")
     db = db_path or DEFAULT_DB
     conn = None
     swept = False                                     # boot sweep runs once, when we
