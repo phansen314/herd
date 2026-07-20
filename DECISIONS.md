@@ -8,13 +8,50 @@ Read this when you're about to "simplify" something and want to know whether
 someone already did and reverted it. Each entry ends with **Protects:** — the
 current behaviour that would break if the decision were undone.
 
-**By topic:** [the pager](#pager) · [attention/ack](#ack) · [reaper robustness](#ps-floor) ·
+**By topic:** [env divergence](#env-divergence) · [the pager](#pager) · [attention/ack](#ack) · [reaper robustness](#ps-floor) ·
 [spawn TOCTOU](#toctou) · [the events table](#events) · [statement
 transcription](#transcription) · [ctrl-q](#expect) · [the poker](#poker) · [rows handoff](#rows-handoff) · [launchd log](#launchd-log) ·
 [pid ancestry](#spike1) · [the `live` column](#live-column) · [two clocks](#clocks) ·
 [HERD_RUNTIME](#runtime) · [awk vs bash](#awk) · [kitty match semantics](#kitty-match)
 
 ---
+
+## 2026-07-19 — A setting that reaches one half is a divergence {#env-divergence}
+
+The environment is not a shared channel between herd's parts. The hooks are
+descendants of your shell and see everything you export; `systemctl --user` starts
+the daemon with none of it — the unit names `PYTHONPATH` and nothing else, and its
+real environment (verified via /proc) holds essentially nothing herd-shaped. So
+every threshold README documents was silently ignored when exported, and two were
+worse than ignored:
+
+  `HERD_CLAUDE_NAME`  exported in `.bashrc`, the hooks saw it and stored a pid for
+                      a process named e.g. `myclaude`. The daemon did not, compared
+                      comm against its own default `claude`, read the mismatch as a
+                      recycled pid, and reaped **every live session on its first
+                      tick**. Verified, not theorised.
+
+  `HERD_RUNTIME`      set in a shell, `lock_path()` resolves under it, so a
+                      hand-started daemon took a DIFFERENT lock file and ran
+                      alongside the systemd one — the duplicate the flock exists to
+                      prevent.
+
+Both are silent. Neither half can detect that the other resolved a different value,
+which is why this is a written decision rather than a runtime check.
+
+**Decided:** `~/.herd/config` is the only channel that reaches both halves, and
+both parse it by the same rules — `config.parse` and `herd_load_config`, pinned by
+`test_source_invariants` (key lists) and
+`test_bash_and_python_strip_inline_comments_the_same_way` (parsing). Documenting a
+knob in README or a docstring is not enough; it must be in `config.KNOWN` and
+`common.sh`'s case list, or it is settable only where it does harm.
+
+**Protects:** the invariant that every `HERD_*` key either half reads appears in
+both key lists. **Currently violated:** `daemon.py` reads `HERD_BACKOFF_MAX_SECS`
+and `HERD_ORPHAN_GRACE_SECS`, neither of which is in `config.KNOWN` — so they are
+unsettable through the only channel the daemon reads, and `herd doctor` reports the
+correct spelling as an unknown-key typo. Fixing that is a separate change; this
+entry is what makes the gap visible.
 
 ## 2026-07-18 — No Claude-invoked pager; the escalation stub is deleted {#pager}
 

@@ -13,6 +13,8 @@
 # The daemon (systemd, empty env) and the hooks (children of your shell) share no
 # environment, so both read this file by the same rules. herd/config.py is the
 # python half; test_source_invariants pins the two key lists together.
+# A key that reaches only one half is silent and costs live sessions:
+# DECISIONS.md#env-divergence.
 #
 # The environment WINS over the file — same precedence as config.py. `${!k+x}` is
 # not used to test that: indirect expansion with a modifier is not bash 3.2. eval is

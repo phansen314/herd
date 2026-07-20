@@ -5,7 +5,7 @@
 The environment is not a shared channel between herd's parts: the hooks descend
 from your shell, while `systemctl --user` starts the daemon with nothing from it.
 A setting that reaches only one side is a divergence, not a preference — see
-DECISIONS.md for the two that cost real sessions.
+DECISIONS.md#env-divergence for the two that cost real sessions.
 
 common.sh parses this file with the same rules; test_source_invariants pins the
 two key lists together.
