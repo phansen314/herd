@@ -28,20 +28,20 @@ def test_reaper_reaps_dead_keeps_live(fresh):
     r = _live(c, "recycled", 5002)
     ok = _live(c, "alive", 5003)
     procs = {5001: ("Z", "claude"), 5002: ("S", "bash"), 5003: ("S", "claude")}  # 5000 absent
-    assert reap_once(c, procs, T2) == 3
+    assert reap_once(c, procs, T2, recheck=lambda: procs) == 3
     assert stopped_at(c, a) and stopped_at(c, z) and stopped_at(c, r) and stopped_at(c, ok) is None
 
 
 def test_reaper_skips_null_pid(fresh):
     c = fresh()
     k = mk_session(c, session_id="nopid")
-    assert reap_once(c, {}, T2) == 0 and stopped_at(c, k) is None
+    assert reap_once(c, {}, T2, recheck=dict) == 0 and stopped_at(c, k) is None
 
 
 def test_reap_provenance_and_no_clock_move(fresh):
     c = fresh()
     d = _live(c, "dead", 5010)
-    reap_once(c, {}, T2)
+    reap_once(c, {}, T2, recheck=dict)
     row = c.execute("SELECT status,status_source,stopped_at,last_event_at FROM sessions WHERE id=?", (d,)).fetchone()
     assert (row["status"], row["status_source"], row["stopped_at"], row["last_event_at"]) == \
         ("stopped", "pid", T2, T0)
@@ -50,8 +50,8 @@ def test_reap_provenance_and_no_clock_move(fresh):
 def test_reaper_is_idempotent(fresh):
     c = fresh()
     _live(c, "dead", 5010)
-    reap_once(c, {}, T2)
-    assert reap_once(c, {}, T2) == 0
+    reap_once(c, {}, T2, recheck=dict)
+    assert reap_once(c, {}, T2, recheck=dict) == 0
 
 
 def test_boot_sweep_reaps_preboot_spares_postboot(fresh):
@@ -127,7 +127,7 @@ def test_broken_ps_reaps_nothing(fresh, monkeypatch):
     procs = read_proc_table()
     assert procs is None
     if procs is not None:                     # mirrors run()'s guard
-        reap_once(c, procs, T2)
+        reap_once(c, procs, T2, recheck=lambda: procs)
     assert stopped_at(c, k) is None
 
 
@@ -315,6 +315,69 @@ def test_reap_does_not_fire_when_the_pid_changed_since_the_select(fresh):
     assert c.execute(W["W3d_reap"], {"pk": pk, "now": T2, "pid": 7777}).rowcount == 1
 
 
+def test_a_session_born_after_the_proc_snapshot_is_not_reaped(fresh):
+    """The proc table is read BEFORE reap_once's SELECT, so a SessionStart landing
+    between the two reads is absent from the snapshot through no fault of its own.
+    _dead() reads absence as death, and the reap is permanent: W4_event carries
+    `AND stopped_at IS NULL`, so no later tool call heals it and R1_list hides it
+    for the rest of the session's life. The second snapshot is what tells a newborn
+    apart from a corpse — a live process must appear in a table read after it
+    started."""
+    c = fresh()
+    newborn = _live(c, "newborn", 5100)
+    # snapshot #1 predates the session entirely; snapshot #2 sees it alive
+    assert reap_once(c, {}, T2, recheck=lambda: {5100: ("S", "claude")}) == 0
+    assert stopped_at(c, newborn) is None
+
+
+def test_a_pid_absent_from_both_snapshots_is_still_reaped(fresh):
+    """The other direction: confirming against a second table must not cost us the
+    reap this daemon exists for. kill -9 leaves the pid absent from both."""
+    c = fresh()
+    dead = _live(c, "corpse", 5101)
+    assert reap_once(c, {}, T2, recheck=dict) == 1
+    assert stopped_at(c, dead) is not None
+
+
+def test_recheck_reapplies_dead_not_bare_membership(fresh):
+    """A pid that REAPPEARS in the second snapshot is not automatically alive: a
+    zombie passes kill -0 and a recycled pid runs someone else's program. Presence
+    is where those two signals live, so the confirmation runs _dead again rather
+    than testing membership."""
+    c = fresh()
+    z = _live(c, "zombie-again", 5102)
+    r = _live(c, "recycled-again", 5103)
+    back = {5102: ("Z", "claude"), 5103: ("S", "bash")}
+    assert reap_once(c, {}, T2, recheck=lambda: back) == 2
+    assert stopped_at(c, z) is not None and stopped_at(c, r) is not None
+
+
+def test_an_untrustworthy_recheck_reaps_nothing(fresh):
+    """read_proc_table returns None — not {} — when ps cannot be trusted, because
+    absence-means-death turns an empty table into a total wipe. The confirmation
+    inherits that contract: a failed re-check skips the tick."""
+    c = fresh()
+    a = _live(c, "a", 5104)
+    b = _live(c, "b", 5105)
+    assert reap_once(c, {}, T2, recheck=lambda: None) == 0
+    assert stopped_at(c, a) is None and stopped_at(c, b) is None
+
+
+def test_recheck_is_not_forked_when_nothing_looks_dead(fresh):
+    """Steady state is zero candidates, and the second ps is ~20ms of fork on a 2s
+    tick. It must stay lazy."""
+    c = fresh()
+    _live(c, "alive", 5106)
+    calls = []
+
+    def counting():
+        calls.append(1)
+        return {}
+
+    assert reap_once(c, {5106: ("S", "claude")}, T2, recheck=counting) == 0
+    assert calls == []
+
+
 @pytest.mark.parametrize("raw,expect", [("-60", 120), ("-1", 120), ("0", 0), ("45", 45),
                                         ("fast", 120), ("", 120)])
 def test_int_env_rejects_negatives(monkeypatch, raw, expect):
@@ -489,7 +552,7 @@ def test_reaping_removes_the_per_session_runtime_files(fresh, tmp_path, monkeypa
     pk = mk_session(c, session_id="dead-1", pid=4242, status="working")
     for n in ("herd-tool-dead-1", "herd-stline-dead-1"):
         (tmp_path / n).write_text("x")
-    assert reap_once(c, {}, T1) == 1                      # pid absent -> dead
+    assert reap_once(c, {}, T1, recheck=dict) == 1                      # pid absent -> dead
     assert not list(tmp_path.glob("herd-*-dead-1"))
 
 
@@ -509,7 +572,7 @@ def test_a_session_that_resumed_keeps_its_runtime_files(fresh, tmp_path, monkeyp
         return True
 
     monkeypatch.setattr(daemon, "_dead", resume_mid_tick)
-    assert reap_once(c, {}, T1) == 0                      # judged pid no longer held
+    assert reap_once(c, {}, T1, recheck=dict) == 0                      # judged pid no longer held
     assert (tmp_path / "herd-stline-alive-1").exists()
 
 

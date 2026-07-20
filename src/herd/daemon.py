@@ -270,16 +270,39 @@ def sweep_runtime_files(session_id):
     return gone
 
 
-def reap_once(conn, procs, now):
+def reap_once(conn, procs, now, recheck=read_proc_table):
     """One reap tick over live, pid-bearing sessions. pid-NULL rows are skipped
-    (liveness unknowable; clean death arrives via SessionEnd). Returns count."""
+    (liveness unknowable; clean death arrives via SessionEnd). Returns count.
+
+    `procs` is read BEFORE this SELECT, so absence from it is ambiguous: the pid
+    died, OR its SessionStart landed between the two reads and it was never in the
+    snapshot to begin with. _dead() reads absence as death, so the newborn case was
+    a reap — and a permanent one, because W4_event carries `AND stopped_at IS NULL`
+    and only a fresh SessionStart (W2b_insert) clears it. A session running fine in
+    its terminal went invisible to R1_list for the rest of its life. Re-asserting
+    the pid in W3d_reap does not help: the pid we judged IS the newborn's own.
+
+    So a candidate is confirmed against a SECOND snapshot taken after the SELECT. A
+    process born before the SELECT is alive now and must appear in it; one that died
+    before the first snapshot is absent from both. Only absence from both is death.
+    The re-check is lazy — most ticks have no candidate and fork nothing."""
     reaped = 0
     rows = conn.execute(
         "SELECT id, pid, session_id FROM sessions "
         "WHERE stopped_at IS NULL AND pid IS NOT NULL"
     ).fetchall()
-    for r in rows:
-        if _dead(r["pid"], procs):
+    candidates = [r for r in rows if _dead(r["pid"], procs)]
+    if not candidates:
+        return 0
+    confirm = recheck()
+    if confirm is None:
+        return 0            # untrustworthy ps: skip the tick, exactly as run() does
+                            # on the first snapshot. Treating a failed re-check as
+                            # "confirmed absent" would reap every session at once.
+    for r in candidates:
+        # _dead again, not bare membership: a pid that reappears as a zombie or as a
+        # recycled non-claude is still dead, and those signals only exist on presence.
+        if _dead(r["pid"], confirm):
             # Pass the pid we JUDGED, not the row's current one — W3d_reap re-asserts
             # it, so a resume that landed since the SELECT is a 0-row no-op instead of
             # a live session reaped on evidence about a pid it no longer holds.
