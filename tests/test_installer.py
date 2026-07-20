@@ -1373,3 +1373,85 @@ def test_uninstall_refuses_to_delete_the_checkout(home, monkeypatch, tmp_path):
     assert (fake / "common.sh").exists(), "uninstall deleted the checkout"
     assert (fake_schema / "writes.sql").exists(), "uninstall deleted the checkout schema"
     assert "LEFT" in out and "--dev" in out, out
+
+
+def test_the_atomic_write_fsyncs_before_it_renames(home, monkeypatch):
+    """tmp+rename orders the NAME, not the DATA: os.replace can reach disk before
+    the bytes it points at, leaving a settings.json that is present, correctly named
+    and zero-length — the same unparseable-settings failure _atomic_write exists to
+    prevent, by the one route tmp+rename does not cover.
+
+    Asserts the ORDER, not merely that fsync was called: a flush after the rename
+    would satisfy a call-count check and still leave the window open."""
+    calls = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: (calls.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(os, "replace", lambda a, b: (calls.append("replace"), real_replace(a, b))[1])
+
+    target = home / "sub" / "thing.json"
+    inst._atomic_write(target, '{"a": 1}')
+
+    assert target.read_text() == '{"a": 1}'
+    assert "fsync" in calls, "the data was never flushed to disk"
+    assert calls.index("fsync") < calls.index("replace"), \
+        f"renamed before the data was durable: {calls}"
+
+
+def test_a_settings_file_that_turns_into_a_json_array_mid_install(home, monkeypatch):
+    """The re-read merge caught OSError and JSONDecodeError but not a non-object.
+    _offer_bell blocks on input(), so the file can change shape in that window, and
+    `fresh[k] = ...` on a list raises TypeError AFTER sync_hooks() promoted the new
+    hooks — leaving them live, settings.json never rewritten, and a traceback where
+    the summary should be. The first read was already guarded; this one was not."""
+    def rewrite_as_array(_settings_arg):
+        inst.SETTINGS.write_text('["not", "an", "object"]')
+        return "bell stubbed"
+    monkeypatch.setattr(inst, "_offer_bell", rewrite_as_array)
+
+    inst.install()          # must not raise
+
+    data = json.loads(inst.SETTINGS.read_text())
+    assert isinstance(data, dict), "install left settings.json a non-object"
+    assert _wired(data), "install did not wire the hooks it had already promoted"
+
+
+def test_a_hook_the_checkout_dropped_is_removed_on_reinstall(home):
+    """The copy only walked src->dst, so a renamed or deleted hook stayed in
+    ~/.herd/hooks forever — still executable, still wired if settings.json named it
+    — and hooks_are_current() said "current" because it walks src->dst too."""
+    inst.install()
+    stale = inst.INSTALLED_HOOKS / "retired_hook.sh"
+    stale.write_text("#!/bin/bash\n# removed from the checkout two releases ago\n")
+    stale_sql = inst.INSTALLED_SCHEMA / "retired.sql"
+    stale_sql.write_text("-- gone\n")
+    assert not inst.hooks_are_current(), "a dropped file still read as current"
+
+    inst.install()
+
+    assert not stale.exists(), "the dropped hook survived a reinstall"
+    assert not stale_sql.exists(), "the dropped SQL survived a reinstall"
+    assert inst.hooks_are_current()
+
+
+def test_the_copy_keeps_a_file_that_is_not_ours(home):
+    """Pruning removes OUR extensions that the checkout dropped. Anything else in
+    that directory belongs to someone else and is not the installer's to delete."""
+    inst.install()
+    theirs = inst.INSTALLED_HOOKS / "notes.txt"
+    theirs.write_text("mine")
+    inst.install()
+    assert theirs.exists(), "the installer deleted a file herd never wrote"
+
+
+def test_hooks_are_current_checks_sql_beside_the_hooks_it_was_given(home, tmp_path):
+    """.sh was checked against the hooks_dir argument and .sql against the module
+    global, so a non-default caller compared two different installs. The schema dir
+    is the hooks dir's SIBLING — the same rule common.sh resolves at runtime and
+    _copy_hook_tree writes by."""
+    alt = tmp_path / "elsewhere"
+    inst._copy_hook_tree(alt / "hooks", alt / "schema")
+    assert inst.hooks_are_current(alt / "hooks"), "a complete sibling pair read as stale"
+
+    (alt / "schema" / "writes.sql").write_text("-- drifted\n")
+    assert not inst.hooks_are_current(alt / "hooks"), \
+        "drift in the sibling schema was checked against ~/.herd/schema instead"

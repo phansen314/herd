@@ -64,9 +64,13 @@ COMPLETION_SRC = REPO / "completions" / "herd.bash"
 COMPLETION_LINK = HOME / ".local" / "share" / "bash-completion" / "completions" / "herd"
 
 # Defined in settings.py, which doctor reads too. Re-exported: tests and the rest
-# of this module address them here.
+# of this module address it here.
+#
+# OUR_SCRIPTS is deliberately NOT re-exported. It was, twice — once as this alias and
+# again as a recomputed literal below — and both were dead, which is how the second
+# survived a59598b ("one definition of what herd owns"). settings.is_managed is the
+# only reader; anything needing the set should import it from settings.
 HERD_HOOKS = _settings.HERD_HOOKS
-_OUR_SCRIPTS = _settings.OUR_SCRIPTS
 
 STATUSLINE = str(INSTALLED_HOOKS / "statusline.sh")
 
@@ -76,8 +80,6 @@ SYSTEMCTL_TIMEOUT = 15
 LAUNCHCTL_TIMEOUT = 15
 # A wired hook that hangs would hang the self-test that exists to vet it.
 SELFTEST_TIMEOUT = 20
-
-_OUR_SCRIPTS = {s for s, _ in HERD_HOOKS.values()} | {"statusline.sh", "common.sh"}
 
 
 def hook_cmd(script, hooks_dir=None):
@@ -168,14 +170,33 @@ def _atomic_write(path, text):
     The REPLACEMENT INHERITS THE MODE OF WHAT IT REPLACES (the copymode below):
     os.replace does not carry it across, so without that a 0755 wrapper becomes
     0664 — Claude execs a file it cannot execute and the statusline silently
-    vanishes — and a 0600 settings.json widens to 0664."""
+    vanishes — and a 0600 settings.json widens to 0664.
+
+    FSYNCED BEFORE THE RENAME. tmp+rename alone orders nothing: os.replace can reach
+    the disk before the data it points at, so a crash or power loss in that window
+    leaves a settings.json that is present, correctly named — and zero-length. That
+    is the same unparseable-settings failure this function exists to prevent,
+    arriving by the one route tmp+rename does not cover."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + f".herd-tmp.{os.getpid()}")
     try:
-        tmp.write_text(text)
+        with open(tmp, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
         if path.exists():
             shutil.copymode(path, tmp)
         os.replace(tmp, path)
+        # The rename itself is a directory operation and needs its own barrier.
+        try:
+            dfd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass                    # not fsyncable (some filesystems): data is safe
+
     finally:
         if tmp.exists():
             tmp.unlink()
@@ -187,9 +208,23 @@ def _copy_hook_tree(hooks_dst, schema_dst):
 
     The two must always be SIBLINGS: common.sh resolves HERD_WRITES as
     <hooks>/../schema/writes.sql, so hooks installed without their schema fail every
-    write with "no such statement" while still exiting 0."""
+    write with "no such statement" while still exiting 0.
+
+    PRUNES what the checkout no longer has. The copy only ever walked src->dst, so a
+    renamed or deleted hook stayed in ~/.herd/hooks forever — still executable, still
+    wired if settings.json named it — and hooks_are_current() reported "current"
+    because it walks src->dst too. Only OUR extensions are removed, and only when
+    the source no longer has them; a foreign file in there is not ours to delete."""
     hooks_dst.mkdir(parents=True, exist_ok=True)
     schema_dst.mkdir(parents=True, exist_ok=True)
+    for src_dir, dst_dir, pattern in ((HOOKS_DIR, hooks_dst, "*.sh"),
+                                      (SCHEMA_DIR, schema_dst, "*.sql")):
+        if dst_dir.resolve() == src_dir.resolve():
+            continue                            # copying the checkout onto itself
+        keep = {f.name for f in src_dir.glob(pattern)}
+        for stale in sorted(dst_dir.glob(pattern)):
+            if stale.name not in keep:
+                stale.unlink()
     for src in sorted(HOOKS_DIR.glob("*.sh")):
         dst = hooks_dst / src.name
         shutil.copy2(src, dst)
@@ -218,18 +253,30 @@ def sync_hooks(dev=False, dry=False):
 
 def hooks_are_current(hooks_dir=None):
     """Do the installed copies match the checkout? False means the tree moved on
-    without a re-install — what `herd doctor` reports."""
+    without a re-install — what `herd doctor` reports.
+
+    The schema dir follows the hooks dir as its SIBLING, which is the same rule
+    common.sh resolves at runtime (<hooks>/../schema/writes.sql) and the one
+    _copy_hook_tree writes by. Reading it from the module global instead meant a
+    caller passing a non-default hooks_dir got its .sh checked against that
+    directory and its .sql against ~/.herd/schema — two different installs.
+
+    Also catches a file the checkout has DROPPED: _copy_hook_tree prunes those now,
+    so a leftover means the tree was installed by an older herd."""
     hooks_dir = hooks_dir or INSTALLED_HOOKS
     if hooks_dir == HOOKS_DIR:
         return True                              # --dev: the checkout IS the copy
-    for src in sorted(HOOKS_DIR.glob("*.sh")):
-        dst = hooks_dir / src.name
-        if not dst.exists() or dst.read_bytes() != src.read_bytes():
-            return False
-    for src in sorted(SCHEMA_DIR.glob("*.sql")):
-        dst = INSTALLED_SCHEMA / src.name
-        if not dst.exists() or dst.read_bytes() != src.read_bytes():
-            return False
+    schema_dir = (INSTALLED_SCHEMA if hooks_dir == INSTALLED_HOOKS
+                  else hooks_dir.parent / "schema")
+    for src_dir, dst_dir, pattern in ((HOOKS_DIR, hooks_dir, "*.sh"),
+                                      (SCHEMA_DIR, schema_dir, "*.sql")):
+        want = {f.name for f in src_dir.glob(pattern)}
+        if {f.name for f in dst_dir.glob(pattern)} - want:
+            return False                         # a file the checkout no longer has
+        for src in sorted(src_dir.glob(pattern)):
+            dst = dst_dir / src.name
+            if not dst.exists() or dst.read_bytes() != src.read_bytes():
+                return False
     return True
 
 
@@ -372,7 +419,7 @@ def install_launchd(dry=False):
         return f"would write {PLIST} and (re)load {LAUNCHD_LABEL}"
     PLIST.parent.mkdir(parents=True, exist_ok=True)
     HERD_DIR.mkdir(parents=True, exist_ok=True)          # StandardOut/ErrPath's dir
-    PLIST.write_text(plist_text())
+    _atomic_write(PLIST, plist_text())      # atomic like every other write here
     # bootout first so a rewritten plist is re-read: bootstrap on an already-loaded
     # label fails with EEXIST and silently leaves the OLD definition running.
     # Failure here just means "wasn't loaded", expected on a first install.
@@ -404,7 +451,7 @@ def install_service(dry=False):
     if dry:
         return f"would write {SERVICE} and enable + (re)start herd.service"
     SERVICE.parent.mkdir(parents=True, exist_ok=True)
-    SERVICE.write_text(service_unit_text())
+    _atomic_write(SERVICE, service_unit_text())   # atomic like every other write
     for args in (["daemon-reload"], ["enable", "herd.service"], ["restart", "herd.service"]):
         _systemctl(*args)
     active = (_systemctl("is-active", "herd.service").stdout or "").strip()
@@ -929,11 +976,18 @@ def install(dry=False, dev=False):
     if SETTINGS.exists():
         try:
             fresh = json.loads(SETTINGS.read_text())
+            # TypeError too, and the isinstance guard: the FIRST read is checked for
+            # a non-object, this one was not. _offer_bell blocks on input(), so the
+            # file can become a JSON array in that window — and `fresh[k] = ...` on a
+            # list raises AFTER sync_hooks() promoted the new hooks, leaving them live
+            # with settings.json never rewritten and a traceback instead of a summary.
+            if not isinstance(fresh, dict):
+                raise TypeError(f"settings.json is {type(fresh).__name__}, not an object")
             for k in owned:
                 if k in new_settings:
                     fresh[k] = new_settings[k]
             new_settings = fresh
-        except (OSError, json.JSONDecodeError):
+        except (OSError, TypeError, json.JSONDecodeError):
             pass                                # unreadable — go with what we built
     backup_original(SETTINGS, SETTINGS.read_text() if SETTINGS.exists() else "")
     backup(SETTINGS, ts)
