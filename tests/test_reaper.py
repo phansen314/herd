@@ -733,3 +733,19 @@ def test_backoff_grows_then_caps(fails, expect):
     asserted it against itself, which would have passed against any implementation
     at all — including none."""
     assert daemon._backoff(fails, 2.0) == expect
+
+
+@pytest.mark.parametrize("cap", [0, 1])
+def test_a_cap_below_the_interval_never_polls_faster_than_healthy(monkeypatch, cap):
+    """_int_env permits 0 on purpose — "no grace" is coherent for a grace period —
+    but a 0 CAP is not. It made _backoff return 0 for every failing tick, so
+    time.sleep(0) spun the loop at machine speed on exactly the permanent faults
+    (schema-less DB, full disk) the cap exists to slow down, hammering the WAL write
+    lock and starving the hooks' busy_timeout.
+
+    Parametrized past 0 because any cap under the interval is the same bug smaller:
+    it makes FAILING ticks poll faster than healthy ones."""
+    monkeypatch.setattr(daemon, "BACKOFF_MAX_SECS", cap)
+    for fails in (2, 3, 10, 50):
+        assert daemon._backoff(fails, 2.0) >= 2.0, \
+            f"cap={cap} fails={fails} backs off faster than the healthy cadence"

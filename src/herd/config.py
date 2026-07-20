@@ -169,6 +169,12 @@ DEFAULT_TEXT = """\
 #HERD_STUCK_SECS=300       # silence before a `working` session reads as stuck
 #HERD_STRANDED_SECS=120    # grace before an unstarted spawn reservation is dropped
 
+# ── daemon retry and sweeps (seconds) ───────────────────────────────────────
+#HERD_BACKOFF_MAX_SECS=60   # ceiling on the wait after consecutive tick
+                            # failures; never drops below the tick interval
+#HERD_ORPHAN_GRACE_SECS=300 # age before a runtime file whose session has no
+                            # row is swept
+
 # ── identity and placement ──────────────────────────────────────────────────
 # Set these HERE, not in .bashrc: the hooks would see them and the daemon would
 # not, and that divergence stops every live session on the reaper's first tick.

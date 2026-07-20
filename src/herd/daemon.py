@@ -517,10 +517,18 @@ def _backoff(fails, interval):
 
     fails <= 1 is the normal cadence on purpose: one bad tick is usually a held
     write lock, which clears in milliseconds. Beyond that it doubles, capped at
-    BACKOFF_MAX_SECS."""
+    BACKOFF_MAX_SECS.
+
+    NEVER BELOW `interval`. _int_env permits 0 by design — "no grace" is coherent
+    for a grace period — but a 0 CAP is not: it made this return 0 for every failing
+    tick, so `time.sleep(0)` spun the loop as fast as the machine allowed, hammering
+    the WAL write lock and starving the hooks' busy_timeout, on exactly the permanent
+    faults (schema-less DB, full disk) the cap exists to slow down. Any cap below
+    `interval` is the same bug smaller: it makes FAILING ticks poll faster than
+    healthy ones."""
     if fails <= 1:
         return interval
-    return min(interval * (2 ** min(fails - 1, 10)), BACKOFF_MAX_SECS)
+    return max(interval, min(interval * (2 ** min(fails - 1, 10)), BACKOFF_MAX_SECS))
 
 
 def _fault_hint(exc, db):
