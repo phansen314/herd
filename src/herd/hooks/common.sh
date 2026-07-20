@@ -78,12 +78,17 @@ HERD_DB="${HERD_DB:-$HOME/.herd/herd.db}"
 # is safe. config.runtime_dir() must agree — the daemon takes its single-instance
 # lock here, so two answers means two daemons.
 HERD_RUNTIME="${HERD_RUNTIME:-${XDG_RUNTIME_DIR:-}}"
-if [ -z "$HERD_RUNTIME" ]; then
-    HERD_RUNTIME="$HOME/.herd/run"
-    # `[ -d ]` is a builtin, mkdir is a fork: only pay it when actually missing.
-    [ -d "$HERD_RUNTIME" ] || { mkdir -p "$HERD_RUNTIME" 2>/dev/null && \
-                                chmod 700 "$HERD_RUNTIME" 2>/dev/null; }
-fi
+[ -n "$HERD_RUNTIME" ] || HERD_RUNTIME="$HOME/.herd/run"
+# Materialise WHICHEVER path won, not just the fallback. db() opens its error file
+# there with a redirect, and bash does not run a command whose redirect fails — so a
+# HERD_RUNTIME naming a missing directory made every db() call a no-op that wrote
+# nothing and logged nothing (the log guard tests `-s "$err"`, and $err was never
+# created). An explicit path or a /run/user/<uid> systemd reaped after logout both
+# land here. This does not change WHICH directory is chosen, so config.runtime_dir()
+# still agrees; it only ensures the one both halves picked exists.
+# `[ -d ]` is a builtin, mkdir is a fork: only pay it when actually missing.
+[ -d "$HERD_RUNTIME" ] || { mkdir -p "$HERD_RUNTIME" 2>/dev/null && \
+                            chmod 700 "$HERD_RUNTIME" 2>/dev/null; }
 HERD_ERRLOG="${HERD_ERRLOG:-$HOME/.herd/hook-errors.log}"
 
 # writes.sql sits at hooks/../schema/. ${BASH_SOURCE%/*} not $(dirname) — no fork.
@@ -270,7 +275,14 @@ herd_db_uri() {
 
 db() {
     local err="$__HERD_ERRFILE" rc
-    : > "$err" 2>/dev/null              # builtin truncate: no stale stderr leaks in
+    # Belt and braces for the above: if the errfile still cannot be created, run the
+    # query ANYWAY with stderr discarded. Losing the diagnostic is bad; silently
+    # performing no writes at all is worse, and an unwritable $err used to cause
+    # exactly that by making bash skip the sqlite3 command entirely.
+    # 2>/dev/null comes FIRST: redirections are applied left to right, so with the
+    # order reversed bash reports the failing `> "$err"` on the hook's own stderr
+    # before the suppression is in effect.
+    : 2>/dev/null > "$err" || err=/dev/null   # builtin truncate: no stale stderr leaks in
     [ "$__HERD_DB_URI_FOR" = "$HERD_DB" ] || herd_db_uri
     sqlite3 \
         -bail \

@@ -720,3 +720,53 @@ def test_a_path_containing_a_question_mark_still_opens(tmp_path):
     got = c.execute("SELECT session_id FROM sessions").fetchall()
     c.close()
     assert got == [("odd-1",)], "the URI encoding opened the wrong file"
+
+
+# ── an unwritable runtime dir must not silently disable every write ──────────
+@pytest.mark.shell
+@pytest.mark.parametrize("makeable", [True, False])
+def test_a_hook_still_writes_when_the_runtime_dir_is_missing(tmp_path, makeable):
+    """db() opens its error file under $HERD_RUNTIME, and bash does NOT run a command
+    whose redirect fails — so a HERD_RUNTIME naming a missing directory made every
+    db() call a no-op. It wrote nothing and logged nothing either, because the log
+    guard tests `-s "$err"` and $err was never created: total, silent write failure.
+
+    Reachable two ways, both covered here. makeable=True is an explicit HERD_RUNTIME
+    (or a /run/user/<uid> systemd reaped after logout) that common.sh can simply
+    create. makeable=False is a directory it CANNOT create, where the query must
+    still run with the diagnostic discarded — losing stderr beats losing the write."""
+    import sqlite3
+    SCHEMA = pathlib.Path(__file__).resolve().parent.parent / "src" / "herd" / "schema"
+    db = tmp_path / "herd.db"
+    c = sqlite3.connect(db)
+    for f in ("core.sql", "herd.sql"):
+        c.executescript((SCHEMA / f).read_text())
+    c.commit(); c.close()
+
+    if makeable:
+        runtime = tmp_path / "gone" / "deep"          # absent, but creatable
+    else:
+        ro = tmp_path / "ro"
+        ro.mkdir()
+        ro.chmod(0o500)                               # no write bit: mkdir must fail
+        runtime = ro / "nope"
+
+    env = dict(os.environ, HERD_DB=str(db), HERD_RUNTIME=str(runtime),
+               HERD_ERRLOG=str(tmp_path / "err.log"), HOME=str(tmp_path))
+    env.pop("XDG_RUNTIME_DIR", None)
+    r = subprocess.run(["bash", str(HOOKS / "session_start.sh")],
+                       input=json.dumps({"session_id": "rt-1", "cwd": "/x",
+                                         "model": {"id": "m"}, "transcript_path": "/t"}),
+                       env=env, capture_output=True, text=True, timeout=60)
+    try:
+        c = sqlite3.connect(db)
+        got = c.execute("SELECT session_id FROM sessions").fetchall()
+        c.close()
+        assert got == [("rt-1",)], "an unwritable runtime dir silently dropped the write"
+        assert r.returncode == 0, "a hook must still never block Claude"
+        # the redirect failure must not reach the hook's own stderr either: bash
+        # applies redirections left to right, so `2>/dev/null` has to come first
+        assert "No such file or directory" not in r.stderr, r.stderr
+    finally:
+        if not makeable:
+            (tmp_path / "ro").chmod(0o700)            # else tmp_path cleanup fails
