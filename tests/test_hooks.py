@@ -841,3 +841,60 @@ def test_a_non_numeric_throttle_does_not_break_every_tool_call(tmp_path):
     r = run()
     assert "integer expression expected" not in r.stderr, r.stderr
     assert r.returncode == 0
+
+
+# ── a broken jq is not a shifted payload ─────────────────────────────────────
+def _no_jq(tmp_path):
+    """A PATH whose `jq` exits 127, i.e. jq missing from a hook's environment."""
+    d = tmp_path / "nojq"
+    d.mkdir()
+    (d / "jq").write_text("#!/bin/sh\nexit 127\n")
+    (d / "jq").chmod(0o755)
+    return f"{d}:{os.environ['PATH']}"
+
+
+@pytest.mark.shell
+def test_payload_read_separates_a_broken_jq_from_a_shifted_parse(tmp_path):
+    """Both failures shared one return code, so callers could not tell them apart.
+
+    rc 2 is a real sentinel mismatch; rc 1 is jq failing, where NOTHING was parsed
+    and jq_in has already logged the cause. HERD_PARSE_TAIL is cleared on rc 1 —
+    a tail left over from an earlier call would be read as evidence about this one."""
+    script = f'''
+        . {HOOKS / "common.sh"}
+        INPUT='{{"a":"1","b":"2"}}'
+        payload_read '.a, .b' X Y; echo "ok=$?"
+        payload_read '.a' P Q;     echo "shift=$? tail=[$HERD_PARSE_TAIL]"
+        PATH="{_no_jq(tmp_path)}"
+        payload_read '.a, .b' R S; echo "nojq=$? tail=[$HERD_PARSE_TAIL]"
+    '''
+    env = dict(os.environ, HERD_RUNTIME=str(tmp_path), HERD_ERRLOG=str(tmp_path / "e.log"),
+               HERD_CONFIG="/nonexistent", HOME=str(tmp_path))
+    out = subprocess.run(["bash", "-c", script], env=env,
+                         capture_output=True, text=True, timeout=60).stdout
+    assert "ok=0" in out, out
+    assert "shift=2" in out, out
+    assert "nojq=1" in out, out
+    assert "nojq=1 tail=[]" in out, f"a stale tail survived a jq failure: {out}"
+
+
+@pytest.mark.shell
+def test_a_broken_jq_is_not_logged_as_a_shifted_payload(tmp_path):
+    """The hook logged "payload parse shifted (sentinel=[])" whenever jq failed:
+    the wrong cause, an empty sentinel, and a second line contradicting the accurate
+    one jq_in had just written — during the one outage where the log is all you have.
+
+    The gsub in payload_read strips the separator from every field, so payload
+    CONTENT can never displace the sentinel; a shift was never the explanation."""
+    log = tmp_path / "err.log"
+    env = dict(os.environ, PATH=_no_jq(tmp_path), HERD_DB=str(tmp_path / "no.db"),
+               HERD_RUNTIME=str(tmp_path), HERD_ERRLOG=str(log),
+               HERD_CONFIG="/nonexistent", HOME=str(tmp_path))
+    r = subprocess.run(["bash", str(HOOKS / "session_start.sh")],
+                       input=json.dumps({"session_id": "s", "cwd": "/x",
+                                         "model": {"id": "m"}, "transcript_path": "/t"}),
+                       env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, "a hook must never block Claude"
+    text = log.read_text()
+    assert "jq NOT FOUND" in text, text
+    assert "shifted" not in text, f"a jq outage was still blamed on the payload: {text}"

@@ -324,7 +324,15 @@ def test_every_hook_parses_its_payload_through_payload_read():
     for f in sorted(HOOKS.glob("*.sh")):
         if f.name in ("common.sh", "preview.sh"):     # the reader; and argv, not stdin
             continue
-        src = f.read_text()
+        # CODE ONLY: full-line comments are stripped before matching. This check is
+        # textual, so prose that merely NAMES jq_in read as a call — it fired on a
+        # comment explaining why a hook must not call jq_in, i.e. on a comment saying
+        # the very thing the test enforces. The `read -r` version had the same
+        # problem and was narrowed to jq_in instead of being taught about comments,
+        # which only moved the trap. (Trailing inline comments are still matched;
+        # no hook has one naming these, and stripping them needs a bash lexer.)
+        src = "\n".join(ln for ln in f.read_text().splitlines()
+                         if not ln.lstrip().startswith("#"))
         if "jq_in" not in src and "payload_read" not in src:
             continue                                   # parses no payload at all
         assert "payload_read" in src, \

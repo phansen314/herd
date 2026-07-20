@@ -177,14 +177,29 @@ herd_log() {
 # session_name), and either one shifts every later value down a slot — silently and
 # permanently, since these get persisted. So the separator and both newline forms
 # are stripped from every field, and a sentinel is appended AFTER the join where no
-# value can reach it. A nonzero return means a shifted parse and the caller decides:
-# statusline.sh refuses to write (a wrong row is permanent, a wrong render lasts one
-# tick), session_start.sh writes anyway minus the untrusted fields (it is the only
-# thing that ever creates the row).
+# value can reach it.
 #
-# HERD_PARSE_TAIL is a documented output, not an internal: on a nonzero return it
-# holds whatever arrived where the sentinel should have been, and every caller logs
-# it as the only clue to what the payload did.
+# TWO DISTINCT FAILURES, and they are not interchangeable:
+#
+#   rc 2  the sentinel did not arrive — a genuine shift. The caller decides:
+#         statusline.sh refuses to write (a wrong row is permanent, a wrong render
+#         lasts one tick), session_start.sh writes anyway minus the untrusted fields
+#         (it is the only thing that ever creates the row).
+#   rc 1  jq itself failed (missing, or a bad filter). NOTHING was parsed — not even
+#         the session id — and jq_in has already logged the real cause.
+#
+# They shared a return code, so a jq outage was reported as "payload parse shifted
+# (sentinel=[])": the wrong cause, an empty sentinel, and a second log line
+# contradicting the accurate one jq_in had just written. The recovery was misapplied
+# too — with no id parsed there is no row to save, so session_start's field-dropping
+# path ran and then exited anyway. Note the gsub above means payload CONTENT can
+# never displace the sentinel, so rc 2 indicates a caller expression that does not
+# match its variable list, not a hostile payload.
+#
+# HERD_PARSE_TAIL is a documented output, not an internal: on rc 2 it holds whatever
+# arrived where the sentinel should have been, and the caller logs it as the only
+# clue to what the payload did. On rc 1 it is cleared — there is no tail to report,
+# and a stale one from an earlier call would be read as evidence.
 #
 # NO APOSTROPHES IN A CALLER EXPRESSION: it arrives here as a single-quoted bash
 # string at the call site, so one would end it and hand the rest to the shell.
@@ -195,11 +210,14 @@ payload_read() {
     # interpolated into a double-quoted one: jq filters are full of double quotes
     # ("number", "%I:%M%p"), and escaping them at every call site is how the
     # apostrophe rule above gets broken by accident.
-    __out=$(jq_in -rj '['"$__expr"'] | map(. // "" | tostring | gsub("[\\n\\r\u001f]"; " ")) | join("\u001f") | . + "\u001fEOR"') || return 1
+    __out=$(jq_in -rj '['"$__expr"'] | map(. // "" | tostring | gsub("[\\n\\r\u001f]"; " ")) | join("\u001f") | . + "\u001fEOR"') || {
+        HERD_PARSE_TAIL=""      # no tail exists; a stale one would read as evidence
+        return 1
+    }
     IFS=$'\x1f' read -r "$@" HERD_PARSE_TAIL <<JQEOF
 $__out
 JQEOF
-    [ "$HERD_PARSE_TAIL" = "EOR" ]
+    [ "$HERD_PARSE_TAIL" = "EOR" ] || return 2
 }
 
 # jq_in <jq args...> — filter $INPUT, and LOG when jq itself fails. Without the

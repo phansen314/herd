@@ -73,7 +73,13 @@ if [ "$PARSE_OK" -ne 0 ]; then
     # now_pair before herd_log, or the line stamps "?" — nothing has set $NOW_ISO
     # this early.
     now_pair
-    herd_log "statusline: payload parse shifted (sentinel=[$HERD_PARSE_TAIL]) — no DB write"
+    if [ "$PARSE_OK" -eq 2 ]; then
+        herd_log "statusline: payload parse shifted (sentinel=[$HERD_PARSE_TAIL]) — no DB write"
+    else
+        # rc 1: jq failed; jq_in already logged why. No field was parsed, so there is
+        # nothing to shift and nothing to blame on the payload.
+        herd_log "statusline: no fields parsed — no DB write"
+    fi
     printf '%s' "⬢ ? | herd: payload parse error"
     exit 0
 fi

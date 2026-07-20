@@ -22,12 +22,20 @@ PARSE_OK=$?
 # captures claude's pid, and it does not fire again, so exiting here loses the
 # session for its whole life. SID is field 1 and survives any shift; drop the three
 # untrusted values and record the rest.
-if [ "$PARSE_OK" -ne 0 ]; then
+if [ "$PARSE_OK" -eq 2 ]; then
     herd_log "session_start: payload parse shifted (sentinel=[$HERD_PARSE_TAIL]) — cwd/model/transcript dropped"
     # "?" and not "": bind() maps EMPTY to SQL NULL and sessions.cwd is NOT NULL, so
     # blanking it fails W2b_insert and the session gets no row at all. model and
     # transcript_path are nullable.
     CWD="?"; MODEL=""; TRANSCRIPT=""
+elif [ "$PARSE_OK" -ne 0 ]; then
+    # rc 1: jq itself failed and jq_in has already logged the real cause. NOTHING
+    # was parsed, so the recovery above does not apply — there is no session id to
+    # hang a row on, and valid_sid below exits. Say that plainly instead of blaming
+    # a shift: this used to log "parse shifted (sentinel=[])", contradicting the
+    # accurate line jq_in had just written, during the one outage where the log is
+    # all you have.
+    herd_log "session_start: no fields parsed — this session gets no row"
 fi
 
 valid_sid "$SID" || exit 0
