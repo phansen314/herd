@@ -8,6 +8,13 @@ __d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."
 . "$__d/common.sh" || { echo "herd: cannot source $__d/common.sh" >&2; exit 1; }
 
 HERD_TOOL_THROTTLE="${HERD_TOOL_THROTTLE:-2}"
+# Validated like NOW_EPOCH and LAST below, and for the same reason: it is a `test`
+# integer operand. `HERD_TOOL_THROTTLE=2s` in ~/.herd/config made every tool call
+# print "[: 2s: integer expression expected" and return 2, so the `&& exit 0` never
+# fired — throttling silently off, plus stderr noise per tool use.
+case "$HERD_TOOL_THROTTLE" in
+    ''|*[!0-9]*) HERD_TOOL_THROTTLE=2 ;;
+esac
 
 read_input
 # One field, so a shift is unreachable; the shared reader is used anyway so all

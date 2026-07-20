@@ -136,18 +136,30 @@ render() {
 
     # 🤖 model — strip claude- prefix + trailing 8-digit date, title-case family.
     if [ -n "$MODEL" ]; then
-        rest="${MODEL#claude-}"
-        case "$rest" in
-            *-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) rest="${rest%-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]}" ;;
-        esac
+        # `${MODEL#claude-}` alone only strips a prefix at position 0, so a Bedrock or
+        # Vertex id (us.anthropic.claude-opus-4-20250514-v1:0) kept its whole vendor
+        # path and rendered as "🤖 us.anthropic.claude opus.4.20250514.v1:0". Drop
+        # anything up to and including the LAST "claude-" wherever it sits.
+        rest="${MODEL##*claude-}"
+        # Cut at the 8-digit date and drop everything after it. Matching only a
+        # TRAILING date left the Bedrock/Vertex suffix behind
+        # (claude-opus-4-20250514-v1:0 -> "Opus 4.20250514.v1:0"), since there the
+        # date sits mid-string. `%%` cuts at the first date, so both shapes land on
+        # the same family+version, and an id with no date is untouched.
+        rest="${rest%%-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*}"
         family="${rest%%-*}"
-        ver="${rest#*-}"; ver="${ver//-/.}"
+        # A dashless id has no version part, and `${rest#*-}` returns $rest unchanged
+        # when there is no dash — which rendered the family twice ("🤖 Opus opus").
+        case "$rest" in
+            *-*) ver="${rest#*-}"; ver="${ver//-/.}" ;;
+            *)   ver="" ;;
+        esac
         case "$family" in
             opus)   family=Opus ;;
             sonnet) family=Sonnet ;;
             haiku)  family=Haiku ;;
         esac
-        L1+=("🤖 $family $ver")
+        if [ -n "$ver" ]; then L1+=("🤖 $family $ver"); else L1+=("🤖 $family"); fi
     fi
 
     # 💰 cost — always 2 dp.

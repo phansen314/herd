@@ -32,7 +32,16 @@ fi
 # would shift every later row's fields and render ANOTHER session into the pane.
 # A wrong preview is worse than a blank one, so the parse also fails closed on
 # NF != 20 (which absorbs the trailing empty record sqlite3 leaves).
-printf '.mode list\n.separator "%s" "%s"\n%s\n' $'\037' $'\036' "$SQL" | db | awk \
+# Captured, not piped straight into awk: a pipeline takes its status from the LAST
+# command, so `db | awk` reported awk's 0 and a failed query was indistinguishable
+# from an empty result — which the END block below then rendered as "(session gone)",
+# declaring live sessions dead whenever the DB was locked or HERD_DB was wrong. The
+# `bad` counter guards malformed rows only; this guards the query itself.
+if ! ROWS=$(printf '.mode list\n.separator "%s" "%s"\n%s\n' $'\037' $'\036' "$SQL" | db); then
+    echo "(preview unavailable — database unreadable)"
+    exit 0
+fi
+printf '%s' "$ROWS" | awk \
     -v RS=$'\036' -v FS=$'\037' -v want="$1" '
     function g(v) { return v == "" ? "—" : v }
     BEGIN {

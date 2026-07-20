@@ -770,3 +770,74 @@ def test_a_hook_still_writes_when_the_runtime_dir_is_missing(tmp_path, makeable)
     finally:
         if not makeable:
             (tmp_path / "ro").chmod(0o700)            # else tmp_path cleanup fails
+
+
+# ── a DB failure is not a claim about the session ────────────────────────────
+@pytest.mark.shell
+def test_preview_reports_an_unreadable_db_instead_of_calling_the_session_gone(tmp_path):
+    """`db | awk` took the pipeline's status from awk, which exits 0 on an empty
+    stream — so a failed query was indistinguishable from "no such session" and the
+    END block rendered "(session gone)". A locked DB or a wrong HERD_DB therefore
+    declared LIVE sessions dead in the picker. preview.sh's own comment states the
+    rule it was breaking: "gone" is a claim about the session, so only make it when
+    the data was readable."""
+    env = dict(os.environ, HERD_DB=str(tmp_path / "nope.db"),
+               HERD_RUNTIME=str(tmp_path), HERD_ERRLOG=str(tmp_path / "err.log"),
+               HERD_CONFIG="/nonexistent", HOME=str(tmp_path))
+    r = subprocess.run(["bash", str(HOOKS / "preview.sh"), "7"],
+                       env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, "the preview must never fail the picker"
+    assert "session gone" not in r.stdout, \
+        "an unreadable database was reported as a dead session"
+    assert "unavailable" in r.stdout, r.stdout
+
+
+@pytest.mark.shell
+def test_the_error_log_is_stamped_even_when_no_hook_set_the_clock(tmp_path):
+    """db() appends to $HERD_ERRLOG itself rather than through herd_log, and both
+    inlined `${NOW_ISO:-?}`. preview.sh never calls now_pair, so every line it
+    logged was stamped "?" — in the log whose purpose is diagnosing intermittent
+    faults, where the timestamp is the whole point."""
+    log = tmp_path / "err.log"
+    env = dict(os.environ, HERD_DB=str(tmp_path / "nope.db"),
+               HERD_RUNTIME=str(tmp_path), HERD_ERRLOG=str(log),
+               HERD_CONFIG="/nonexistent", HOME=str(tmp_path))
+    subprocess.run(["bash", str(HOOKS / "preview.sh"), "7"],
+                   env=env, capture_output=True, text=True, timeout=60)
+    stamps = {ln.split("\t", 1)[0] for ln in log.read_text().splitlines() if ln}
+    assert stamps, "nothing was logged at all"
+    assert "?" not in stamps, f"unstamped log lines: {stamps}"
+    assert all(s.startswith("20") and s.endswith("Z") for s in stamps), stamps
+
+
+@pytest.mark.shell
+def test_a_non_numeric_throttle_does_not_break_every_tool_call(tmp_path):
+    """HERD_TOOL_THROTTLE reaches `test -lt` as an integer operand. `2s` in
+    ~/.herd/config made every PostToolUse print "[: 2s: integer expression expected"
+    and return 2, so the `&& exit 0` never fired: throttling silently off plus
+    stderr noise on every tool call. The two operands beside it were already
+    case-glob validated; this one was missed."""
+    import sqlite3
+    SCHEMA = pathlib.Path(__file__).resolve().parent.parent / "src" / "herd" / "schema"
+    db = tmp_path / "herd.db"
+    c = sqlite3.connect(db)
+    for f in ("core.sql", "herd.sql"):
+        c.executescript((SCHEMA / f).read_text())
+    c.commit(); c.close()
+    env = dict(os.environ, HERD_DB=str(db), HERD_RUNTIME=str(tmp_path),
+               HERD_ERRLOG=str(tmp_path / "err.log"), HERD_TOOL_THROTTLE="2s",
+               HERD_CONFIG="/nonexistent", HOME=str(tmp_path))
+    payload = json.dumps({"session_id": "thr-1", "cwd": "/x",
+                          "model": {"id": "m"}, "transcript_path": "/t"})
+
+    def run():
+        return subprocess.run(["bash", str(HOOKS / "post_tool_use.sh")], input=payload,
+                              env=env, capture_output=True, text=True, timeout=60)
+
+    # TWICE, and the second call is the one that matters: the comparison is guarded
+    # by `[ -f "$TFILE" ]`, so a single invocation never reaches the `test -lt` at
+    # all. Written as one call first, this passed against the unfixed hook.
+    run()
+    r = run()
+    assert "integer expression expected" not in r.stderr, r.stderr
+    assert r.returncode == 0

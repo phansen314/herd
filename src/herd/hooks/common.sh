@@ -152,8 +152,19 @@ herd_log_rotate() {
     mv -f "$HERD_ERRLOG" "$HERD_ERRLOG.1" 2>/dev/null
 }
 
+# The log stamp, in ONE place: db() writes to $HERD_ERRLOG directly rather than
+# through herd_log, and both used to inline `${NOW_ISO:-?}`.
+#
+# Falls back to `date` rather than calling now_pair for its side effect, because
+# callers reach the log from inside $(...) — jq_in is the live example — where an
+# assignment to NOW_ISO dies with the subshell. preview.sh never sets the pair at
+# all, so ALL of its lines were "?", in the one log meant for diagnosing
+# intermittent faults. The fork is paid only on the unstamped path.
+herd_stamp() {
+    printf '%s' "${NOW_ISO:-$(date -u '+%Y-%m-%dT%H:%M:%S.000Z' 2>/dev/null || echo '?')}"
+}
 herd_log() {
-    printf '%s\t%s\t%s\n' "${NOW_ISO:-?}" "${0##*/}" "$*" >> "$HERD_ERRLOG" 2>/dev/null
+    printf '%s\t%s\t%s\n' "$(herd_stamp)" "${0##*/}" "$*" >> "$HERD_ERRLOG" 2>/dev/null
     herd_log_rotate
 }
 
@@ -201,7 +212,8 @@ jq_in() {
     local out rc
     out=$(printf '%s' "$INPUT" | jq "$@" 2>/dev/null); rc=$?
     if [ "$rc" -ne 0 ]; then
-        [ -n "$NOW_ISO" ] || now_pair          # failure path only — no extra fork
+        # (No now_pair here: jq_in is called as $(jq_in ...), so anything it assigned
+        # died with the subshell. herd_log stamps itself instead.)
         if [ "$rc" -eq 127 ]; then
             herd_log "jq NOT FOUND (rc=127) — herd cannot parse any payload"
         else
@@ -292,7 +304,7 @@ db() {
         "$__HERD_DB_URI" "$@" 2>"$err"
     rc=$?
     if [ $rc -ne 0 ] && [ -s "$err" ]; then
-        { printf '%s\t%s\trc=%d\t' "${NOW_ISO:-?}" "${0##*/}" "$rc"
+        { printf '%s\t%s\trc=%d\t' "$(herd_stamp)" "${0##*/}" "$rc"
           tr '\n' ' ' < "$err"; printf '\n'; } >> "$HERD_ERRLOG" 2>/dev/null
         herd_log_rotate            # db() appends directly, so cap it here too
     fi
