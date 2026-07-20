@@ -187,9 +187,12 @@ WHERE stopped_at IS NULL AND started_at < :boot_time
 -- GUARD, EVER — it freezes last_event_at on the hot path (post_tool_use is always
 -- 'working'), making a busy session read silent and paging you about it.
 -- sessions.last_event_at is the ONLY event signal anything reads. DESIGN.md#two-clocks.
--- The stopped_at guard is a different predicate and IS required: without it a wrongly
--- reaped session never recovers (hooks cannot clear stopped_at, R1_list filters on it)
--- and rows go status='working' AND stopped, which the CHECK permits and no reader expects.
+-- The stopped_at guard is a different predicate and IS required — but not because it
+-- restores a wrongly reaped session. That session never recovers either way: no hook
+-- can clear stopped_at and R1_list filters on it. What the guard prevents is the row
+-- LYING about itself. Without it a later hook sets status='working' on a stopped row,
+-- giving status='working' AND stopped_at NOT NULL — which the CHECK permits and no
+-- reader expects.
 -- :name W4_event
 UPDATE sessions
 SET status          = :status,

@@ -11,8 +11,9 @@ Claude sessions execute. `--dev` wires the checkout directly.
 
 Idempotent. Every edited file is backed up as <file>.herd-bak.<ts> before the
 first change, and once as <file>.herd-bak.original — the pre-herd copy uninstall
-restores. Nothing is written until the self-test passes; a FAIL aborts and exits
-nonzero. Leaves klawde's repo and ~/.klawde/sessions.db in place — only unwires
+restores. Nothing is rewired or copied until the self-test passes; a FAIL aborts and
+exits nonzero. (The herd dir, the config and the DB are created before the gate —
+bootstrap_db runs first, so a FAIL still leaves those behind.) Leaves klawde's repo and ~/.klawde/sessions.db in place — only unwires
 it from settings.json.
 """
 import json

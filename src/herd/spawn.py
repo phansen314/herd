@@ -98,8 +98,9 @@ def spawn(conn, spec, socket, now, *, launch_fn=None):
     # ── phase 2: launch, then stamp the placement onto the reservation ──
     # A RAISING launcher (kitten not on PATH, fork limit) must be treated exactly
     # like a failed one: propagating skips the abort below and strands the
-    # reservation as a pid-NULL row, which reap_once never revisits, so the job name
-    # stays burned until the next boot sweep.
+    # reservation as a pid-NULL row, which reap_once skips by design. W3f_sweep_stranded
+    # reclaims it, but only once it is older than HERD_STRANDED_SECS (120s), so the job
+    # name stays burned for that long instead of being freed at once by the abort.
     try:
         win, err = launch_fn(spec, socket), None
     except Exception as e:                       # noqa: BLE001 — degrade, never crash the CLI
