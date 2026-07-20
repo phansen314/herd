@@ -19,11 +19,12 @@ import os
 import pathlib
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 
 from herd.db import connect, load_statements
-from herd.daemon import DEFAULT_DB, _now_iso
+from herd.daemon import DEFAULT_DB, _fault_hint, _now_iso
 from herd.kitty.focus import focus_session
 from herd.spawn import resolve_spec, spawn
 from herd.template import load_template, available_templates
@@ -668,7 +669,19 @@ def main(argv=None):
         print()
         print(USAGE)
         return 2
-    conn = connect(DEFAULT_DB, readonly=cmd in _READONLY)
+    # The shared open is the FIRST thing every verb does, and it is the one that
+    # fails on a machine herd is not installed on yet — or one with a typo'd HERD_DB
+    # in ~/.herd/config. Unguarded it printed a raw sqlite3 traceback, which is the
+    # worst possible first contact with the tool. doctor already got this treatment
+    # (its whole job is broken machines); the other five verbs never did, though they
+    # are the ones a new user reaches first. _fault_hint owns the wording, so the
+    # advice cannot drift from the daemon's.
+    try:
+        conn = connect(DEFAULT_DB, readonly=cmd in _READONLY)
+    except sqlite3.Error as e:
+        print(_fault_hint(e, DEFAULT_DB) or f"herd: cannot open {DEFAULT_DB}: {e}",
+              file=sys.stderr)
+        return 1
     return COMMANDS[cmd](conn, rest)
 
 

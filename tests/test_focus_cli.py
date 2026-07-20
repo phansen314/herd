@@ -5,6 +5,7 @@ import inspect
 import pathlib
 import re
 import shlex
+import sqlite3
 import sys
 import socket
 import time
@@ -941,6 +942,26 @@ def test_cli_refuses_unknown_arguments(argv, why, monkeypatch, capsys):
                         lambda *a, **k: pytest.fail(f"must not open the DB: {why}"))
     assert cli.main(argv) == 2, why
     assert "usage" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("cmd", ["ls", "jump", "watch", "spawn", "poke"])
+def test_an_unopenable_db_is_a_message_not_a_traceback(cmd, monkeypatch, capsys):
+    """The shared connect() is the FIRST thing every verb does, and the one that
+    fails on a machine herd is not installed on yet — or one with a typo'd HERD_DB
+    in ~/.herd/config. Unguarded it printed a raw sqlite3 traceback, which is the
+    worst possible first contact with the tool.
+
+    doctor got this treatment long ago (its whole job is broken machines) and the
+    reasoning was never carried across to the five verbs a new user actually reaches
+    first. The wording comes from daemon._fault_hint so it cannot drift from the
+    daemon's advice for the same fault."""
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("unable to open database file")
+    monkeypatch.setattr(cli, "connect", boom)
+    assert cli.main([cmd]) == 1
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "HERD_DB" in err and "herd.install" in err
 
 
 def test_cli_lets_one_shot_through(monkeypatch):
