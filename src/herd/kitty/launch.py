@@ -42,23 +42,54 @@ def build_launch_argv(spec, socket):
 LAUNCH_TIMEOUT = 10
 
 
+class LaunchError(RuntimeError):
+    """The launch failed, carrying kitten's OWN diagnosis where there is one.
+
+    Exists because there was nowhere to put that diagnosis. `_run` returned stdout
+    and discarded stderr — which is where kitten writes the actual cause — and
+    `launch` collapsed every failure into None, so spawn() had nothing to report and
+    guessed: EVERY failed launch said "(remote control off, or bad socket?)",
+    including a bad --cwd, a bad --type, an unwritable directory and a stale socket.
+    kitty's remote control is the hardest step in herd's setup, so that guess sent
+    people to re-check the one thing that was usually already right.
+
+    spawn() needs no new handling: it already treats a raising launcher exactly like
+    a failed one (dropping the reservation so the job name is freed at once, rather
+    than staying burned until W3f sweeps it) and already prints the exception. That
+    path was there for `kitten` missing from PATH; this just gives it more to say."""
+
+
 def _run(argv):
-    """Run kitten, return stdout. A TimeoutExpired reads as a failed launch. OSError
-    is deliberately NOT caught, unlike focus.py: spawn() wraps this call and reports
-    the real cause ("kitten not found")."""
+    """Run kitten and return its stdout. Raises LaunchError with kitten's own stderr
+    on a nonzero exit or a timeout. OSError is deliberately NOT caught, as in
+    focus.py: spawn() wraps this call and reports the real cause ("kitten not
+    found")."""
     try:
-        return subprocess.run(argv, capture_output=True, text=True,
-                              timeout=LAUNCH_TIMEOUT).stdout
+        p = subprocess.run(argv, capture_output=True, text=True,
+                           timeout=LAUNCH_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return ""                      # non-integer -> launch() returns None
+        raise LaunchError(
+            f"kitten @ launch timed out after {LAUNCH_TIMEOUT}s — a socket with "
+            "nothing listening (a stale unix:/tmp/kitty-<pid>)?") from None
+    if p.returncode != 0:
+        # stderr first: that is where kitten explains itself. Newlines flattened —
+        # this ends up on one CLI line.
+        detail = (p.stderr or p.stdout or "").strip().replace("\n", " ")
+        raise LaunchError(f"kitten @ launch exited {p.returncode}"
+                          + (f": {detail}" if detail else ""))
+    return p.stdout
 
 
 def launch(spec, socket, *, run_fn=None):
-    """Launch the session; return the new kitty window_id (int), or None on failure.
-    kitten prints the id on success — anything non-integer means the launch failed
-    (remote control off, bad socket, …). run_fn is injected for testing."""
+    """Launch the session and return the new kitty window_id (int).
+
+    Raises LaunchError on any failure — it does NOT return None. kitten prints the
+    id on success, so non-integer output means the launch failed; returning None for
+    that threw away the only evidence of WHY. run_fn is injected for testing."""
     out = ((run_fn or _run)(build_launch_argv(spec, socket)) or "").strip()
     try:
         return int(out)
     except (TypeError, ValueError):
-        return None
+        raise LaunchError(
+            f"kitten @ launch printed no window id (got {out!r}) — is "
+            "allow_remote_control enabled in kitty.conf?") from None

@@ -111,7 +111,12 @@ def spawn(conn, spec, socket, now, *, launch_fn=None):
             conn.execute(W["W1_spawn_abort"], {"pk": pk})
         except Exception:                        # noqa: BLE001
             pass
-        why = f": {err}" if err is not None else " (remote control off, or bad socket?)"
+        # `err` now almost always carries kitten's own words (launch.LaunchError).
+        # The bare fallback is for a launch_fn that returns None without raising —
+        # an injected one in tests, essentially — and it no longer NAMES a cause it
+        # cannot know: guessing "remote control off" for every failure is what this
+        # replaced.
+        why = f": {err}" if err is not None else " (no window id, and no reason given)"
         return False, f"kitty launch failed{why}", None
 
     try:

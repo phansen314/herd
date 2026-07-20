@@ -6,7 +6,7 @@ import sqlite3
 import pytest
 
 from herd import cli
-from herd.kitty.launch import build_launch_argv, launch
+from herd.kitty.launch import build_launch_argv, launch, LaunchError
 from herd.spawn import SpawnSpec, spawn, valid_job
 
 from helpers import T0, SOCK, short_tmp_dir, mk_session, mk_herd, job_holder
@@ -200,9 +200,59 @@ def test_launch_tolerates_surrounding_whitespace():
     (None, "no stdout at all"),
 ])
 def test_launch_reads_any_non_integer_as_failure(out, label):
-    """spawn() keys off None to drop the reservation and free the job name, so
-    anything that is not a window id MUST come back as None, not raise."""
-    assert launch(_spec(), SOCK, run_fn=lambda argv: out) is None, label
+    """Anything that is not a window id is a failed launch, and now RAISES rather
+    than returning None.
+
+    This used to assert `is None`, reasoning that spawn() keys off None to drop the
+    reservation and free the job name. spawn() handles both — see
+    test_a_raising_launcher_frees_the_job_name, which pins the abort on the raising
+    path — and None was what destroyed the diagnosis: every failure looked the same
+    by the time spawn saw it, so it guessed "remote control off, or bad socket?" for
+    a bad --cwd, an unwritable directory or a stale socket alike."""
+    with pytest.raises(LaunchError):
+        launch(_spec(), SOCK, run_fn=lambda argv: out)
+
+
+def test_launch_surfaces_kittens_stderr_not_a_guess(monkeypatch):
+    """_run must carry kitten's stderr into the error. Driven at _run, so the
+    subprocess contract itself is exercised rather than a stubbed run_fn."""
+    import subprocess as _sp
+    from herd.kitty import launch as L
+
+    def fake_run(argv, **kw):
+        return _sp.CompletedProcess(argv, 1, "",
+                                    "Error: Failed to connect to unix:/tmp/kitty-9: "
+                                    "no such file or directory\n")
+    monkeypatch.setattr(L.subprocess, "run", fake_run)
+    with pytest.raises(L.LaunchError) as exc:
+        L.launch(_spec(), SOCK)
+    m = str(exc.value)
+    assert "Failed to connect" in m and "no such file or directory" in m
+    assert "remote control off" not in m          # the guess is gone
+
+
+def test_spawn_reports_the_launch_error_and_frees_the_job(fresh):
+    """spawn() needs no new handling: its existing raising-launcher path both frees
+    the job name and prints the exception.
+
+    NOTE this passes against the pre-fix code too — it pins the MECHANISM the fix
+    leans on, not the fix. test_launch_surfaces_kittens_stderr_not_a_guess is the
+    one that fails without it. Kept because that mechanism is load-bearing now: a
+    later simplification that stopped formatting `err` into the message would put
+    the guessing back, silently."""
+    from herd.kitty.launch import LaunchError
+    c = fresh()
+
+    def boom(spec, socket):
+        raise LaunchError("kitten @ launch exited 1: Error: /nope: No such file")
+
+    ok, msg, _ = spawn(c, _spec(job="api"), SOCK, T0, launch_fn=boom)
+    assert not ok
+    assert "/nope: No such file" in msg           # kitten's words, not a guess
+    assert "remote control off" not in msg
+    # and the reservation was dropped, so the handle is reusable immediately
+    assert c.execute("SELECT COUNT(*) FROM herd_sessions WHERE job_name='api'"
+                     ).fetchone()[0] == 0
 
 
 def test_launch_passes_the_built_argv_through():
@@ -217,8 +267,8 @@ def test_launch_passes_the_built_argv_through():
                     reason="drives the real `kitten` binary, which kitty ships")
 def test_launch_times_out_against_a_socket_that_never_answers(monkeypatch):
     """The real path: a stale unix:/tmp/kitty-<pid> whose kitty is gone. Drives the
-    actual subprocess call, not a stub, so the TimeoutExpired -> "" -> None chain
-    is exercised end to end.
+    actual subprocess call, not a stub, so the TimeoutExpired -> LaunchError
+    chain is exercised end to end.
 
     Needs kitten on PATH — the point is the REAL subprocess, so stubbing it would
     delete the test. CONTRIBUTING lists kitty as not needed for the suite, and this
@@ -236,7 +286,10 @@ def test_launch_times_out_against_a_socket_that_never_answers(monkeypatch):
         p = str(d / "kitty-stale")
         srv.bind(p); srv.listen(1)
         try:
-            assert L.launch(_spec(), f"unix:{p}") is None
+            with pytest.raises(L.LaunchError) as exc:
+                L.launch(_spec(), f"unix:{p}")
+            # and it says WHAT happened, not a guess at why
+            assert "timed out" in str(exc.value)
         finally:
             srv.close()
 
