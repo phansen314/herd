@@ -188,6 +188,46 @@ def test_a_failing_db_is_not_retried_as_an_adoption_miss(hook_env):
     assert len(_errlog(hook_env)) == 1                     # W5 only — no adopt, no retry
 
 
+def test_a_failed_sink_is_retried_on_the_next_tick(hook_env):
+    """A failed W5 must NOT leave the fingerprint cached as if it had landed.
+
+    The cache write was unconditional, so the fingerprint claimed "this payload is
+    already recorded" after a write that FAILED. Every later tick with an identical
+    payload then took the cache hit and exited before touching the DB — no retry,
+    ever. An idle session's payload IS static (cost, tokens, ctx and the rate-limit
+    fields are all frozen), so recovery waited on the user typing again, and until
+    then `herd ls` showed NULL cost and context for a session herd was otherwise
+    tracking fine. A locked DB past the 3s busy_timeout is the common way in, i.e.
+    exactly when losing the retry matters.
+
+    The DB is corrupted and then RESTORED BYTE-FOR-BYTE, so the payload the second
+    tick sees is identical to the first — which is the whole trap. The snapshot is
+    taken after the session row exists, or the restore would roll it away and the
+    retry would have nothing to update.
+
+    test_identical_tick_is_fingerprint_hit is the other half: after a SUCCESSFUL
+    tick an identical payload must still take the cache hit."""
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/code/herd")
+    c.close()
+    good = pathlib.Path(hook_env.path).read_bytes()               # schema + the row
+
+    pathlib.Path(hook_env.path).write_bytes(os.urandom(4096))     # not a database
+    r1 = _statusline(hook_env, SL_PAY)
+    assert r1.returncode == 0 and r1.stdout.strip()               # renders regardless
+
+    pathlib.Path(hook_env.path).write_bytes(good)                 # the DB comes back
+    r2 = _statusline(hook_env, SL_PAY)                            # SAME payload
+    assert r2.returncode == 0
+
+    c = hook_env.conn()
+    row = c.execute("SELECT total_cost_usd, context_percent FROM sessions "
+                    "WHERE session_id='s1'").fetchone()
+    c.close()
+    assert row["total_cost_usd"] is not None and row["context_percent"] is not None, \
+        "the retry never reached the DB — the failed sink was cached as a success"
+
+
 def test_a_genuine_adoption_miss_still_adopts(hook_env):
     """The other side of the gate: a HEALTHY db reporting 0 changes must still take
     path C, or a reconciled-but-unadopted row never gets claimed."""

@@ -311,9 +311,22 @@ fi
 render "$SNAME" "$BURN"
 
 # ── cache atomically (tmp + rename — a torn write must not feed a false hit) ─
-{ printf '%s\n%s\n%s\n' "$FP" "$L1S" "$L2S"; } > "$CACHE.tmp.$$" 2>/dev/null &&
-    mv -f "$CACHE.tmp.$$" "$CACHE" 2>/dev/null
-rm -f "$CACHE.tmp.$$" 2>/dev/null      # the && skipped the mv: leave no debris
+#
+# ONLY WHEN THE SINK LANDED. The fingerprint means "this payload is already
+# recorded", and writing it after a FAILED W5 claimed something untrue: every later
+# tick with an identical payload took the cache hit above and exited before touching
+# the DB, so the write was never retried. An idle session's payload IS static — cost,
+# tokens, ctx and the rate-limit fields are all frozen — so recovery waited on the
+# user typing again, and until then `herd ls` showed NULL cost and context for a
+# session herd was otherwise tracking fine. A locked DB past the 3s busy_timeout is
+# the common way in, i.e. exactly when a retry matters.
+#
+# The render still happens either way; only the "no need to write" claim is gated.
+if [ "$RC" -eq 0 ]; then
+    { printf '%s\n%s\n%s\n' "$FP" "$L1S" "$L2S"; } > "$CACHE.tmp.$$" 2>/dev/null &&
+        mv -f "$CACHE.tmp.$$" "$CACHE" 2>/dev/null
+    rm -f "$CACHE.tmp.$$" 2>/dev/null  # the && skipped the mv: leave no debris
+fi
 
 emit "$L1S" "$L2S"
 exit 0
