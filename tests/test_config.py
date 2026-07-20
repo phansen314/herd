@@ -105,15 +105,29 @@ def _fake_claude(tmp_path, name):
 
 
 def _db_with_session(tmp_path, pid):
+    """A live `working` session owned by `pid`.
+
+    Timestamps are NOW, deliberately, and must not go back to a fixed date. These
+    two tests run the REAL daemon, so W3e_boot_sweep runs too, and it reaps any live
+    row whose started_at precedes system boot — a pre-boot row's pid may have been
+    recycled, which is exactly what that sweep is for.
+
+    A hardcoded 2026-07-15 therefore encoded the machine's boot time in the result:
+    it passed on a workstation booted before that date and failed on every CI
+    runner, which boots fresh. The session was reaped by the boot sweep before the
+    reaper ever judged liveness, so both tests failed for a reason unrelated to the
+    thing they assert."""
     import sqlite3
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     db = tmp_path / "herd.db"
     c = sqlite3.connect(db)
     for f in ("core.sql", "herd.sql"):
         c.executescript((SCHEMA / f).read_text())
     c.execute("INSERT INTO sessions(session_id,cwd,model,pid,status,status_source,"
               "last_event_at,last_event_type,started_at,updated_at) VALUES"
-              "('s1','/x','m',?,'working','hook','2026-07-15T10:00:00.000Z','tool',"
-              "'2026-07-15T10:00:00.000Z','2026-07-15T10:00:00.000Z')", (pid,))
+              "('s1','/x','m',?,'working','hook',?,'tool',?,?)",
+              (pid, now, now, now))
     c.commit()
     c.close()
     return db
