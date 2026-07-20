@@ -216,8 +216,14 @@ are served ad-hoc by parsing the per-session JSONL transcript
 (`sessions.transcript_path`).
 
 `PRAGMA auto_vacuum=INCREMENTAL` in `core.sql` was added for this table's churn and
-outlived it — nothing else grows unboundedly and no `incremental_vacuum` is ever
-called.
+outlived it: no `incremental_vacuum` is ever called, so it reclaims nothing today.
+
+This once read "nothing else grows unboundedly," which was false. `sessions` grows
+without bound — death is a soft delete (`stopped_at`), and nothing prunes stopped
+rows. It does not bite yet at the session-insert rate, and the per-tick cost it used
+to carry is gone (`W6e_sweep_dead` now scans the live set, not all history), but the
+table itself still only grows. A retention sweep is the open item; when it lands,
+that is also what would give `auto_vacuum=INCREMENTAL` something to reclaim.
 
 **Protects:** the single-lifecycle-write rule. A second event sink brings the
 divergence hazard back.

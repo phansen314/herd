@@ -308,8 +308,19 @@ WHERE session_pk = (SELECT id FROM sessions WHERE session_id = :session_id);
 -- never DELETE, so ON DELETE CASCADE never fires, and attention_tick only visits
 -- rows WHERE stopped_at IS NULL — so an armed row outlives its session, unbounded.
 -- :name W6e_sweep_dead
+-- Bounded by the LIVE set, not by all-history. The old form drove the subquery
+-- from `stopped_at IS NOT NULL` — every session that ever stopped — so this
+-- unconditional every-tick DELETE cost grew forever, scanning tens of thousands of
+-- dead rows twice a second to reclaim the near-zero attention rows among them.
+-- Driving from `stopped_at IS NULL` instead scans herd_attention (small: only armed
+-- sessions) and probes the live set by equality — both bounded, neither growing.
+-- NOT IN is safe here: sessions.id is INTEGER PRIMARY KEY, so the subquery never
+-- yields a NULL that would collapse NOT IN to "delete nothing". Equivalent to the
+-- old form on real data (herd_attention.session_pk FKs sessions(id) ON DELETE
+-- CASCADE, so an orphan cannot exist), and it also reclaims one if a cascade were
+-- ever bypassed.
 DELETE FROM herd_attention
-WHERE session_pk IN (SELECT id FROM sessions WHERE stopped_at IS NOT NULL);
+WHERE session_pk NOT IN (SELECT id FROM sessions WHERE stopped_at IS NULL);
 
 
 -- ── R_statusline. RENDER INPUT (statusline.sh): feeds only the burn rate (the
