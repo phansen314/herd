@@ -113,11 +113,38 @@ ORIGINAL_SUFFIX = ".herd-bak.original"
 
 
 def _is_wired(path, text):
-    """Does this file already point at herd? BOTH roots, or a copy-mode install
-    reads as pristine and overwrites the pre-herd snapshot with a herd-wired one."""
+    """Does this file already point at herd? Asks _is_managed — the SAME predicate
+    install uses to claim an entry — rather than scanning for the two current roots.
+
+    A raw prefix scan cannot see an install made from a checkout that has since
+    moved: neither root appears in the wired text, the file reads as pristine, and a
+    HERD-WIRED settings.json gets snapshotted as the pre-herd original, permanently.
+    --restore-original then faithfully reinstates herd and prints success. That is
+    the bug _restore_source's docstring describes, one predicate over.
+
+    KLAWDE IS EXCLUDED, and that is the whole difference between this predicate and
+    _is_managed. is_managed answers "may herd CLAIM this entry?", which is true of
+    klawde's hooks — herd unwires them. This asks "did herd WRITE this file?", and a
+    klawde-wired settings.json is precisely the pre-herd original worth snapshotting.
+    Conflating the two deletes the statusLine uninstall is supposed to hand back.
+
+    settings.json is walked as JSON; the statusline wrapper is a shell script, so it
+    falls back to scanning for a herd-owned invocation token."""
     if not text:
         return False
-    return str(HOOKS_DIR) in text or str(INSTALLED_HOOKS) in text
+
+    def ours(cmd):
+        return bool(cmd) and "/.klawde/" not in cmd and _is_managed(cmd)
+
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        cmds = [c for _, c in _settings.hook_commands(data)]
+        cmds.append(_statusline_cmd(data))
+        return any(ours(c) for c in cmds)
+    return any(ours(tok.strip("\"'")) for tok in _SL_TOKEN.findall(text))
 
 
 def backup_original(path, text):
@@ -642,7 +669,11 @@ def statusline_plan(data, wrapper_exists, hooks_dir=None):
     wrapper gets no statusline — and statusline.sh writes every metric column."""
     sl = statusline_cmd(hooks_dir)
     cmd = _statusline_cmd(data)
-    if not cmd or cmd == sl or "/.klawde/" in cmd:
+    # _is_managed, not a string compare: `cmd == sl` sees only the root this install
+    # is wiring, so switching between copy and --dev mode called the OTHER mode's
+    # statusline "foreign" and left the key behind, pointing at the previous install.
+    # `cmd == sl` stays in front of it for tests that redirect hooks_dir off both roots.
+    if not cmd or cmd == sl or _is_managed(cmd):
         return "set"
     if cmd == str(WRAPPER):
         return "wrapper" if wrapper_exists else "set"     # dangling pointer -> ours
@@ -1145,10 +1176,18 @@ def uninstall(restore_original=False):
     print("  " + _uninstall_kitty(ts))
     rc = _uninstall_settings(ts, restore_original)
     rc |= _uninstall_wrapper(ts, restore_original)
-    # After the wiring, not before: if unwiring fails the files are still referenced,
-    # and removing them first would leave settings.json pointing at nothing.
-    for line in _uninstall_hook_tree():
-        print("  " + line)
+    # After the wiring, and ONLY if it succeeded. Both unwire paths have a
+    # refuse-and-leave-it branch that returns 1 and tells the user to edit the file by
+    # hand — settings.json or the wrapper still NAMES these scripts. Removing them
+    # anyway turned a stale config into a broken one: every hook and the statusLine
+    # pointing at a path that no longer exists. Ordering alone never fixed that; the
+    # removal has to be conditional.
+    if rc == 0:
+        for line in _uninstall_hook_tree():
+            print("  " + line)
+    else:
+        print(f"  KEPT {INSTALLED_HOOKS} — the wiring above still references it.")
+        print("     Re-run --uninstall once that is resolved to remove it.")
     return rc
 
 

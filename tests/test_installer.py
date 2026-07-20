@@ -362,6 +362,72 @@ def test_uninstall_refuses_an_unparseable_settings_file(home, capsys):
     assert "--restore-original" in capsys.readouterr().out
 
 
+def test_a_refused_unwire_keeps_the_hook_tree_it_still_references(home, capsys):
+    """A refused uninstall must leave the machine EXACTLY as it found it.
+
+    _uninstall_hook_tree ran unconditionally after the unwire, and both unwire paths
+    have a refuse-and-leave-it branch. So the sequence "settings.json got hand-edited
+    into something unparseable -> run --uninstall to back out" printed an instruction,
+    returned 1, and deleted every script settings.json still names: five hooks and
+    the statusLine now pointing at paths that do not exist. Stale config in, BROKEN
+    config out, from the command you ran to make it stop.
+
+    The two refusal tests that already existed asserted rc == 1 and "the file is
+    unchanged" — neither looked at whether the referenced scripts survived, which is
+    the actual damage."""
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+    inst.install()
+    hooks = sorted(p.name for p in inst.INSTALLED_HOOKS.glob("*.sh"))
+    assert hooks, "precondition: install put a hook tree down"
+
+    inst.SETTINGS.write_text("{not json at all")          # hand-edited into garbage
+    assert inst.uninstall() == 1
+    assert sorted(p.name for p in inst.INSTALLED_HOOKS.glob("*.sh")) == hooks
+    assert "KEPT" in capsys.readouterr().out              # and it SAYS why
+
+
+def test_a_clean_uninstall_still_removes_the_hook_tree(home):
+    """The other half of the gate: rc == 0 must behave exactly as before."""
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+    inst.install()
+    assert list(inst.INSTALLED_HOOKS.glob("*.sh"))
+    assert inst.uninstall() == 0
+    assert not list(inst.INSTALLED_HOOKS.glob("*.sh"))
+
+
+def test_switching_modes_moves_the_statusline_too(home):
+    """statusline_plan used an exact string compare instead of the ownership test, so
+    it saw the OTHER mode's statusline as a stranger's: `install` then `install --dev`
+    rewired all five hooks to the checkout and left statusLine pointing at the old
+    ~/.herd copy, while printing that herd 'does not own' its own file. On a moved or
+    deleted checkout that pointer is permanently dead."""
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+    inst.install()
+    inst.install(dev=True)
+    d = json.loads(inst.SETTINGS.read_text())
+    assert d["statusLine"]["command"] == inst.statusline_cmd(inst.HOOKS_DIR)
+    inst.install()
+    d = json.loads(inst.SETTINGS.read_text())
+    assert d["statusLine"]["command"] == inst.statusline_cmd()
+
+
+def test_a_moved_checkout_is_not_snapshotted_as_the_pre_herd_original(home):
+    """_is_wired scanned for the two CURRENT roots, so an install made from a
+    checkout that has since moved read as pristine — and a herd-wired settings.json
+    became the permanent '.original'. --uninstall --restore-original then reinstated
+    herd and printed success. That is the _restore_source bug, one predicate over."""
+    moved = {"hooks": {"SessionStart": [{"hooks": [
+        {"type": "command", "command": "/gone/elsewhere/herd/hooks/session_start.sh"}]}]}}
+    text = json.dumps(moved)
+    assert inst._is_wired(inst.SETTINGS, text)
+    assert inst.backup_original(inst.SETTINGS, text) is None
+
+    # and the distinction the predicate turns on: klawde is not herd's own writing.
+    klawde = json.dumps({"statusLine": {"type": "command",
+                                        "command": "/h/.klawde/statusline.sh"}})
+    assert not inst._is_wired(inst.SETTINGS, klawde)
+
+
 def test_a_failed_selftest_aborts_before_touching_settings(home, monkeypatch):
     """The self-test exists to catch hooks that are wired but silently no-op. Running
     it after the write meant reporting FAIL on a config already pointed at herd."""
