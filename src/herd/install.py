@@ -27,6 +27,7 @@ import sys
 import tempfile
 
 from herd import config as herd_config
+from herd import settings as _settings
 from herd.db import connect, apply_schema
 
 HOOKS_DIR = pathlib.Path(__file__).resolve().parent / "hooks"   # in the checkout
@@ -74,15 +75,11 @@ CLI_LINK = HOME / ".local" / "bin" / "herd"
 COMPLETION_SRC = REPO / "completions" / "herd.bash"
 COMPLETION_LINK = HOME / ".local" / "share" / "bash-completion" / "completions" / "herd"
 
-# event -> (hook script, async?). Stop is NEW (klawde has none). SessionStart and
-# SessionEnd are BLOCKING; SessionEnd blocking is the fix for klawde's async bug.
-HERD_HOOKS = {
-    "SessionStart": ("session_start.sh", False),
-    "Stop":         ("stop.sh",          True),
-    "SessionEnd":   ("session_end.sh",   False),
-    "Notification": ("notification.sh",  True),
-    "PostToolUse":  ("post_tool_use.sh", True),
-}
+# Both now live in settings.py, which doctor reads too — see the module docstring
+# there on why one definition matters. Re-exported because the tests and the rest of
+# this module address them here.
+HERD_HOOKS = _settings.HERD_HOOKS
+_OUR_SCRIPTS = _settings.OUR_SCRIPTS
 
 STATUSLINE = str(INSTALLED_HOOKS / "statusline.sh")
 
@@ -105,25 +102,9 @@ def statusline_cmd(hooks_dir=None):
 
 
 def _is_managed(cmd):
-    """A command herd owns — klawde's, or any prior herd install. Everything else
-    (cdh, the PreToolUse HTTP hook, anything unknown) is preserved untouched.
-
-    Recognising our own scripts BY NAME matters as much as by path: a prefix test
-    against the current roots misses an install made from a checkout that has since
-    moved, so the stale entry survives the strip and step 2 adds a second one —
-    every hook then fires twice. The herd-shaped-path condition keeps us from
-    claiming an unrelated tool's session_start.sh."""
-    if not cmd:
-        return False
-    if "/.klawde/" in cmd:
-        return True
-    if cmd.startswith(str(HOOKS_DIR)) or cmd.startswith(str(INSTALLED_HOOKS)):
-        return True
-    parts = cmd.split()
-    if not parts:                       # whitespace-only: `not cmd` misses it, and
-        return False                    # split()[0] on it is an IndexError
-    path = parts[0]
-    return path.rsplit("/", 1)[-1] in _OUR_SCRIPTS and ("/herd/" in path or "/.herd/" in path)
+    """Delegates to settings.is_managed — the definition doctor uses too. The roots
+    come from THIS module, so a test that redirects INSTALLED_HOOKS still works."""
+    return _settings.is_managed(cmd, (HOOKS_DIR, INSTALLED_HOOKS))
 
 
 def _ts():
@@ -632,8 +613,9 @@ def _uninstall_kitty(ts):
 
 # ── settings.json surgery ──────────────────────────────────────────────────
 def _statusline_cmd(data):
-    sl = data.get("statusLine")
-    return sl.get("command", "") if isinstance(sl, dict) else ""
+    """Delegates to settings.statusline_command, which also survives a statusLine
+    that is a string or a list — this copy did not."""
+    return _settings.statusline_command(data)
 
 
 def statusline_plan(data, wrapper_exists, hooks_dir=None):
@@ -659,23 +641,9 @@ def statusline_plan(data, wrapper_exists, hooks_dir=None):
 
 
 def _strip_managed(hooks):
-    """Remove every herd-managed command in place, dropping blocks and then events
-    that become empty. cdh / PreToolUse-HTTP / others are untouched.
-
-    Shared by rewire_settings (which re-adds herd afterwards) and unwire_settings
-    (which does not). It lives in one place because the two must agree on what herd
-    owns — a strip that drifts from the re-add either doubles every hook or strands
-    one behind."""
-    for event in list(hooks):
-        blocks = hooks[event]
-        for block in blocks:
-            block["hooks"] = [h for h in block.get("hooks", [])
-                              if not _is_managed(h.get("command", ""))]
-        kept = [b for b in blocks if b.get("hooks")]
-        if kept:
-            hooks[event] = kept
-        else:
-            del hooks[event]
+    """Delegates to settings.strip_managed. That copy is shape-tolerant; this one
+    raised AttributeError on a hand-edited settings.json."""
+    _settings.strip_managed(hooks, (HOOKS_DIR, INSTALLED_HOOKS))
 
 
 def rewire_settings(data, wrapper_exists=False, hooks_dir=None):
@@ -921,7 +889,32 @@ def install(dry=False, dev=False):
     # A first-time machine may have no settings.json at all — treat that as empty
     # rather than a traceback. rewire_settings() setdefaults "hooks", backup()
     # no-ops on a missing file, so the absent case needs no other special-casing.
-    settings = json.loads(SETTINGS.read_text()) if SETTINGS.exists() else {}
+    # NOT a bare json.loads. A truncated or hand-broken settings.json raised
+    # JSONDecodeError straight out of install(), and a mode-000 one PermissionError
+    # — a stack trace from the command you run precisely BECAUSE your config is
+    # broken. _uninstall_settings has always caught both and said something useful;
+    # this end of the module did not.
+    settings = {}
+    if SETTINGS.exists():
+        try:
+            settings = json.loads(SETTINGS.read_text())
+        except (OSError, ValueError) as e:       # ValueError covers JSONDecodeError
+            print(f"herd install: cannot read {SETTINGS} — {e}")
+            print("  fix the file (or move it aside) and re-run; nothing was changed.")
+            return 2
+    if not isinstance(settings, dict):
+        # A settings.json that is a list or a string parses fine and is not a
+        # settings file. Wiring into it would produce something Claude cannot read.
+        print(f"herd install: {SETTINGS} is not a JSON object — nothing was changed.")
+        return 2
+    if "hooks" in settings and not isinstance(settings["hooks"], dict):
+        # rewire_settings does hooks.setdefault(event, ...), which is an
+        # AttributeError on a list. Refusing is right rather than coercing: `hooks`
+        # holding something unexpected is a file herd did not write and does not
+        # understand, and replacing it with {} would delete whatever the user meant.
+        print(f"herd install: {SETTINGS} has a `hooks` key that is not an object "
+              f"({type(settings['hooks']).__name__}) — nothing was changed.")
+        return 2
     plan = statusline_plan(settings, WRAPPER.exists(), hooks_dir)
     new_settings = rewire_settings(settings, wrapper_exists=WRAPPER.exists(),
                                    hooks_dir=hooks_dir)

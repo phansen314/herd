@@ -20,6 +20,7 @@ import sys
 
 from herd import MIN_PYTHON
 from herd import daemon
+from herd import settings as _settings
 
 OK, WARN, FAIL = "ok", "warn", "fail"
 _MARK = {OK: "✔", WARN: "!", FAIL: "✘"}
@@ -48,31 +49,13 @@ def _db_path():
 # you run to find out why herd is broken died with a traceback instead of naming
 # the block. install._strip_managed has always used .get() here; doctor did not.
 def _hook_commands(data):
-    """[(event, command), ...] from a settings dict, tolerating any shape."""
-    out = []
-    hooks = data.get("hooks")
-    if not isinstance(hooks, dict):
-        return out
-    for event, blocks in hooks.items():
-        if not isinstance(blocks, list):
-            continue
-        for b in blocks:
-            if not isinstance(b, dict):
-                continue
-            hs = b.get("hooks")
-            if not isinstance(hs, list):
-                continue
-            for h in hs:
-                if isinstance(h, dict):
-                    out.append((event, h.get("command") or ""))
-    return out
+    """Delegates to settings.hook_commands — the walk install uses too."""
+    return _settings.hook_commands(data)
 
 
 def _statusline_command(data):
-    """settings.statusLine.command, or "" — including when statusLine is a string,
-    a list, or anything else a hand edit can leave behind."""
-    sl = data.get("statusLine")
-    return (sl.get("command") or "") if isinstance(sl, dict) else ""
+    """Delegates to settings.statusline_command."""
+    return _settings.statusline_command(data)
 
 
 def _readable(path):
@@ -193,8 +176,14 @@ def check_wiring(settings_text, hook_roots, statusline_paths, events):
     for ev, cmd in _hook_commands(data):
         wired.setdefault(ev, []).append(cmd)
     for event in events:
+        # settings.is_managed, NOT a substring test against the current roots. The
+        # broader match is deliberate (see settings.py): a prefix test misses an
+        # install made from a checkout that has since MOVED — which is precisely the
+        # case install._is_managed exists to handle, and which doctor used to report
+        # as `<event> not wired` about hooks that were running fine. Two definitions
+        # of ownership, one file apart; now one.
         cmds = [c for c in wired.get(event, [])
-                if any(str(r) in c for r in hook_roots)]
+                if _settings.is_managed(c, hook_roots)]
         if not cmds:
             out.append((FAIL, f"{event} not wired", "run: python3 -m herd.install"))
         elif not os.path.exists(cmds[0]):
