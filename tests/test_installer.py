@@ -646,6 +646,37 @@ def test_hooks_are_current_detects_drift(home):
     assert not inst.hooks_are_current()
 
 
+def test_hooks_are_current_detects_a_lost_executable_bit(home):
+    """Byte-identical is not current if the hook can no longer RUN.
+
+    _copy_hook_tree chmods +x because without it the hook is a silent no-op, and
+    selftest has a dedicated not_executable check because a blank statusline once
+    shipped exactly that way. This compared content only, so the drift detector
+    `herd doctor` reads called a tree "current" when a umask change, a restrictive
+    mount or a stray chmod -R had turned every hook into a no-op."""
+    inst.sync_hooks()
+    assert inst.hooks_are_current()
+    (inst.INSTALLED_HOOKS / "stop.sh").chmod(0o644)
+    assert not inst.hooks_are_current()
+
+
+def test_rewire_survives_a_hand_edited_event_value(home):
+    """install() type-checks settings["hooks"] and refuses a non-dict with an
+    explanation. The level below had no such check, so an event whose value is a
+    dict reached .insert() and raised AttributeError — a raw traceback out of the
+    command you run BECAUSE your config is odd, which is the failure mode this file
+    refuses everywhere else. The stranger's value is kept, not dropped: herd does
+    not own a shape it cannot read (settings.strip_managed follows the same rule)."""
+    foreign = {"hooks": [{"type": "command", "command": "/opt/theirs.sh"}]}
+    odd = {"hooks": {"Stop": foreign,                   # a BLOCK where a list belongs
+                     "SessionStart": "not-a-list"}}     # and something with no shape
+    out = inst.rewire_settings(odd)                     # must not raise
+    assert out["hooks"]["Stop"][0]["hooks"][0]["command"].endswith("stop.sh")
+    assert foreign in out["hooks"]["Stop"]              # the stranger's hook survives
+    assert "not-a-list" in out["hooks"]["SessionStart"]
+    assert inst.rewire_settings(out) == out             # and it is still idempotent
+
+
 # ── symlinks + service: the side-effecting paths ────────────────────────────
 def test_relink_backs_up_a_real_file_instead_of_destroying_it(tmp_path):
     """uninstall_cli only removes symlinks resolving to OUR target, so anything

@@ -341,6 +341,14 @@ def hooks_are_current(hooks_dir=None):
             dst = dst_dir / src.name
             if not dst.exists() or dst.read_bytes() != src.read_bytes():
                 return False
+            # Byte-identical is not enough for the HOOKS: _copy_hook_tree chmods +x
+            # because without it the hook is a silent no-op, and selftest has a
+            # dedicated not_executable check because a blank statusline once shipped
+            # that way. Comparing content alone, the drift detector `herd doctor`
+            # reads reported "current" for a tree whose +x had been lost — to a
+            # umask change, a restrictive mount, or a stray chmod -R.
+            if pattern == "*.sh" and not os.access(dst, os.X_OK):
+                return False
     return True
 
 
@@ -746,7 +754,17 @@ def rewire_settings(data, wrapper_exists=False, hooks_dir=None):
         entry = {"type": "command", "command": hook_cmd(script, hooks_dir)}
         if is_async:
             entry["async"] = True
-        hooks.setdefault(event, []).insert(0, {"hooks": [entry]})
+        # An event whose value is not a list is a hand edit. install() type-checks
+        # settings["hooks"] itself and refuses a non-dict with an explanation; this
+        # level had no such check, so {"hooks": {"Stop": {...}}} reached .insert on a
+        # dict and raised AttributeError — a raw traceback out of the command you run
+        # BECAUSE your config is odd. strip_managed already leaves such a value
+        # alone (herd does not own a shape it cannot read); herd's own entry goes in
+        # front of it, which is the same position it takes everywhere else.
+        blocks = hooks.get(event)
+        if not isinstance(blocks, list):
+            blocks = [] if blocks is None else [blocks]
+        hooks[event] = [{"hooks": [entry]}] + blocks
 
     # 3. the statusline. Preserve any sibling keys (padding etc.) — only the
     #    command is ours to set.
