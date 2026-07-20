@@ -141,14 +141,24 @@ def test_broken_ps_reaps_nothing(fresh, tmp_path, monkeypatch):
     test_an_untrustworthy_recheck_reaps_nothing). Deleting EITHER leaves the row
     unreaped, so the outcome assertion alone cannot tell you the outer guard is
     still there — verified by deleting each in turn. The spy pins it directly:
-    on an untrustworthy table, run() must not call reap_once at all."""
+    on an untrustworthy table, run() must not call reap_once at all.
+
+    started_at is NOW, not _live()'s T0 default. This drives the REAL run(), so
+    W3e_boot_sweep runs too, and it reaps any live row whose started_at precedes
+    system boot. With T0 (2026-07-15) the row survives on a workstation booted
+    before that date and is swept on a CI runner, which boots fresh — so the boot
+    sweep stopped the row before the reaper under test was ever reached, and the
+    test failed for a reason unrelated to what it asserts. Exactly the trap
+    test_config.py's _db_with_session documents and _db_with_dead_session below
+    avoids; this is the third time it has been paid for."""
     db = tmp_path / "brokenps.db"
     conn = sqlite3.connect(db)
     for f in ("core.sql", "herd.sql"):
         conn.executescript((SRC / "herd" / "schema" / f).read_text())
     conn.commit()
     conn.row_factory = sqlite3.Row
-    k = _live(conn, "alive", 5003)
+    now = daemon._now_iso()
+    k = _live(conn, "alive", 5003, started=now, le=now)
     conn.commit()
     conn.close()
 
