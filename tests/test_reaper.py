@@ -119,17 +119,67 @@ def test_read_proc_table_parses_a_good_table(monkeypatch):
     assert read_proc_table() == {100: ("S", "claude")}
 
 
-@pytest.mark.shell
-def test_broken_ps_reaps_nothing(fresh, monkeypatch):
-    """The whole point: one failed probe must not stop every live session."""
-    c = fresh()
-    k = _live(c, "alive", 5003)
+def test_broken_ps_reaps_nothing(fresh, tmp_path, monkeypatch):
+    """The whole point: one failed probe must not stop every live session.
+
+    THE GUARD UNDER TEST IS IN run(), so run() is what this drives. It used to read
+
+        procs = read_proc_table()
+        assert procs is None
+        if procs is not None:                 # mirrors run()'s guard
+            reap_once(...)
+        assert stopped_at(c, k) is None
+
+    — `procs` had just been asserted None, so the branch was dead and the final
+    assertion was tautological. run()'s guard was COPIED here rather than exercised,
+    and the test passed against a run() with no guard at all. It was also the only
+    thing standing between a stubbed read_proc_table and no coverage of the real one;
+    see test_the_real_ps_probe_sees_this_process.
+
+    TWO assertions, because the behaviour has two independent guards: run()'s
+    `procs is not None` and reap_once's `confirm is None` (pinned on its own by
+    test_an_untrustworthy_recheck_reaps_nothing). Deleting EITHER leaves the row
+    unreaped, so the outcome assertion alone cannot tell you the outer guard is
+    still there — verified by deleting each in turn. The spy pins it directly:
+    on an untrustworthy table, run() must not call reap_once at all."""
+    db = tmp_path / "brokenps.db"
+    conn = sqlite3.connect(db)
+    for f in ("core.sql", "herd.sql"):
+        conn.executescript((SRC / "herd" / "schema" / f).read_text())
+    conn.commit()
+    conn.row_factory = sqlite3.Row
+    k = _live(conn, "alive", 5003)
+    conn.commit()
+    conn.close()
+
+    called = []
+    real_reap = daemon.reap_once
+    monkeypatch.setattr(daemon, "reap_once",
+                        lambda *a, **kw: called.append(a[1]) or real_reap(*a, **kw))
     monkeypatch.setattr(daemon.subprocess, "run", _FakePs(rc=1, out=""))
+    daemon.run(db_path=str(db), once=True, attend=False)
+
+    assert called == [], f"run() reaped against an untrustworthy table: {called}"
+    c = sqlite3.connect(db)
+    c.row_factory = sqlite3.Row
+    try:
+        assert stopped_at(c, k) is None, "a failed ps probe reaped a live session"
+    finally:
+        c.close()
+
+
+@pytest.mark.shell
+def test_the_real_ps_probe_sees_this_process():
+    """read_proc_table against the REAL ps, unstubbed.
+
+    Every other caller in this file replaces daemon.subprocess.run, and the one
+    unstubbed caller sat inside a dead `if` — so nothing executed
+    `ps -eo pid=,stat=,comm=` and a typo in that argv passed the whole file green.
+    Our own pid must be in the table; a `ps` that cannot see the process asking is
+    the failure read_proc_table returns None for."""
     procs = read_proc_table()
-    assert procs is None
-    if procs is not None:                     # mirrors run()'s guard
-        reap_once(c, procs, T2, recheck=lambda: procs)
-    assert stopped_at(c, k) is None
+    assert procs is not None, "the real ps probe failed outright"
+    assert os.getpid() in procs, "ps did not list this process"
 
 
 # ── W3f: stranded spawn reservations ────────────────────────────────────────
