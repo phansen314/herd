@@ -1,4 +1,4 @@
-"""Jump to a session's kitty window — reusable by the CLI and the future TUI.
+"""Jump to a session's kitty window — reusable by the CLI and by `watch`.
 
 Placement (kitty_socket, window_id) is a CACHE: kitty REUSES window ids, so before
 focusing we re-derive the window from `kitten @ ls` and confirm its foreground claude
@@ -94,6 +94,8 @@ def focus_session(conn, session_pk, now, *, list_fn=None, focus_fn=None):
     # a jump IS an ack: clear this session's attention if it was raised.
     conn.execute(W["W6c_ack"], {"pk": session_pk, "now": now, "focus_started_at": now})
     if win != stored:
-        conn.execute("UPDATE herd_sessions SET window_id = ?, verified_at = ? "
-                     "WHERE session_pk = ?", (win, now, session_pk))
+        # W1_spawn_window, not an inline UPDATE: stamping a placement onto
+        # herd_sessions is that statement's job whether the placement came from a
+        # launch or from this self-heal. writes.sql is THE set of writes.
+        conn.execute(W["W1_spawn_window"], {"pk": session_pk, "win": win, "now": now})
     return True, f"focused window {win} on {socket}"

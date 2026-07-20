@@ -197,6 +197,41 @@ def test_no_hook_inlines_dml():
     assert not offenders, f"inlined DML at {offenders}"
 
 
+def test_no_python_module_inlines_dml():
+    """The Python half of test_no_hook_inlines_dml.
+
+    "The ONLY statements that write" is asserted in writes.sql, DESIGN.md, README.md
+    and DECISIONS.md — and the guard cited as enforcing it globbed *.sh, so
+    focus.py:97 carried a verbatim copy of W1_spawn_window past all four claims. An
+    invariant with a hole in its guard is a comment.
+
+    Parsed, not grepped: every prose mention of "delete the per-session files" is a
+    docstring, and a substring scan would drown in them. Only real string literals
+    handed to sqlite3 can be DML."""
+    import ast
+
+    dml = re.compile(r"\b(INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)", re.I)
+    offenders = []
+    for py in sorted((ROOT / "src" / "herd").rglob("*.py")):
+        tree = ast.parse(py.read_text())
+        docstrings = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef,
+                                 ast.FunctionDef, ast.AsyncFunctionDef)):
+                body = getattr(node, "body", None)
+                if body and isinstance(body[0], ast.Expr) \
+                        and isinstance(body[0].value, ast.Constant) \
+                        and isinstance(body[0].value.value, str):
+                    docstrings.add(id(body[0].value))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                    and id(node) not in docstrings and dml.search(node.value):
+                rel = py.relative_to(ROOT)
+                offenders.append(f"{rel}:{node.lineno}")
+    assert not offenders, (
+        f"inlined DML at {offenders} — route it through writes.sql via W[...]")
+
+
 def test_preview_reads_live_sessions_only_through_r1_list():
     """The bash twin of test_focus_cli.py::test_cli_reads_live_sessions_only_through_r1_list.
 
