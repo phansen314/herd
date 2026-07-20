@@ -348,6 +348,87 @@ def test_a_newline_in_the_cwd_does_not_lose_the_fields_after_it(hook_env):
     assert row["api_duration_ms"] == 2300
 
 
+def test_a_separator_in_the_name_does_not_shift_every_later_field(hook_env):
+    """The sibling of the newline test, and the worse half. \\x1f is what the 23
+    outputs are JOINED with, and it was not stripped — so a payload carrying one
+    does not truncate the read, it SHIFTS it: every later value lands in the next
+    field. Unlike the newline case, COALESCE cannot absorb it. The values are
+    non-NULL and wrong, and they are sticky for the life of the row.
+
+    Measured on the unfixed script with this exact payload: total_cost_usd took the
+    context percentage (12.5 -> $12.50) and rate_limit_5h_percent took the cost."""
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/code/herd")
+    pay = {**SL_FULL, "session_name": "ev\x1fil",
+           "context_window": {**SL_FULL["context_window"], "used_percentage": 12.5},
+           "cost": {**SL_FULL["cost"], "total_cost_usd": 1.75}}
+    out = _statusline(hook_env, pay).stdout
+    row = c.execute("SELECT session_name, context_percent, total_cost_usd, "
+                    "rate_limit_5h_percent, model FROM sessions "
+                    "WHERE session_id='s1'").fetchone()
+    assert row["session_name"] == "ev il"          # separator folded to a space
+    assert row["total_cost_usd"] == 1.75           # NOT 12.5, the context percentage
+    assert row["rate_limit_5h_percent"] == 73.5    # NOT 1.75, the cost
+    assert row["context_percent"] == 12
+    assert row["model"] == "claude-opus-4-8"
+    assert "💰 $1.75" in out
+
+
+def test_a_separator_in_the_cwd_is_folded_too(hook_env):
+    """The strip lives in the map, so it covers all 23 fields — not just the name.
+    Asserts on a field AFTER cwd (10th), since an earlier one passes either way."""
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/code/herd")
+    out = _statusline(hook_env, {**SL_FULL, "cwd": "/code/her\x1fd"}).stdout
+    # api_duration_ms is 11th, cwd 10th. cwd itself is NOT asserted: statusline sinks
+    # no cwd parameter at all (session_start owns that column), so it would pass
+    # with or without the fix.
+    row = c.execute("SELECT api_duration_ms FROM sessions "
+                    "WHERE session_id='s1'").fetchone()
+    assert row["api_duration_ms"] == 2300
+    assert "⌛" in out
+
+
+def test_the_sentinel_blocks_the_sink_rather_than_writing_a_shifted_row(hook_env):
+    """Belt and braces behind the strip: the read takes one variable more than there
+    are fields, so a shift that somehow reaches it is VISIBLE instead of silent. It
+    has to fail closed — no DB write — because a shifted row is permanent while a
+    bad render lasts one tick. Simulated by breaking the sentinel, which is the one
+    way to exercise the guard without a jq that ignores the gsub."""
+    c = hook_env.conn()
+    mk_session(c, session_id="s1", cwd="/code/herd")
+    before = c.execute("SELECT total_cost_usd FROM sessions "
+                       "WHERE session_id='s1'").fetchone()["total_cost_usd"]
+
+    # A copy of the tree, because hook_env runs the hooks from the CHECKOUT and this
+    # test has to edit one. common.sh resolves the SQL as <hooks>/../schema, so the
+    # layout has to be preserved, not just the one script.
+    root = pathlib.Path(hook_env.runtime).parent / "broken"
+    (root / "hooks").mkdir(parents=True)
+    (root / "schema").mkdir()
+    for f in HOOKS.glob("*.sh"):
+        (root / "hooks" / f.name).write_text(f.read_text())
+    for f in (HOOKS.parent / "schema").glob("*.sql"):
+        (root / "schema" / f.name).write_text(f.read_text())
+    sl = root / "hooks" / "statusline.sh"
+    broken = sl.read_text().replace('EOR"\'', 'NOPE"\'')
+    assert broken != sl.read_text(), "sentinel literal moved — update this test"
+    sl.write_text(broken)
+
+    env = dict(os.environ, HERD_DB=hook_env.path, HERD_RUNTIME=hook_env.runtime,
+               HERD_ERRLOG=f"{hook_env.runtime}/err.log")
+    for k in ("KITTY_WINDOW_ID", "KITTY_LISTEN_ON", "HERD_JOB"):
+        env.pop(k, None)
+    out = subprocess.run(["bash", str(sl)], input=json.dumps(SL_FULL),
+                         capture_output=True, text=True, env=env).stdout
+
+    after = c.execute("SELECT total_cost_usd FROM sessions "
+                      "WHERE session_id='s1'").fetchone()["total_cost_usd"]
+    assert after == before, "a shifted parse must not reach the DB"
+    assert "parse error" in out
+    assert any("parse shifted" in line for line in _errlog(hook_env))
+
+
 def test_a_carriage_return_is_folded_too(hook_env):
     """\r does not terminate `read`, so this one is cosmetic rather than a
     truncation — a bare CR in a name still garbles the rendered line."""
