@@ -30,10 +30,32 @@ ok() { c '32' "  ✔ $1"; }
 no() { c '31' "  ✘ $1"; }
 hm() { c '33' "  ! $1"; }
 
-q()  { sqlite3 -noheader "$DB" "$1" 2>/dev/null; }
+# The job name reaches SQL as a literal, so double every quote — the same rule
+# common.sh's bind() follows. Interpolated raw, `smoke'; DELETE FROM sessions; --`
+# ran as SQL (verified: it deleted the rows and the script printed ✔), and the far
+# likelier `paul's-run` silently broke every check in here.
+JOB_SQL=$(printf '%s' "$JOB" | sed "s/'/''/g")
+
+# mode=rw REFUSES to create. A bare path let sqlite3's default create an empty
+# schema-less DB on a typo'd HERD_DB — `check` and `clean` had no [ -f "$DB" ] guard
+# — and the hooks then open that file happily while the daemon reports "no such
+# table: sessions" forever. Only the installer may create a database (common.sh:288).
+# % first, or the escapes we add get re-escaped.
+db_uri() {
+    local u="${DB//%/%25}"
+    u="${u//\?/%3F}"; u="${u//#/%23}"
+    printf 'file:%s?mode=rw' "$u"
+}
+DBURI="$(db_uri)"
+
+# .timeout, because the hooks are writing to this DB by design. Without it a
+# SQLITE_BUSY is swallowed by 2>/dev/null, reads as an empty result, and `verify`
+# renders that as "the job name was lost" — the script reporting the bug it exists
+# to detect.
+q()  { sqlite3 -noheader -cmd ".timeout 3000" "$DBURI" "$1" 2>/dev/null; }
 
 rows() {
-    sqlite3 -header -column "$DB" "
+    sqlite3 -header -column -cmd ".timeout 3000" "$DBURI" "
       SELECT s.id, substr(s.session_id,1,8) AS sess, COALESCE(h.job_name,'—') AS job,
              COALESCE(h.source,'—') AS src, COALESCE(h.window_id,'—') AS win,
              COALESCE(s.pid,'—') AS pid, s.status,
@@ -46,7 +68,7 @@ verify() {
     echo; c '1' "current rows (newest first)"; rows; echo
     local live_pk job_src job_win job_sid dupes
     live_pk=$(q "SELECT s.id FROM sessions s JOIN herd_sessions h ON h.session_pk=s.id
-                 WHERE h.job_name='$JOB' AND s.stopped_at IS NULL ORDER BY s.id DESC LIMIT 1")
+                 WHERE h.job_name='$JOB_SQL' AND s.stopped_at IS NULL ORDER BY s.id DESC LIMIT 1")
     if [ -z "$live_pk" ]; then
         no "no LIVE session holds job '$JOB' — the job name was lost"
         hm "that is the bug class we fixed today; the rows above say which way"
@@ -56,7 +78,7 @@ verify() {
     job_src=$(q "SELECT source FROM herd_sessions WHERE session_pk=$live_pk")
     job_win=$(q "SELECT COALESCE(window_id,'') FROM herd_sessions WHERE session_pk=$live_pk")
     dupes=$(q "SELECT COUNT(*) FROM sessions s JOIN herd_sessions h ON h.session_pk=s.id
-               WHERE h.job_name='$JOB' AND s.stopped_at IS NULL")
+               WHERE h.job_name='$JOB_SQL' AND s.stopped_at IS NULL")
 
     ok "job '$JOB' is held by live session #$live_pk"
     [ -n "$job_sid" ] && ok "adopted Claude's uuid: $job_sid" \
@@ -71,7 +93,7 @@ verify() {
         ok "route: adopted the reservation in place (source=spawn)"
     else
         pred=$(q "SELECT s.id FROM sessions s JOIN herd_sessions h ON h.session_pk=s.id
-                  WHERE h.job_name='$JOB' AND s.stopped_at IS NOT NULL
+                  WHERE h.job_name='$JOB_SQL' AND s.stopped_at IS NOT NULL
                     AND s.pid = (SELECT pid FROM sessions WHERE id=$live_pk)
                     AND h.window_id = (SELECT window_id FROM herd_sessions WHERE session_pk=$live_pk)
                   ORDER BY s.id DESC LIMIT 1")
@@ -94,12 +116,17 @@ verify() {
     # match, which would yank you to the spawned tab and away from these results.
     echo; c '1' "does the handle resolve? (no focus — read-only)"
     local n
-    n=$(cd "$REPO" && PYTHONPATH="$REPO/src" python3 -c "
-import sys
+    # The job name arrives in the ENVIRONMENT, not spliced into the source. Quoted
+    # into the -c text it was a second injection point with a quieter failure than
+    # the SQL one: an apostrophe made it a SyntaxError, 2>/dev/null ate it, and the
+    # case below reported "resolves to nothing" — a false negative on the exact
+    # thing this check exists to prove.
+    n=$(cd "$REPO" && PYTHONPATH="$REPO/src" HERD_SMOKE_JOB="$JOB" python3 -c "
+import os
 from herd.cli import resolve
 from herd.db import connect
 from herd.daemon import DEFAULT_DB
-print(len(resolve(connect(DEFAULT_DB, readonly=True), '$JOB')))" 2>/dev/null)
+print(len(resolve(connect(DEFAULT_DB, readonly=True), os.environ['HERD_SMOKE_JOB'])))" 2>/dev/null)
     case "$n" in
         1) ok "'$JOB' resolves to exactly 1 session — herd jump $JOB will go straight there" ;;
         0|"") hm "'$JOB' resolves to nothing (or the check could not run)" ;;
@@ -117,7 +144,7 @@ spawn)
     [ -f "$DB" ] && ok "db: $DB" || { no "no db at $DB"; exit 1; }
     q "SELECT 1" >/dev/null && ok "db readable" || { no "db unreadable"; exit 1; }
     if [ -n "$(q "SELECT 1 FROM sessions s JOIN herd_sessions h ON h.session_pk=s.id
-                  WHERE h.job_name='$JOB' AND s.stopped_at IS NULL")" ]; then
+                  WHERE h.job_name='$JOB_SQL' AND s.stopped_at IS NULL")" ]; then
         no "job '$JOB' is already held by a live session"
         no "  finish that one, or: bash $0 clean"; exit 1
     fi
@@ -135,7 +162,7 @@ spawn)
     echo "   past 120s is one of the cases we fixed.)"
     for i in $(seq 40); do
         sid=$(q "SELECT session_id FROM sessions s JOIN herd_sessions h ON h.session_pk=s.id
-                 WHERE h.job_name='$JOB' AND s.stopped_at IS NULL AND s.session_id IS NOT NULL")
+                 WHERE h.job_name='$JOB_SQL' AND s.stopped_at IS NULL AND s.session_id IS NOT NULL")
         [ -n "$sid" ] && break
         sleep 1; printf '.'
     done; echo
@@ -158,7 +185,7 @@ spawn)
 check)  verify ;;
 clean)
     pks=$(q "SELECT s.id FROM sessions s JOIN herd_sessions h ON h.session_pk=s.id
-             WHERE h.job_name='$JOB'")
+             WHERE h.job_name='$JOB_SQL'")
     [ -z "$pks" ] && { ok "nothing to clean for job '$JOB'"; exit 0; }
     echo "  removing sessions rows: $(echo "$pks" | tr '\n' ' ')"
     echo "  (close the spawned tab first if it is still open)"
