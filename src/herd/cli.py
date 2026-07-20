@@ -175,9 +175,15 @@ def _preview_cmd():
 
 
 def _fzf_run(rows, query, extra=()):
-    """Run the picker, return its raw stdout. watch needs the raw text: with
-    --expect the pressed key is the first line, and that is its only way to tell
-    quit from cancel.
+    """Run the picker, return (raw stdout, exit code). watch needs the raw text:
+    with --expect the pressed key is the first line, and that is its only way to
+    tell quit from cancel.
+
+    THE EXIT CODE IS NOT OPTIONAL, it is the only thing that separates "the user
+    pressed Esc" (130) from "fzf never ran" (2). Both produce empty stdout, so
+    discarding the code left cmd_watch's loop unable to tell a self-paced human
+    from a picker failing instantly — and it re-entered with no delay, binding a
+    port and forking a poker each pass: 5000 iterations in 0.25s, measured.
 
     `extra` appends watch-mode flags (--listen, --expect, extra binds) without
     forking a second copy of the flag list — jump and watch must not drift apart on
@@ -193,12 +199,12 @@ def _fzf_run(rows, query, extra=()):
          "--preview", preview, "--preview-window", "right,55%,wrap", *extra],
         input="\n".join(_row_line(r) for r in rows),
         stdout=subprocess.PIPE, text=True)   # stderr stays on the terminal (fzf's UI)
-    return p.stdout
+    return p.stdout, p.returncode
 
 
 def _fzf_pick(rows, query, extra=()):
     """Interactive fuzzy pick with a live preview pane. Returns a row or None."""
-    return _parse_pick(rows, _fzf_run(rows, query, extra))
+    return _parse_pick(rows, _fzf_run(rows, query, extra)[0])
 
 
 # ── preview (its own process, spawned by fzf per highlight — reads live) ──────
@@ -279,6 +285,13 @@ def cmd_rows(conn, args):
 _ROWS_CMD = f"{shlex.quote(sys.executable)} -m herd.cli rows"   # -> sh -c, see _fzf_run
 _POKE_INTERVAL = 2.0
 _POKE_GRACE = 10                            # ticks to let fzf bind before giving up
+
+# A picker that returns NOTHING in under this long did not host a human decision.
+# Esc is self-paced, so re-entering instantly is right for it; an fzf that cannot
+# start returns in ~1ms and re-entering instantly is a fork bomb. Time is the
+# backstop behind the exit code, for a failure that exits 0 or 1 rather than 2.
+_PICKER_MIN_SECS = 0.25
+_PICKER_MAX_FAST = 5
 
 
 def _rows_text(conn):
@@ -480,6 +493,7 @@ def cmd_watch(conn, args):
         print("herd watch needs fzf and a tty (try: herd ls)")
         return 2
     empty = False
+    fast_empty = 0
     while True:
         rows = _live(conn)
         if not rows:
@@ -502,13 +516,24 @@ def cmd_watch(conn, args):
         empty = False
         port = _free_port()
         poker = _spawn_poker(port)
+        started = time.monotonic()
         try:
-            out = _fzf_run(rows, "", _watch_flags(port, one_shot))
+            out, rc = _fzf_run(rows, "", _watch_flags(port, one_shot))
         except KeyboardInterrupt:
             return 130                      # belt-and-braces: a ctrl-c that lands
                                             # before fzf has taken the terminal
         finally:
             _reap_poker(poker, port)        # one poker per picker, always reaped
+        # fzf: 0 selected, 1 no match, 2 ERROR, 130 interrupted (Esc/ctrl-c). Only 2
+        # means the picker itself failed — a --bind this fzf does not know, a --listen
+        # port taken between _free_port and exec, a terminal too small for --height.
+        # Looping on that re-binds a port and forks a poker per pass with nothing
+        # slowing it down. It cannot fix itself, so say why and stop.
+        if rc == 2:
+            print(f"herd watch: fzf exited {rc} — it could not start "
+                  f"(try: herd ls, or check your fzf version supports --listen)")
+            return 2
+        elapsed = time.monotonic() - started
         key, sel = _parse_expect(out)
         if key in _QUIT_KEYS:
             return 0
@@ -535,6 +560,20 @@ def cmd_watch(conn, args):
             # that resolves to nothing keeps the panel up so the message can be read.
         elif one_shot:
             return 130                      # Esc: no key, no selection — dismiss
+
+        # Nothing came back AND it came back too fast to have been a keypress. One of
+        # those is Esc on a quick hand; _PICKER_MAX_FAST in a row is a picker that is
+        # not running. Counts CONSECUTIVE passes and resets below, so a genuine Esc
+        # anywhere in the sequence clears it.
+        if not key and not sel.strip() and elapsed < _PICKER_MIN_SECS:
+            fast_empty += 1
+            if fast_empty >= _PICKER_MAX_FAST:
+                print(f"herd watch: the picker exited immediately "
+                      f"{_PICKER_MAX_FAST} times running (last rc={rc}) — giving up "
+                      f"rather than respawning it (try: herd ls)")
+                return 2
+        else:
+            fast_empty = 0
 
 
 def _complete_tokens(rows):

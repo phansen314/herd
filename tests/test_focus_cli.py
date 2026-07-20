@@ -231,7 +231,7 @@ def test_watch_and_jump_share_one_fzf_flag_list(monkeypatch, fresh):
 
     def fake_run(cmd, **kw):
         seen["cmd"] = cmd
-        return type("P", (), {"stdout": ""})()
+        return type("P", (), {"stdout": "", "returncode": 0})()
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     cli._fzf_pick(cli._live(c), "", cli._watch_flags(4321))
@@ -239,7 +239,7 @@ def test_watch_and_jump_share_one_fzf_flag_list(monkeypatch, fresh):
     assert seen["cmd"].index("--listen=4321") > seen["cmd"].index("--with-nth")
 
 
-def _watch_driver(monkeypatch, outs):
+def _watch_driver(monkeypatch, outs, delay=0.0):
     """Drive cmd_watch with canned fzf stdout, one per loop pass. Patches _fzf_run —
     NOT _fzf_pick: cmd_watch calls _fzf_run, and patching the wrong one lets the real
     fzf spawn and the loop spin forever (it did, and hung the suite)."""
@@ -274,7 +274,15 @@ def _watch_driver(monkeypatch, outs):
         out = outs.pop(0)
         if isinstance(out, BaseException):
             raise out
-        return out
+        # A canned entry is either raw stdout or an explicit (stdout, rc) pair. The
+        # bare-string form synthesises the rc fzf would really have returned — 130
+        # for the empty output Esc produces, 0 for a selection — so the tests that
+        # predate the exit code keep reading as what they were always describing.
+        if delay:
+            time.sleep(delay)               # a picker that hosted a real keypress
+        if isinstance(out, tuple):
+            return out
+        return out, (130 if not out.strip() else 0)
 
     monkeypatch.setattr(cli, "_fzf_run", fake_run)
     return killed, seen
@@ -307,6 +315,58 @@ def test_watch_reenters_the_picker_on_esc(monkeypatch, fresh):
     killed, _ = _watch_driver(monkeypatch, ["", "", "ctrl-q\n"])
     assert cli.cmd_watch(c, []) == 0
     assert len(killed) == 3                 # three pickers, three pokers reaped
+
+
+def test_watch_stops_instead_of_respawning_a_picker_that_cannot_start(monkeypatch, fresh):
+    """fzf exits 2 when it could not run at all — an unknown --bind, a --listen port
+    taken between _free_port and exec, a terminal too small for --height. That is
+    indistinguishable from Esc by stdout alone (both empty), so the loop re-entered
+    with no delay, binding a port and forking a poker every pass. Measured on the
+    unfixed loop: 5000 iterations in 0.25s, each one a real socket bind and fork.
+
+    The canned list holds ONE entry on purpose: a second pass would consume it, and
+    _watch_driver raises when cmd_watch loops past its input. Looping is the bug."""
+    c, _ = _watch_fixture(fresh)
+    killed, _ = _watch_driver(monkeypatch, [("", 2)])
+    assert cli.cmd_watch(c, []) == 2
+    assert len(killed) == 1                 # the one poker it did fork was reaped
+
+
+def test_watch_gives_up_after_repeated_instant_empty_pickers(monkeypatch, fresh):
+    """The backstop behind the exit code, for a picker that fails while exiting 0 or
+    1. Nothing returned AND returned too fast to have been a keypress, N times
+    running. The canned list is one longer than the limit: tripping at the limit
+    means the last entry is never consumed."""
+    c, _ = _watch_fixture(fresh)
+    canned = [("", 1)] * (cli._PICKER_MAX_FAST + 1)
+    killed, _ = _watch_driver(monkeypatch, canned)
+    assert cli.cmd_watch(c, []) == 2
+    assert len(killed) == cli._PICKER_MAX_FAST
+    assert len(canned) == 1, "gave up one pass too late"
+
+
+def test_a_slow_esc_never_trips_the_backstop(monkeypatch, fresh):
+    """The counter must key on FAST empties, not empties. Esc is a legitimate empty
+    result and the dashboard is a thing people sit in — dismissing the picker twenty
+    times over an afternoon must not look like a failing fzf. Simulated by making
+    each canned picker take longer than the threshold to return."""
+    c, _ = _watch_fixture(fresh)
+    killed, _ = _watch_driver(monkeypatch, [""] * 8 + ["ctrl-q\n"],
+                              delay=cli._PICKER_MIN_SECS * 1.5)
+    assert cli.cmd_watch(c, []) == 0
+    assert len(killed) == 9
+
+
+def test_one_genuine_esc_clears_the_fast_empty_count(monkeypatch, fresh):
+    """CONSECUTIVE, not cumulative. A real interaction between two instant empties
+    has to reset the counter, or a long-lived dashboard eventually trips on noise it
+    already recovered from."""
+    c, _ = _watch_fixture(fresh)
+    pk = cli._live(c)[0]["id"]
+    monkeypatch.setattr(cli, "_do_focus", lambda conn, row: None)
+    canned = ([("", 1)] * 4) + [f"\n{pk}\tpick\n"] + ([("", 1)] * 4) + ["ctrl-q\n"]
+    _watch_driver(monkeypatch, canned)
+    assert cli.cmd_watch(c, []) == 0
 
 
 def test_watch_reaps_its_poker_even_when_the_picker_raises(monkeypatch, fresh):
@@ -597,7 +657,7 @@ def _preview_arg(monkeypatch):
     seen = {}
     monkeypatch.setattr(cli.subprocess, "run",
                         lambda argv, **k: seen.update(argv=argv) or
-                        __import__("types").SimpleNamespace(stdout=""))
+                        __import__("types").SimpleNamespace(stdout="", returncode=0))
     cli._fzf_run([], "")
     return seen["argv"][seen["argv"].index("--preview") + 1]
 
@@ -749,7 +809,8 @@ def test_watch_focuses_a_session_that_appeared_after_the_picker_opened(monkeypat
     def fake_run(rows, query, extra=()):
         seeded.append([r["id"] for r in rows])
         # fzf returns the LATE session — on screen via reload, absent from the seed
-        return f"\n{late}\t! #{late}  late\n" if len(seeded) == 1 else "ctrl-q\n"
+        out = f"\n{late}\t! #{late}  late\n" if len(seeded) == 1 else "ctrl-q\n"
+        return out, 0
 
     monkeypatch.setattr(cli, "_has_fzf", lambda: True)
     monkeypatch.setattr(cli, "_spawn_poker",
@@ -793,7 +854,7 @@ def test_watch_leaves_no_rows_file_behind(monkeypatch, fresh, tmp_path):
 
     monkeypatch.setattr(cli, "_has_fzf", lambda: True)
     monkeypatch.setattr(cli, "_spawn_poker", spawn)
-    monkeypatch.setattr(cli, "_fzf_run", lambda rows, q, extra=(): "ctrl-q\n")
+    monkeypatch.setattr(cli, "_fzf_run", lambda rows, q, extra=(): ("ctrl-q\n", 0))
     assert cli.cmd_watch(c, []) == 0
     assert ports == [45123]
     assert not list(tmp_path.glob("herd-rows-*")), "watch left its poker's rows file"
