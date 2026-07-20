@@ -284,6 +284,69 @@ def sweep_runtime_files(session_id):
     return gone
 
 
+# Grace before a per-session runtime file with no live row is treated as garbage.
+# SessionStart writes the row, but the statusline can render (and cache) first, so a
+# young file whose session is simply not in the DB yet is NORMAL. Generous: the cost
+# of waiting is one stale file for another sweep, the cost of being wrong is
+# deleting a live session cache mid-startup.
+ORPHAN_GRACE_SECS = _int_env("HERD_ORPHAN_GRACE_SECS", 300)
+
+
+def sweep_orphan_files(conn, now=None, listdir=None, unlink=None, age_of=None):
+    """Delete per-session runtime files whose session is gone or stopped.
+
+    sweep_runtime_files is ROW-DRIVEN: it is called from reap_once with a session_id
+    the daemon read out of the database. That cannot reach a file whose row no
+    longer exists — nothing knows the id, so nothing ever unlinks it. Measured on a
+    real herd: 34 herd-stline-* files, 30 of them with no row at all, against 13
+    sessions that had ever existed. The oldest was three days old.
+
+    boot_sweep is the other half of the gap. W3e stops every session that started
+    before this boot — precisely the mass-death case where no SessionEnd ran — and
+    touches none of their files, so it leaks a pair per session by construction.
+
+    So this one is DIRECTORY-driven: read the names, ask the DB about each, delete
+    what is not live. That covers orphans and pre-boot deaths in the same pass, and
+    it is the only form that can ever shrink a set nothing has a row for.
+
+    Files younger than ORPHAN_GRACE_SECS are left alone. The statusline can render
+    before SessionStart commits the row, so "no row" on a fresh file means "not yet",
+    not "never".
+    """
+    d = _runtime_dir()
+    listdir = listdir or (lambda: os.listdir(d))
+    unlink = unlink or (lambda pth: os.unlink(pth))
+    age_of = age_of or (lambda pth: time.time() - os.stat(pth).st_mtime)
+    try:
+        names = listdir()
+    except OSError:
+        return 0                      # dir gone or unreadable: nothing to do
+    live = {r[0] for r in conn.execute(
+        "SELECT session_id FROM sessions WHERE stopped_at IS NULL "
+        "AND session_id IS NOT NULL")}
+    gone = 0
+    for name in names:
+        for prefix in ("herd-stline-", "herd-tool-"):
+            if not name.startswith(prefix):
+                continue
+            sid = name[len(prefix):]
+            # The same guard sweep_runtime_files applies, for the same reason: this
+            # name came off the filesystem and is about to become a path to unlink.
+            # A file called `herd-stline-../../x` is not a session.
+            if not _valid_sid(sid) or sid in live:
+                break
+            pth = os.path.join(d, name)
+            try:
+                if age_of(pth) < ORPHAN_GRACE_SECS:
+                    break             # too young to judge — see the docstring
+                unlink(pth)
+                gone += 1
+            except OSError:
+                pass                  # raced with session_end.sh, or not ours
+            break
+    return gone
+
+
 def reap_once(conn, procs, now, recheck=read_proc_table):
     """One reap tick over live, pid-bearing sessions. pid-NULL rows are skipped
     (liveness unknowable; clean death arrives via SessionEnd). Returns count.
@@ -549,6 +612,15 @@ def run(interval=2.0, db_path=None, once=False, attend=None):
                     _log("reconnected")
             if not swept:
                 boot_sweep(conn, now, boot_time_iso())
+                # Right here, and not on every tick. boot_sweep just stopped every
+                # pre-boot session without touching their files, so this is the one
+                # moment the orphan set is largest and cheapest to clear. It is a
+                # readdir of a directory holding a handful of entries, so a periodic
+                # re-run would cost more than it ever reclaims — a session that dies
+                # later is handled by reap_once, which HAS the row.
+                n = sweep_orphan_files(conn, now)
+                if n:
+                    _log(f"swept {n} orphaned runtime file(s)")
                 swept = True
             procs = read_proc_table()
             if procs is not None:                     # tier 1 — always, unless ps

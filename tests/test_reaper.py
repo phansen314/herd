@@ -5,6 +5,7 @@ import pathlib
 import sqlite3
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -582,3 +583,94 @@ def test_the_sweep_refuses_a_session_id_that_is_not_a_filename(sid, tmp_path, mo
     the hooks have valid_sid."""
     monkeypatch.setenv("HERD_RUNTIME", str(tmp_path))
     assert daemon.sweep_runtime_files(sid) == 0
+
+
+# ── orphaned runtime files: the sweep no row can reach ───────────────────────
+def _rt(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERD_RUNTIME", str(tmp_path))
+    return tmp_path
+
+
+def _old(p, secs=10_000):
+    os.utime(p, (time.time() - secs, time.time() - secs))
+    return p
+
+
+def test_orphan_sweep_deletes_files_whose_session_has_no_row(fresh, monkeypatch, tmp_path):
+    """The gap sweep_runtime_files cannot close. It is called from reap_once with a
+    session_id read OUT of the database, so a file whose row is gone is unreachable
+    — nothing knows the id. Measured on a real herd: 34 cache files, 30 with no row
+    at all, oldest three days old."""
+    c = fresh()
+    rt = _rt(monkeypatch, tmp_path)
+    for n in ("herd-stline-dead-1", "herd-tool-dead-1", "herd-stline-dead-2"):
+        (rt / n).write_text("x")
+        _old(rt / n)
+    assert daemon.sweep_orphan_files(c) == 3
+    assert not list(rt.glob("herd-stline-*")) and not list(rt.glob("herd-tool-*"))
+
+
+def test_orphan_sweep_keeps_files_of_live_sessions(fresh, monkeypatch, tmp_path):
+    """The one thing it must never do. These are rewritten about once a second by a
+    session that is still running."""
+    c = fresh()
+    rt = _rt(monkeypatch, tmp_path)
+    _live(c, "alive", 7100)
+    for n in ("herd-stline-alive", "herd-tool-alive"):
+        (rt / n).write_text("x")
+        _old(rt / n)
+    assert daemon.sweep_orphan_files(c) == 0
+    assert (rt / "herd-stline-alive").exists()
+
+
+def test_orphan_sweep_takes_files_of_stopped_sessions(fresh, monkeypatch, tmp_path):
+    """A stopped row is exactly the pre-boot case: W3e marks it and never touches
+    the files, so boot_sweep leaked a pair per session by construction."""
+    c = fresh()
+    rt = _rt(monkeypatch, tmp_path)
+    pk = _live(c, "ended", 7101)
+    c.execute("UPDATE sessions SET stopped_at=? WHERE id=?", (T2, pk))
+    (rt / "herd-stline-ended").write_text("x")
+    _old(rt / "herd-stline-ended")
+    assert daemon.sweep_orphan_files(c) == 1
+
+
+def test_orphan_sweep_spares_a_file_too_young_to_judge(fresh, monkeypatch, tmp_path):
+    """The statusline can render — and cache — before SessionStart commits the row,
+    so "no row" on a fresh file means "not yet", not "never". Without the grace this
+    deletes the cache of a session that is starting up."""
+    c = fresh()
+    rt = _rt(monkeypatch, tmp_path)
+    (rt / "herd-stline-newborn").write_text("x")      # mtime = now
+    assert daemon.sweep_orphan_files(c) == 0
+    assert (rt / "herd-stline-newborn").exists()
+
+
+def test_orphan_sweep_refuses_a_name_that_escapes_the_directory(fresh, monkeypatch, tmp_path):
+    """The name came off the FILESYSTEM and is about to become a path to unlink.
+    _valid_sid is the same guard sweep_runtime_files applies, for the same reason."""
+    c = fresh()
+    rt = _rt(monkeypatch, tmp_path)
+    outside = tmp_path.parent / "do-not-touch"
+    outside.write_text("precious")
+    unlinked = []
+    n = daemon.sweep_orphan_files(
+        c, listdir=lambda: ["herd-stline-../../do-not-touch"],
+        unlink=lambda p: unlinked.append(p), age_of=lambda p: 10_000)
+    assert n == 0 and unlinked == [], "a traversal name reached unlink()"
+    assert outside.read_text() == "precious"
+
+
+def test_orphan_sweep_ignores_files_that_are_not_ours(fresh, monkeypatch, tmp_path):
+    """The runtime dir is shared — XDG_RUNTIME_DIR holds other tools' state, and the
+    fallback is ~/.herd/run next to the config. Only the two prefixes are ours."""
+    c = fresh()
+    rt = _rt(monkeypatch, tmp_path)
+    for n in ("herd-daemon.lock", "herd-rows-4321", "pulse-cookie", "herd-db-err.99"):
+        (rt / n).write_text("x")
+        _old(rt / n)
+    assert daemon.sweep_orphan_files(c) == 0
+    # names, not a count: the `fresh` fixture keeps its DB in this same tmp dir,
+    # so counting entries measured the fixture as much as the behaviour.
+    for n in ("herd-daemon.lock", "herd-rows-4321", "pulse-cookie", "herd-db-err.99"):
+        assert (rt / n).exists(), f"{n} was swept"
