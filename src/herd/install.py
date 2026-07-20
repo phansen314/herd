@@ -203,7 +203,19 @@ def _atomic_write(path, text):
     the disk before the data it points at, so a crash or power loss in that window
     leaves a settings.json that is present, correctly named — and zero-length. That
     is the same unparseable-settings failure this function exists to prevent,
-    arriving by the one route tmp+rename does not cover."""
+    arriving by the one route tmp+rename does not cover.
+
+    WRITES THROUGH A SYMLINK. os.replace onto a symlink REPLACES THE LINK with a
+    regular file — it does not follow it. Keeping ~/.claude/settings.json and
+    ~/.config/kitty/kitty.conf symlinked into a dotfiles repo is mainstream, and
+    without this the install silently unlinked them: herd's wiring landed in a new
+    local file, the repo copy was left untouched and diverging, and the next `stow`
+    or `chezmoi apply` either failed or clobbered the wiring back out. Resolving
+    first writes where the link points, which is what the link is for, and leaves the
+    link itself intact. The tmp file moves with it — os.replace cannot cross
+    filesystems, and a dotfiles repo is often on a different mount."""
+    if path.is_symlink():
+        path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + f".herd-tmp.{os.getpid()}")
     try:
@@ -224,6 +236,32 @@ def _atomic_write(path, text):
         except OSError:
             pass                    # not fsyncable (some filesystems): data is safe
 
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def _atomic_copy(src, dst, executable=False):
+    """Copy src over dst via tmp + rename. The _atomic_write rule, applied to the
+    files that are EXECUTED rather than read.
+
+    shutil.copy2 opens the destination 'wb' — truncate in place — and these are the
+    scripts that fire on every SessionStart, Stop and PostToolUse. Upgrading with
+    sessions open therefore had a window where a hook could be read half-written; for
+    one already executing it is worse, since bash re-reads by offset and an in-place
+    rewrite of a different length feeds it garbage mid-run. The staged self-test is
+    an elaborate gate against bad CONTENT going live, and it was followed by a
+    promotion step that could put TORN content live.
+
+    No fsync here, unlike _atomic_write: these files are reproducible from the
+    checkout by re-running install, so the crash-durability half of that argument
+    does not apply. Only the tearing does."""
+    tmp = dst.with_name(dst.name + f".herd-tmp.{os.getpid()}")
+    try:
+        shutil.copy2(src, tmp)
+        if executable:
+            tmp.chmod(tmp.stat().st_mode | 0o111)
+        os.replace(tmp, dst)
     finally:
         if tmp.exists():
             tmp.unlink()
@@ -254,10 +292,9 @@ def _copy_hook_tree(hooks_dst, schema_dst):
                 stale.unlink()
     for src in sorted(HOOKS_DIR.glob("*.sh")):
         dst = hooks_dst / src.name
-        shutil.copy2(src, dst)
-        dst.chmod(dst.stat().st_mode | 0o111)   # +x, or the hook is a silent no-op
+        _atomic_copy(src, dst, executable=True)  # +x, or the hook is a silent no-op
     for src in sorted(SCHEMA_DIR.glob("*.sql")):
-        shutil.copy2(src, schema_dst / src.name)
+        _atomic_copy(src, schema_dst / src.name)
     return hooks_dst
 
 
@@ -406,7 +443,15 @@ def plist_text():
     return plistlib.dumps({
         "Label": LAUNCHD_LABEL,
         "ProgramArguments": [_service_python(), "-m", "herd.daemon"],
-        "EnvironmentVariables": {"PYTHONPATH": str(PKG_SRC), "HERD_DB": str(DB)},
+        # PYTHONPATH ONLY, exactly as in service_unit_text — see the comment there.
+        # HERD_DB lived here and made this plist the macOS half of the divergence
+        # that comment forbids: a real env var beats ~/.herd/config, which the hooks
+        # DO read, so HERD_DB in the config was honoured by the hooks and ignored by
+        # the daemon. The daemon then reaped an empty database while the hooks wrote
+        # to another, and every session stayed live in `herd ls` forever — the exact
+        # symptom the service exists to prevent. daemon.DEFAULT_DB falls back to
+        # ~/.herd/herd.db, and launchd provides HOME.
+        "EnvironmentVariables": {"PYTHONPATH": str(PKG_SRC)},
         "RunAtLoad": True,
         # Plain true, NOT {"SuccessfulExit": False} — the Restart=always half:
         # restart on exit 0 too.

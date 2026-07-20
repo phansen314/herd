@@ -428,6 +428,55 @@ def test_a_moved_checkout_is_not_snapshotted_as_the_pre_herd_original(home):
     assert not inst._is_wired(inst.SETTINGS, klawde)
 
 
+def test_the_hook_tree_is_never_torn_by_an_upgrade(home, monkeypatch):
+    """The hooks are copied with tmp+rename, not written in place.
+
+    shutil.copy2 opens the destination 'wb'. These are the scripts that fire on every
+    SessionStart, Stop and PostToolUse, so an upgrade with sessions open could have a
+    hook read half-written — and for one already executing it is worse, since bash
+    re-reads by offset. The staged self-test gates bad CONTENT and was followed by a
+    promotion step that could put TORN content live.
+
+    Asserted at the syscall: every destination path is either created fresh or
+    arrives via os.replace. A truncating open of a live hook is the defect."""
+    inst.SETTINGS.write_text(json.dumps(PRISTINE) + "\n")
+    inst.install()                                   # first install: tree now exists
+    live = sorted(p.name for p in inst.INSTALLED_HOOKS.glob("*.sh"))
+
+    opened, replaced = [], []
+    real_open, real_replace = os.open, os.replace
+    monkeypatch.setattr(os, "open", lambda p, f, *a, **k: (
+        opened.append((str(p), f)), real_open(p, f, *a, **k))[1])
+    monkeypatch.setattr(os, "replace", lambda s, d: (
+        replaced.append(str(d)), real_replace(s, d))[1])
+    inst.install()                                   # upgrade over the live tree
+
+    for name in live:
+        dst = str(inst.INSTALLED_HOOKS / name)
+        assert dst in replaced, f"{name} was not promoted by rename"
+        truncating = [f for p, f in opened if p == dst and f & os.O_TRUNC]
+        assert not truncating, f"{name} was opened for truncation in place"
+
+
+def test_a_symlinked_settings_file_is_written_through(home):
+    """os.replace onto a symlink REPLACES THE LINK. Keeping settings.json symlinked
+    into a dotfiles repo is mainstream, and the install silently unlinked it: herd's
+    wiring landed in a new local file while the repo copy sat untouched and
+    diverging, so the next `stow`/`chezmoi apply` either failed or clobbered the
+    wiring back out. The link must survive and the target must receive the write."""
+    real = home / "dotfiles" / "settings.json"
+    real.parent.mkdir()
+    real.write_text(json.dumps(PRISTINE) + "\n")
+    inst.SETTINGS.unlink(missing_ok=True)
+    inst.SETTINGS.symlink_to(real)
+
+    inst.install()
+
+    assert inst.SETTINGS.is_symlink(), "the install replaced the link with a file"
+    assert inst.SETTINGS.resolve() == real.resolve()
+    assert inst.statusline_cmd() in real.read_text(), "the dotfiles copy missed the wiring"
+
+
 def test_a_failed_selftest_aborts_before_touching_settings(home, monkeypatch):
     """The self-test exists to catch hooks that are wired but silently no-op. Running
     it after the write meant reporting FAIL on a config already pointed at herd."""
@@ -668,9 +717,22 @@ def test_plist_is_well_formed():
     assert p["Label"] == inst.LAUNCHD_LABEL
     assert p["ProgramArguments"][1:] == ["-m", "herd.daemon"]
     assert p["EnvironmentVariables"]["PYTHONPATH"] == str(inst.PKG_SRC)
-    assert p["EnvironmentVariables"]["HERD_DB"] == str(inst.DB)
     assert p["RunAtLoad"] is True
     assert inst.PKG_SRC.name == "src"
+
+
+def test_the_plist_sets_no_herd_settings():
+    """The launchd twin of test_the_unit_sets_no_herd_settings, and the same rule.
+
+    These two tests used to CONTRADICT each other: one forbade HERD_* in the unit
+    while the other asserted HERD_DB in the plist as correct. So macOS shipped the
+    exact divergence the unit's comment forbids — HERD_DB in ~/.herd/config was
+    honoured by the hooks and overridden for the daemon, which then reaped an empty
+    database while the hooks wrote to another one. Every session stayed live in
+    `herd ls`, which is the symptom the service exists to prevent."""
+    env = _plist()["EnvironmentVariables"]
+    assert [k for k in env if k.startswith("HERD_")] == [], \
+        f"the plist sets herd settings: {sorted(env)}"
 
 
 def test_plist_retries_forever():
@@ -690,9 +752,10 @@ def test_plist_survives_a_path_that_would_break_hand_rolled_xml(monkeypatch, tmp
     """HOME reaches five values in this plist. Built with a format string, a path
     holding & or < emits XML launchd rejects as 'Bootstrap failed: 5', which says
     nothing about the cause."""
-    monkeypatch.setattr(inst, "DB", tmp_path / "a&b" / "<h>" / "herd.db")
+    hostile = tmp_path / "a&b" / "<h>" / "daemon.log"
+    monkeypatch.setattr(inst, "DAEMON_OUT", hostile)
     p = _plist()
-    assert p["EnvironmentVariables"]["HERD_DB"] == str(tmp_path / "a&b" / "<h>" / "herd.db")
+    assert p["StandardOutPath"] == str(hostile)
 
 
 def test_launchd_install_reloads_rather_than_leaving_the_old_definition(monkeypatch, tmp_path):
