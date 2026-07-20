@@ -1,5 +1,6 @@
 """N (47-57b) — the hooks end to end: the real bash scripts run against a temp DB.
 Nothing but this exercises the bash + writes.sql seam."""
+import json
 import os
 import pathlib
 import subprocess
@@ -187,6 +188,91 @@ def test_bail_rolls_back_committed_prefix(hook_env):
                             HERD_ERRLOG=f"{hook_env.runtime}/err.log"))
     assert c.execute("SELECT last_event_at FROM sessions WHERE session_id='s1'").fetchone()[0] == T0
     assert c.execute("SELECT COUNT(*) FROM herd_attention").fetchone()[0] == 0
+
+
+# ── session_start.sh: payload fields that carry a separator ───────────────────
+def test_a_newline_in_the_cwd_does_not_shift_the_fields_after_it(hook_env):
+    """Four `read -r` over newline-delimited jq output split on the first newline in
+    ANY field. cwd is an arbitrary path and a directory name may legally contain one
+    (`mkdir $'/tmp/we\\nird'`), so the values after it each moved down a slot.
+
+    Measured on the unfixed hook with this exact payload: cwd=/tmp/we,
+    model=ird/proj, transcript_path=claude-opus-4-8. And it is permanent — this hook
+    fires ONCE per session, so nothing ever corrects the row."""
+    hook_env.run("session_start.sh",
+                 {"session_id": "nl-1", "cwd": "/tmp/we\nird/proj",
+                  "model": "claude-opus-4-8", "transcript_path": "/t.jsonl",
+                  "source": "startup", "hook_event_name": "SessionStart"},
+                 {"KITTY_WINDOW_ID": "", "KITTY_LISTEN_ON": ""})
+    r = hook_env.conn().execute(
+        "SELECT cwd, model, transcript_path FROM sessions WHERE session_id='nl-1'").fetchone()
+    assert r["cwd"] == "/tmp/we ird/proj"          # folded, not truncated
+    assert r["model"] == "claude-opus-4-8"         # NOT the tail of the cwd
+    assert r["transcript_path"] == "/t.jsonl"      # NOT the model
+
+
+def test_a_separator_in_the_cwd_does_not_shift_them_either(hook_env):
+    """Escaping the newline by joining on \x1f only moves the trigger unless the
+    separator is stripped too — the statusline shipped exactly that gap."""
+    hook_env.run("session_start.sh",
+                 {"session_id": "us-1", "cwd": "/tmp/we\x1fird",
+                  "model": "claude-opus-4-8", "transcript_path": "/t.jsonl",
+                  "source": "startup", "hook_event_name": "SessionStart"},
+                 {"KITTY_WINDOW_ID": "", "KITTY_LISTEN_ON": ""})
+    r = hook_env.conn().execute(
+        "SELECT cwd, model, transcript_path FROM sessions WHERE session_id='us-1'").fetchone()
+    assert r["cwd"] == "/tmp/we ird"
+    assert r["model"] == "claude-opus-4-8"
+    assert r["transcript_path"] == "/t.jsonl"
+
+
+def test_whitespace_in_the_cwd_survives(hook_env):
+    """`read -r SID` without IFS= strips leading and trailing whitespace, so a cwd
+    with a trailing space was silently stored wrong — a quieter bug than the shift
+    and the same root cause. IFS=$'\\x1f' keeps it."""
+    hook_env.run("session_start.sh",
+                 {"session_id": "ws-1", "cwd": "/tmp/proj ", "model": "m",
+                  "transcript_path": "/t.jsonl", "source": "startup",
+                  "hook_event_name": "SessionStart"},
+                 {"KITTY_WINDOW_ID": "", "KITTY_LISTEN_ON": ""})
+    r = hook_env.conn().execute(
+        "SELECT cwd FROM sessions WHERE session_id='ws-1'").fetchone()
+    assert r["cwd"] == "/tmp/proj "
+
+
+def test_a_shifted_parse_still_records_the_session(hook_env):
+    """Fail OPEN here, unlike the statusline. SessionStart is the only thing that
+    creates the row and captures the pid, and it does not fire again — refusing to
+    write would make the session invisible to herd for its entire life, which is
+    worse than a row with three empty columns. The id is field 1, so identity
+    survives a shift that starts later."""
+    # a copy of the tree: hook_env runs the CHECKOUT, and this test edits a hook.
+    # common.sh resolves the SQL as <hooks>/../schema, so the layout must survive.
+    root = pathlib.Path(hook_env.runtime).parent / "broken"
+    (root / "hooks").mkdir(parents=True)
+    (root / "schema").mkdir()
+    for f in HOOKS.glob("*.sh"):
+        (root / "hooks" / f.name).write_text(f.read_text())
+    for f in (HOOKS.parent / "schema").glob("*.sql"):
+        (root / "schema" / f.name).write_text(f.read_text())
+    sl = root / "hooks" / "session_start.sh"
+    broken = sl.read_text().replace('EOR"\'', 'NOPE"\'')
+    assert broken != sl.read_text(), "sentinel literal moved — update this test"
+    sl.write_text(broken)
+    env = dict(os.environ, HERD_DB=hook_env.path, HERD_RUNTIME=hook_env.runtime,
+               HERD_ERRLOG=f"{hook_env.runtime}/err.log",
+               KITTY_WINDOW_ID="", KITTY_LISTEN_ON="")
+    subprocess.run(["bash", str(sl)], text=True, capture_output=True,
+                   input=json.dumps({"session_id": "sh-1", "cwd": "/x", "model": "m",
+                                     "transcript_path": "/t.jsonl", "source": "startup",
+                                     "hook_event_name": "SessionStart"}), env=env)
+    r = hook_env.conn().execute(
+        "SELECT session_id, cwd, model FROM sessions WHERE session_id='sh-1'").fetchone()
+    assert r is not None, "the session lost its row to a parse it could have survived"
+    # "?" rather than NULL: sessions.cwd is NOT NULL and bind() maps empty to NULL,
+    # so blanking it dropped the row on a constraint failure — this guard failing in
+    # the way it exists to prevent. Caught by this test.
+    assert (r["cwd"], r["model"]) == ("?", None)
 
 
 # ── session_start.sh: the third branch, and the pid capture ──────────────────

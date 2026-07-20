@@ -12,10 +12,42 @@ __d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."
 
 read_input      # see common.sh: NOT $(</dev/stdin), which Claude leaves empty
 
-{ read -r SID; read -r CWD; read -r MODEL; read -r TRANSCRIPT; } <<JQ
-$(jq_in -r '.session_id // "", .cwd // "", .model // "", .transcript_path // ""')
+# ONE read over \x1f-separated fields, the same shape statusline.sh uses, and for
+# the same reason. Four `read -r` over newline-delimited output splits on the first
+# newline IN ANY FIELD: cwd is an arbitrary path and a directory name may legally
+# contain one, so `mkdir $'/tmp/we\nird'` and starting claude there stored
+# cwd=/tmp/we, model=ird/proj, transcript=<the model>. Every value after the
+# damaged one shifts down a slot and is persisted by W2b_insert, where it stays —
+# SessionStart fires ONCE per session, so nothing ever corrects it.
+#
+# `read -r SID` without IFS= also stripped leading and trailing whitespace, so a
+# cwd with a trailing space was silently stored wrong. IFS=$'\x1f' keeps it.
+#
+# The gsub strips the separator ITSELF alongside \n and \r — without that, the
+# escape from the newline is just a shift with a different trigger. Sentinel and
+# guard below, as in statusline.sh.
+IFS=$'\x1f' read -r SID CWD MODEL TRANSCRIPT EOR <<JQ
+$(jq_in -rj '[.session_id, .cwd, .model, .transcript_path]
+| map(. // "" | tostring | gsub("[\\n\\r\u001f]"; " "))
+| join("\u001f") | . + "\u001fEOR"')
 JQ
 # .model is a STRING on hook payloads (an OBJECT on the statusline payload).
+
+# A shifted parse must NOT cost the session its row. This hook is the only thing
+# that creates one and the only thing that captures claude's pid, and it does not
+# fire again — so exiting here would make the session invisible to herd for its
+# entire life, which this file already argues is worse than an imperfect row ("an
+# unnamed-but-visible session beats a lost one", below). SID is field 1 and a shift
+# can only start at or after the field that carried the separator, so the identity
+# survives; drop the three values that cannot be trusted and record the rest.
+if [ "$EOR" != "EOR" ]; then
+    herd_log "session_start: payload parse shifted (sentinel=[$EOR]) — cwd/model/transcript dropped"
+    # "?" and not "": bind() maps an EMPTY value to SQL NULL, and sessions.cwd is
+    # NOT NULL, so blanking it made W2b_insert fail the constraint and the session
+    # got no row at all — this guard failing closed in the exact way it exists to
+    # prevent. Verified. model and transcript_path are nullable, so they can go.
+    CWD="?"; MODEL=""; TRANSCRIPT=""
+fi
 
 valid_sid "$SID" || exit 0
 now_pair
