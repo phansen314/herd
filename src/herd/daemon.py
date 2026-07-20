@@ -492,6 +492,36 @@ def acquire_single_instance(path=None):
     return True
 
 
+def lock_is_held(path=None):
+    """Is the daemon lock actually HELD right now? None if there is no lock file.
+
+    THE RECORDED PID PROVES NOTHING. flock is released by the kernel however the
+    holder dies, but the FILE survives it — so after a crash the lock file sits there
+    with a stale pid, and once the OS recycles that number any unrelated process
+    makes `os.kill(pid, 0)` succeed. doctor then reported "daemon running (pid N)"
+    while nothing was reaping, which is precisely the symptom it exists to catch.
+    Trying the lock is the only authoritative answer.
+
+    Opened READ-ONLY: 'r' cannot create the file (doctor must not conjure a lock on
+    a machine that has none), and flock(2) — unlike POSIX record locks — does not
+    care about the fd's access mode. Acquiring and releasing is safe for a live
+    holder: we only ever get the lock when nobody else has it, and the lock is per
+    open-file-description, so closing ours cannot disturb theirs."""
+    try:
+        fh = open(path or lock_path(), "r")
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True                  # someone holds it: a daemon is alive
+        fcntl.flock(fh, fcntl.LOCK_UN)   # we got it, so nobody did
+        return False
+    finally:
+        fh.close()
+
+
 def holder_pid(path=None):
     """The pid recorded by whoever holds the lock, for a useful refusal message."""
     try:

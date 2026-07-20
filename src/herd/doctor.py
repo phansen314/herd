@@ -29,6 +29,13 @@ _MARK = {OK: "✔", WARN: "!", FAIL: "✘"}
 REQUIRED = ("jq", "sqlite3", "ps", "bash")
 OPTIONAL = ("kitten", "fzf")
 
+# Both tiers. bootstrap_db applies core.sql and herd.sql together, so a DB carrying
+# one and not the other is an interrupted install or a hand-made file — and it opens,
+# queries `sessions` fine, and fails every tier-2 write. test_schema pins this set
+# against the CREATE TABLE statements, so a new table cannot be added without either
+# appearing here or failing that test.
+REQUIRED_TABLES = frozenset({"sessions", "herd_sessions", "herd_attention"})
+
 # strflocaltime, which the statusline formats both reset stamps with. Presence of
 # jq is not enough: on 1.5 that function does not exist, and the raise aborts the
 # WHOLE filter, so all 23 fields come back empty. statusline.sh's per-field `try`
@@ -128,8 +135,18 @@ def check_db(path, connect_fn=None):
     try:
         tables = {r[0] for r in c.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
+        # BOTH TIERS. Checking only `sessions` passed a database with core.sql
+        # applied and herd.sql missing, and reported it as healthy — while every
+        # W1/W2/W6 statement failed, i.e. spawn, jump, placement and attention were
+        # all dead. bootstrap_db applies the two together, so a half-applied schema
+        # means an interrupted install or a hand-made DB, and naming the missing
+        # table is the difference between a fix and a mystery.
+        missing = sorted(REQUIRED_TABLES - tables)
         if "sessions" not in tables:
             out.append((FAIL, "schema not applied", "run: python3 -m herd.install"))
+        elif missing:
+            out.append((FAIL, f"schema incomplete — no {', '.join(missing)}",
+                        "tier-2 tables are missing; run: python3 -m herd.install"))
         else:
             live = c.execute("SELECT COUNT(*) FROM sessions "
                              "WHERE stopped_at IS NULL").fetchone()[0]
@@ -188,7 +205,19 @@ def check_wiring(settings_text, hook_roots, statusline_paths, events):
                     "no cost / context / branch will ever be recorded"))
         return out
     if sl in statusline_paths or any(str(r) in sl for r in hook_roots):
-        out.append((OK, "statusLine", sl))
+        # The SAME existence + +x checks the hooks get above. This branch returned OK
+        # on the strength of the path alone, so a statusline.sh that had lost its +x
+        # — the failure the hook branch calls "a silent no-op", and the one that once
+        # shipped a blank statusline — was reported as fine. It is the only writer of
+        # every metric column, so the symptom is cost/context/branch silently never
+        # being recorded.
+        if not os.path.exists(sl):
+            out.append((FAIL, "statusLine points at a missing file", sl))
+        elif not os.access(sl, os.X_OK):
+            out.append((FAIL, "statusLine is not executable",
+                        f"chmod +x {sl} — no cost / context / branch will be recorded"))
+        else:
+            out.append((OK, "statusLine", sl))
         return out
     # The one place doctor opens a file whose contents it does not control: a
     # statusLine may name a directory, an unreadable file, or non-UTF-8 bytes.
@@ -245,15 +274,26 @@ def _hooks_current():
         return None
 
 
-def check_daemon(lock_path, holder=None, alive=None):
+def check_daemon(lock_path, holder=None, alive=None, held=None):
     """The daemon is the only reaper of silent deaths, so "not running" shows up as
-    sessions that never leave `herd ls`, never as an error."""
-    alive = alive if alive is not None else _pid_alive
+    sessions that never leave `herd ls`, never as an error.
+
+    ASKS THE LOCK, not the pid it records. The lock file outlives its holder, so a
+    crashed daemon leaves a stale pid behind — and once the OS recycles that number,
+    os.kill(pid, 0) succeeds for a completely unrelated process and doctor reported
+    "running" while nothing reaped. The pid is still read, but only to NAME the
+    holder in the message; `alive` remains as the fallback for a platform where the
+    lock cannot be probed."""
     if not os.path.exists(lock_path):
         return [(FAIL, "daemon not running", "sessions will never leave `herd ls`")]
     pid = holder if holder is not None else daemon.holder_pid(lock_path)
-    if pid and alive(pid):
-        return [(OK, "daemon", f"running (pid {pid})")]
+    if held is None:
+        held = daemon.lock_is_held(lock_path)
+    if held is None:                     # unprobeable: fall back to the pid check
+        alive = alive if alive is not None else _pid_alive
+        held = bool(pid and alive(pid))
+    if held:
+        return [(OK, "daemon", f"running (pid {pid})" if pid else "running")]
     return [(FAIL, "daemon not running",
              f"stale lock at {lock_path} — start it, or: {_service_start_hint()}")]
 

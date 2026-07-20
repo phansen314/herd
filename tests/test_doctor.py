@@ -2,6 +2,7 @@
 is designed to survive SILENTLY (hooks never print, a missing dep exits 0, the
 daemon logs to a journal you must know to read), so these tests care about one
 thing: does the broken case actually get named."""
+import fcntl
 import json
 import os
 import pathlib
@@ -96,6 +97,31 @@ def test_a_db_without_the_schema_is_a_failure(tmp_path):
     assert FAIL in _levels(out) and "schema not applied" in _text(out)
 
 
+def test_a_tier1_only_db_is_not_reported_as_healthy(fresh, tmp_path):
+    """core.sql applied, herd.sql missing — and doctor said "herd looks healthy".
+
+    check_db asserted only that `sessions` existed. Such a DB opens, counts sessions
+    fine, and fails every W1/W2/W6 statement: spawn, jump, placement and attention
+    are all dead. That is exactly the silent, half-broken state doctor exists to
+    name, and it was the one shape that sailed through. The missing tables are named
+    because "schema incomplete" without them is a mystery."""
+    c = fresh(tier2=False, name="tier1.db")
+    c.close()
+    out = doctor.check_db(str(tmp_path / "tier1.db"))
+    assert FAIL in _levels(out)
+    assert "herd_sessions" in _text(out) and "herd_attention" in _text(out)
+
+
+def test_required_tables_matches_the_schema(fresh):
+    """REQUIRED_TABLES is hand-written, so pin it against what the schema actually
+    creates — a new table must not be able to appear without this list noticing."""
+    c = fresh()
+    got = {r[0] for r in c.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%'")}
+    assert got == set(doctor.REQUIRED_TABLES)
+
+
 def test_a_corrupt_db_is_reported_not_raised(tmp_path):
     p = tmp_path / "junk.db"
     p.write_bytes(os.urandom(4096))
@@ -146,6 +172,29 @@ def test_a_hook_without_the_executable_bit_is_reported(tmp_path):
     assert FAIL in _levels(out) and "not executable" in _text(out)
 
 
+def test_a_statusline_without_the_executable_bit_is_reported(tmp_path):
+    """The hook branch has checked +x for a while ("a lost +x is a silent no-op",
+    and a blank statusline once shipped exactly that way). The statusLine branch
+    took the path-match shortcut and returned OK without ever looking — for the ONE
+    script that writes every metric column, so the symptom is cost, context and
+    branch silently never being recorded."""
+    sl = tmp_path / "statusline.sh"
+    sl.write_text("#!/bin/bash\n")
+    sl.chmod(0o644)
+    out = doctor.check_wiring(_settings({}, statusline=str(sl)), (tmp_path,),
+                              (str(sl),), ())
+    assert FAIL in _levels(out) and "not executable" in _text(out)
+
+
+def test_a_statusline_wired_to_a_missing_file_is_reported(tmp_path):
+    """Same shortcut, same blind spot: the path matched, so nothing checked it
+    still existed."""
+    sl = tmp_path / "statusline.sh"                     # never created
+    out = doctor.check_wiring(_settings({}, statusline=str(sl)), (tmp_path,),
+                              (str(sl),), ())
+    assert FAIL in _levels(out) and "missing file" in _text(out)
+
+
 def test_an_unset_statusline_is_a_failure(tmp_path):
     out = doctor.check_wiring(json.dumps({"hooks": {}}), (HOOKS,), (SL,), ())
     assert FAIL in _levels(out) and "statusLine not set" in _text(out)
@@ -182,10 +231,67 @@ def test_a_stale_lock_does_not_read_as_running(tmp_path):
 
 
 def test_a_held_lock_reads_as_running(tmp_path):
+    """A REAL flock, not a lock file plus alive=lambda: True.
+
+    This used to write a pid and stub liveness, so it asserted nothing about the
+    lock — the file's mere existence plus a fake `alive` was the whole test, which
+    is exactly the thing that made the pid-reuse bug below invisible."""
     lock = tmp_path / "herd-daemon.lock"
     lock.write_text(f"{os.getpid()}\n")
-    out = doctor.check_daemon(str(lock), holder=os.getpid(), alive=lambda pid: True)
+    with open(lock, "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)      # a live daemon would
+        out = doctor.check_daemon(str(lock), holder=os.getpid())
     assert _levels(out) == [OK]
+
+
+def test_a_recycled_pid_does_not_read_as_running(tmp_path):
+    """The lock FILE outlives its holder; the flock does not.
+
+    check_daemon read the recorded pid and called os.kill(pid, 0). After a daemon
+    crash that pid sits in the file, and once the OS recycles the number ANY
+    unrelated process makes that probe succeed — so doctor printed "daemon running
+    (pid N)" while nothing was reaping and sessions piled up in `herd ls`, the exact
+    symptom the check exists to catch. Nobody holds this lock, and this process is
+    unquestionably alive, so a pid-based check must say "running" and a lock-based
+    one must not."""
+    lock = tmp_path / "herd-daemon.lock"
+    lock.write_text(f"{os.getpid()}\n")                     # our own pid: alive
+    out = doctor.check_daemon(str(lock), holder=os.getpid())
+    assert _levels(out) == [FAIL] and "stale lock" in _text(out)
+
+
+def test_an_unprobeable_lock_falls_back_to_the_pid(tmp_path):
+    """When the lock gives no answer, the old pid check is better than reporting
+    every daemon dead. held is injected because the only way to reach that branch
+    for real is a lock file that exists and cannot be opened, which is not
+    arrangeable as root — where CI often runs."""
+    lock = tmp_path / "herd-daemon.lock"
+    lock.write_text("4242\n")
+    assert _levels(doctor.check_daemon(str(lock), holder=4242,
+                                       alive=lambda pid: True, held=None)) == [FAIL]
+    assert _levels(doctor.check_daemon(str(lock), holder=4242,
+                                       alive=lambda pid: True, held=True)) == [OK]
+
+
+def test_lock_is_held_answers_the_lock_not_the_file(tmp_path):
+    """daemon.lock_is_held on its own: held, not held, and no file at all."""
+    lock = tmp_path / "herd-daemon.lock"
+    assert daemon.lock_is_held(str(lock)) is None           # no file
+    lock.write_text("1\n")
+    assert daemon.lock_is_held(str(lock)) is False          # file, nobody holding
+    with open(lock, "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert daemon.lock_is_held(str(lock)) is True
+    assert daemon.lock_is_held(str(lock)) is False          # released on close
+
+
+def test_probing_the_lock_does_not_steal_it(tmp_path):
+    """The probe takes the lock when nobody holds it, so it MUST release — a doctor
+    run that left the lock held would stop the next daemon from starting."""
+    lock = tmp_path / "herd-daemon.lock"
+    lock.write_text("1\n")
+    daemon.lock_is_held(str(lock))
+    assert daemon.acquire_single_instance(str(lock)) is True
 
 
 # ── env ─────────────────────────────────────────────────────────────────────
