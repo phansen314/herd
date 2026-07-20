@@ -481,14 +481,52 @@ def test_a_malformed_threshold_falls_back_instead_of_raising(var, bad, tmp_path)
         assert var in r.stderr                                 # and it SAYS which knob
 
 
+def _db_with_dead_session(tmp_path):
+    """A real DB holding one live `working` row whose pid is genuinely gone.
+
+    The pid comes from a process we spawned and reaped, so it is absent from ps and
+    cannot be a live stranger's. started_at is NOW on purpose: a pre-boot stamp would
+    let W3e_boot_sweep stop the row, and the test would pass without the ps-driven
+    reaper — the very thing it is asserting — ever running. See test_config.py's
+    _db_with_session for the same trap."""
+    from datetime import datetime, timezone
+    p = subprocess.Popen(["/bin/sleep", "600"])
+    p.kill()
+    p.wait()                                     # no zombie: the pid leaves ps
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    db = tmp_path / "reap.db"
+    c = sqlite3.connect(db)
+    for f in ("core.sql", "herd.sql"):
+        c.executescript((SRC / "herd" / "schema" / f).read_text())
+    c.execute("INSERT INTO sessions(session_id,cwd,model,pid,status,status_source,"
+              "last_event_at,last_event_type,started_at,updated_at) VALUES"
+              "('s1','/x','m',?,'working','hook',?,'tool',?,?)",
+              (p.pid, now, now, now))
+    c.commit()
+    c.close()
+    return db
+
+
 def test_the_daemon_still_starts_under_a_malformed_threshold(tmp_path):
     """Not just the CLI: the reaper itself is what stops if import raises, and a
-    daemon that will not start is silent-death reaping that never happens."""
+    daemon that will not start is silent-death reaping that never happens.
+
+    The tick must REAP, not merely exit 0. This pointed HERD_DB at a path that did
+    not exist, and connect() refuses to create one — so the tick necessarily faulted
+    and `returncode == 0` was the entire assertion. A daemon with its whole tick body
+    deleted passed. It now runs against a real DB holding a session whose pid is
+    genuinely gone, so the reaper has work to do and has to be alive to do it."""
+    db = _db_with_dead_session(tmp_path)
     e = dict(os.environ, PYTHONPATH=str(SRC), HERD_WAIT_SECS="fast",
-             HERD_RUNTIME=str(tmp_path), HERD_DB=str(tmp_path / "t.db"))
+             HERD_ATTENTION="0", HERD_RUNTIME=str(tmp_path), HERD_DB=str(db))
     r = subprocess.run([sys.executable, "-m", "herd.daemon", "--once"],
                        capture_output=True, text=True, env=e, timeout=30)
     assert r.returncode == 0, r.stderr
+    c = sqlite3.connect(db)
+    stopped = c.execute("SELECT stopped_at FROM sessions WHERE session_id='s1'").fetchone()[0]
+    c.close()
+    assert stopped is not None, \
+        f"the daemon started but the tick did no work: {r.stdout}{r.stderr}"
 
 
 # ── comm truncation: Linux caps comm at 15 chars, CLAUDE_NAME is not capped ──

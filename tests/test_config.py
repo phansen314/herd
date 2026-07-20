@@ -152,8 +152,11 @@ def test_the_config_file_stops_the_reaper_killing_a_renamed_claude(tmp_path):
                    HOME=str(tmp_path))
         env.pop("HERD_CLAUDE_NAME", None)            # the shell does NOT have it
         env["HERD_CONFIG"] = str(cfgp)
-        subprocess.run([sys.executable, "-m", "herd.daemon", "--once"],
-                       env=env, capture_output=True, text=True, timeout=60)
+        r = subprocess.run([sys.executable, "-m", "herd.daemon", "--once"],
+                           env=env, capture_output=True, text=True, timeout=60)
+        # The assertion below is "the row was NOT modified", which a daemon that
+        # died on import satisfies perfectly. Check the tick actually ran first.
+        assert r.returncode == 0, r.stderr
         import sqlite3
         c = sqlite3.connect(db)
         status, stopped = c.execute(
@@ -249,8 +252,10 @@ def test_the_daemon_uses_the_database_the_config_file_names(tmp_path):
         env = dict(os.environ, PYTHONPATH=str(SRC), HERD_RUNTIME=str(tmp_path),
                    HERD_CONFIG=str(cfgp), HERD_ATTENTION="0", HOME=str(tmp_path))
         env.pop("HERD_DB", None)                      # nothing in the environment
-        subprocess.run([sys.executable, "-m", "herd.daemon", "--once"],
-                       env=env, capture_output=True, text=True, timeout=60)
+        r = subprocess.run([sys.executable, "-m", "herd.daemon", "--once"],
+                           env=env, capture_output=True, text=True, timeout=60)
+        # A crashed daemon leaves the row untouched too — see the sibling test.
+        assert r.returncode == 0, r.stderr
         # it opened THIS database: the live session is still live, and no stray
         # herd.db appeared next to it
         c = sqlite3.connect(db)
