@@ -374,8 +374,16 @@ def sweep_stranded(conn, now, max_age=None):
 def sweep_dead_attention(conn):
     """Reclaim herd_attention rows whose session has stopped. Tier 2 — runs with
     the attention tick, which cannot do it itself: that tick only visits live rows,
-    so the orphan it would need to see is filtered out before it looks."""
-    return conn.execute(W["W6e_sweep_dead"]).rowcount
+    so the orphan it would need to see is filtered out before it looks.
+
+    changes(), not cursor.rowcount: for a `DELETE ... WHERE ... NOT IN (subquery)`
+    the older SQLite bundled with Python 3.9 reports rowcount as -1 while 3.45
+    reports the true count — a query-shape-dependent quirk of the DBAPI layer.
+    sqlite3_changes() is well-defined across both. The DELETE and the changes() read
+    are one autocommit statement each on the same connection with no writer between
+    them, so the count is this DELETE's."""
+    conn.execute(W["W6e_sweep_dead"])
+    return conn.execute("SELECT changes()").fetchone()[0]
 
 
 def boot_sweep(conn, now, boot_time):
