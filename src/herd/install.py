@@ -133,13 +133,31 @@ def backup_original(path, text):
 def _restore_source(path):
     """The backup uninstall should restore: the pristine original if we have one,
     else the OLDEST timestamped backup (on a pre-ORIGINAL_SUFFIX install, the last
-    copy that predates herd). None when nothing usable exists."""
+    copy that predates herd). None when nothing usable exists.
+
+    A timestamped candidate must still be CHECKED, the same way backup_original
+    checks before creating the pristine copy. Without that, uninstall reinstated
+    herd: with no ~/.claude/settings.json on the machine, install #1 has nothing to
+    snapshot, so no .original is ever written; install #2 then timestamps the
+    ALREADY-WIRED file, and the oldest timestamped backup is a herd-wired one.
+    Uninstall read its statusLine back out and put herd's own statusline in, or with
+    --restore-original wrote the whole wired file back — and printed success either
+    way. Returning None instead is correct and loud: every caller degrades to a
+    surgical unwire or says the file must be edited by hand."""
     orig = path.with_name(path.name + ORIGINAL_SUFFIX)
     if orig.exists():
         return orig
     baks = sorted(path.parent.glob(path.name + ".herd-bak.*"))
-    baks = [b for b in baks if b.name != orig.name]
-    return baks[0] if baks else None
+    for b in baks:
+        if b.name == orig.name:
+            continue
+        try:
+            text = b.read_text()
+        except OSError:
+            continue           # unreadable candidate: try the next-oldest
+        if not _is_wired(b, text):
+            return b
+    return None
 
 
 def _atomic_write(path, text):

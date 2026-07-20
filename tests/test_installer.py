@@ -1269,3 +1269,50 @@ def test_the_selftest_refuses_a_hook_that_cannot_parse(tmp_path):
     ok, detail = inst.selftest(hd)
     assert not ok
     assert "stop.sh" in detail.get("syntax_error", {}), detail
+
+
+def test_uninstall_does_not_rewire_herd_from_a_wired_timestamped_backup(home):
+    """_restore_source's fallback returned the OLDEST timestamped backup without the
+    _is_wired check backup_original applies before writing the pristine copy — so it
+    could hand back a herd-wired snapshot and uninstall would faithfully restore it.
+
+    Reachable on any machine with NO ~/.claude/settings.json, which is the common
+    fresh case: install #1 has nothing to snapshot, so no .original is ever written;
+    install #2 timestamps the already-wired file; the oldest timestamped backup is
+    therefore herd's own. Uninstall then read statusLine back out of it and put
+    herd's statusline BACK, printing success. Verified end to end here rather than
+    by unit-testing _restore_source, because the damage is what uninstall writes."""
+    assert not inst.SETTINGS.exists()          # the precondition that creates the trap
+    inst.install()
+    inst.install()                             # timestamps the wired file
+    assert not inst.SETTINGS.with_name(inst.SETTINGS.name + inst.ORIGINAL_SUFFIX).exists(), \
+        "precondition broke: a pristine original exists, so the fallback is not used"
+
+    inst.uninstall()
+
+    text = inst.SETTINGS.read_text()
+    left = json.loads(text)
+    sl = json.dumps(left.get("statusLine", ""))
+    assert str(inst.INSTALLED_HOOKS) not in sl, \
+        f"uninstall reinstated herd's statusline: {sl}"
+    assert str(inst.INSTALLED_HOOKS) not in text, \
+        f"uninstall left herd wired: {text}"
+
+
+def test_restore_source_skips_a_wired_backup_and_keeps_looking(home):
+    """The fallback must not merely reject the newest wired candidate — it has to
+    keep walking to an older PRE-herd one when there is a genuine one behind it."""
+    p = inst.SETTINGS
+    inst.install()                             # a GENUINELY wired file, not a mock
+    wired_text = p.read_text()
+    assert _wired(json.loads(wired_text)), "precondition: install must wire it"
+
+    p.write_text(json.dumps(PRISTINE))
+    good = p.with_name(p.name + ".herd-bak.20250101-000000")
+    good.write_text(json.dumps(PRISTINE))
+    bad = p.with_name(p.name + ".herd-bak.20260606-000000")
+    bad.write_text(wired_text)
+    assert inst._restore_source(p) == good
+
+    good.unlink()
+    assert inst._restore_source(p) is None, "a wired-only set must yield None"
