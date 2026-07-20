@@ -24,6 +24,7 @@ KNOWN = (
     # daemon
     "HERD_ATTENTION", "HERD_WAIT_SECS", "HERD_APPROVAL_SECS", "HERD_STUCK_SECS",
     "HERD_STRANDED_SECS", "HERD_DAEMON_LOG_MAX",
+    "HERD_BACKOFF_MAX_SECS", "HERD_ORPHAN_GRACE_SECS",
     # shared by the daemon and the hooks — the divergence pair
     "HERD_CLAUDE_NAME", "HERD_RUNTIME", "HERD_DB",
     # hooks

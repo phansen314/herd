@@ -50,7 +50,8 @@ herd_load_config() {
         v="${v%"${v##*[! $tab]}"}"
         case "$k" in
             HERD_ATTENTION|HERD_WAIT_SECS|HERD_APPROVAL_SECS|HERD_STUCK_SECS|\
-            HERD_STRANDED_SECS|HERD_DAEMON_LOG_MAX|HERD_CLAUDE_NAME|HERD_RUNTIME|\
+            HERD_STRANDED_SECS|HERD_DAEMON_LOG_MAX|HERD_BACKOFF_MAX_SECS|\
+            HERD_ORPHAN_GRACE_SECS|HERD_CLAUDE_NAME|HERD_RUNTIME|\
             HERD_DB|HERD_TOOL_THROTTLE|HERD_ERRLOG|HERD_ERRLOG_MAX|HERD_TEMPLATES) ;;
             *) continue ;;                  # unknown key: config.py names it
         esac

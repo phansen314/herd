@@ -47,11 +47,13 @@ knob in README or a docstring is not enough; it must be in `config.KNOWN` and
 `common.sh`'s case list, or it is settable only where it does harm.
 
 **Protects:** the invariant that every `HERD_*` key either half reads appears in
-both key lists. **Currently violated:** `daemon.py` reads `HERD_BACKOFF_MAX_SECS`
-and `HERD_ORPHAN_GRACE_SECS`, neither of which is in `config.KNOWN` — so they are
-unsettable through the only channel the daemon reads, and `herd doctor` reports the
-correct spelling as an unknown-key typo. Fixing that is a separate change; this
-entry is what makes the gap visible.
+both key lists, pinned by `test_every_setting_read_from_the_environment_is_a_config_key`.
+Writing this entry found the invariant already broken: `daemon.py` read
+`HERD_BACKOFF_MAX_SECS` and `HERD_ORPHAN_GRACE_SECS`, and neither was in
+`config.KNOWN` — so they were unsettable through the only channel the daemon reads,
+while `herd doctor` reported the correct spelling as an unknown-key typo. Both are
+now in both lists. The older pin compares the two lists to EACH OTHER, which cannot
+see a key that is missing from both; this one compares them to what the code reads.
 
 ## 2026-07-18 — No Claude-invoked pager; the escalation stub is deleted {#pager}
 

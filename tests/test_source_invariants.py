@@ -243,6 +243,45 @@ def test_config_keys_match_between_python_and_bash():
         f"only in python: {sorted(set(herd_config.KNOWN) - bash_keys)}")
 
 
+# Names read from the environment that are deliberately NOT config keys. Each is
+# unsettable-by-nature rather than merely undocumented, so a config file entry for
+# one could not work:
+#   HERD_CONFIG      the path OF the config file — reading it from the file it
+#                    names is circular.
+#   HERD_WRITES      derived by common.sh as <hooks>/../schema/writes.sql.
+#   HERD_PARSE_TAIL  internal, set by jq_in and read back by the same hook.
+#   HERD_JOB         per-session identity, exported into a spawned session's env.
+_NOT_CONFIG = {"HERD_CONFIG", "HERD_WRITES", "HERD_PARSE_TAIL", "HERD_JOB"}
+
+
+def test_every_setting_read_from_the_environment_is_a_config_key():
+    """The other half of the pinning above: the two key lists can agree with each
+    other and still both miss a knob the code actually reads.
+
+    That is not hypothetical — HERD_BACKOFF_MAX_SECS and HERD_ORPHAN_GRACE_SECS were
+    read by daemon.py and named in neither list. `systemctl --user` gives the daemon
+    no environment, so ~/.herd/config is the ONLY channel that reaches it: a key
+    missing from the lists is one the daemon can never actually be given, while
+    `herd doctor` reports the correct spelling as an unknown-key typo. See
+    DECISIONS.md#env-divergence."""
+    from herd import config as herd_config
+    read = re.compile(r"""(?:environ(?:\.get)?[\[(]\s*["']|_int_env\(["']|getenv\(["'])(HERD_[A-Z_]+)""")
+    missing = {}
+    for f in sorted((ROOT / "src" / "herd").rglob("*")):
+        if f.suffix not in (".py", ".sh"):
+            continue
+        text = f.read_text()
+        names = set(read.findall(text))
+        if f.suffix == ".sh":
+            names |= set(re.findall(r"\$\{?(HERD_[A-Z_]+)", text))
+        gap = names - set(herd_config.KNOWN) - _NOT_CONFIG
+        if gap:
+            missing[f.name] = sorted(gap)
+    assert not missing, (
+        f"read from the environment but absent from config.KNOWN: {missing}. "
+        "Add them to KNOWN and common.sh's case list, or stop reading them.")
+
+
 def test_the_config_template_only_documents_real_keys():
     """Every KEY= in the shipped default must be one herd actually reads. A commented
     example naming a key that does nothing is worse than no example — it is a
