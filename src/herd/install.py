@@ -1036,6 +1036,47 @@ def _uninstall_wrapper(ts, restore_original):
     return 0
 
 
+def _uninstall_hook_tree():
+    """Remove the hook tree _copy_hook_tree installed, and say so.
+
+    Install created ~/.herd/{hooks,schema} and uninstall left them there, unmentioned
+    — asymmetric, and it used to compound the _restore_source bug: the orphaned
+    statusline.sh stayed on disk and executable while settings.json still pointed at
+    it. Nothing points at it now, but "uninstalled" should not leave herd's
+    executables behind.
+
+    SURGICAL, like the rest of uninstall: only the extensions we wrote, then rmdir
+    only if that emptied the directory. A file someone else put in there is theirs,
+    and is reason to keep the directory rather than to delete it anyway.
+
+    REFUSES the source checkout. `--dev` wires ~/.claude/settings.json straight at
+    the repo, so INSTALLED_HOOKS and HOOKS_DIR can be the same directory — an
+    unguarded rmtree there deletes the working tree, not an install."""
+    out = []
+    for d, pattern, src in ((INSTALLED_HOOKS, "*.sh", HOOKS_DIR),
+                            (INSTALLED_SCHEMA, "*.sql", SCHEMA_DIR)):
+        if not d.exists():
+            continue
+        try:
+            same = d.resolve() == src.resolve()
+        except OSError:                 # unresolvable: assume the dangerous case
+            same = True
+        if same:
+            out.append(f"LEFT {d} — that is the checkout itself (--dev install)")
+            continue
+        for f in sorted(d.glob(pattern)):
+            try:
+                f.unlink()
+            except OSError as e:
+                out.append(f"could not remove {f}: {e}")
+        try:
+            d.rmdir()
+            out.append(f"removed {d}")
+        except OSError:
+            out.append(f"removed herd's files from {d} (kept — not empty)")
+    return out or [f"no installed hook tree under {HERD_DIR}"]
+
+
 def uninstall(restore_original=False):
     """Reverse herd's edits to each file it wired, + remove service & CLI.
 
@@ -1049,7 +1090,12 @@ def uninstall(restore_original=False):
     ts = _ts()
     print("  " + _uninstall_kitty(ts))
     rc = _uninstall_settings(ts, restore_original)
-    return rc | _uninstall_wrapper(ts, restore_original)
+    rc |= _uninstall_wrapper(ts, restore_original)
+    # After the wiring, not before: if unwiring fails the files are still referenced,
+    # and removing them first would leave settings.json pointing at nothing.
+    for line in _uninstall_hook_tree():
+        print("  " + line)
+    return rc
 
 
 # Every flag main() understands. Anything outside this set is a TYPO — see main().

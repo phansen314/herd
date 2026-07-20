@@ -1316,3 +1316,60 @@ def test_restore_source_skips_a_wired_backup_and_keeps_looking(home):
 
     good.unlink()
     assert inst._restore_source(p) is None, "a wired-only set must yield None"
+
+
+def test_uninstall_removes_the_installed_hook_tree(home):
+    """install() created ~/.herd/{hooks,schema}; uninstall left them there and said
+    nothing. Asymmetric, and it used to compound the _restore_source bug — the
+    orphaned statusline.sh stayed executable on disk while settings.json still
+    pointed at it."""
+    inst.install()
+    assert (inst.INSTALLED_HOOKS / "common.sh").exists()
+    assert (inst.INSTALLED_SCHEMA / "writes.sql").exists()
+
+    inst.uninstall()
+
+    assert not inst.INSTALLED_HOOKS.exists(), "the installed hooks survived uninstall"
+    assert not inst.INSTALLED_SCHEMA.exists(), "the installed schema survived uninstall"
+    # the things uninstall must NOT take with it
+    assert inst.DB.exists(), "uninstall destroyed the session history"
+
+
+def test_uninstall_keeps_a_directory_holding_someone_elses_file(home):
+    """Surgical, like the rest of uninstall: our extensions go, an unexpected file
+    stays AND keeps its directory. Deleting the tree wholesale would make an
+    uninstall destroy a file herd never wrote."""
+    inst.install()
+    theirs = inst.INSTALLED_HOOKS / "notes.txt"
+    theirs.write_text("mine, not herd's")
+
+    inst.uninstall()
+
+    assert theirs.exists(), "uninstall deleted a file herd did not write"
+    assert not (inst.INSTALLED_HOOKS / "common.sh").exists(), "herd's own hook stayed"
+    assert inst.INSTALLED_HOOKS.exists(), "the directory went with the foreign file"
+
+
+def test_uninstall_refuses_to_delete_the_checkout(home, monkeypatch, tmp_path):
+    """--dev wires settings.json straight at the repo, so INSTALLED_HOOKS and
+    HOOKS_DIR can be the SAME directory — there, an unguarded removal deletes the
+    working tree rather than an install.
+
+    Both roots are pointed at a throwaway copy rather than at the real checkout: if
+    the guard regresses, this test must lose a temp dir, not src/herd/hooks."""
+    fake = tmp_path / "checkout" / "hooks"
+    fake.mkdir(parents=True)
+    (fake / "common.sh").write_text("# pretend checkout\n")
+    fake_schema = tmp_path / "checkout" / "schema"
+    fake_schema.mkdir()
+    (fake_schema / "writes.sql").write_text("-- pretend\n")
+    for name in ("HOOKS_DIR", "INSTALLED_HOOKS"):
+        monkeypatch.setattr(inst, name, fake)
+    for name in ("SCHEMA_DIR", "INSTALLED_SCHEMA"):
+        monkeypatch.setattr(inst, name, fake_schema)
+
+    out = "\n".join(inst._uninstall_hook_tree())
+
+    assert (fake / "common.sh").exists(), "uninstall deleted the checkout"
+    assert (fake_schema / "writes.sql").exists(), "uninstall deleted the checkout schema"
+    assert "LEFT" in out and "--dev" in out, out
