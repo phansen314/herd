@@ -55,6 +55,42 @@ def config_path():
     return pathlib.Path(p) if p else pathlib.Path.home() / ".herd" / "config"
 
 
+def runtime_dir(env=None, mkdir=True):
+    """The one directory for herd's per-session runtime files, the daemon lock, and
+    the picker handoff. HERD_RUNTIME, else XDG_RUNTIME_DIR, else ~/.herd/run.
+
+    NEVER /tmp, which is what the fallback used to be. Every name under it is
+    predictable — herd-db-err.<pid>, herd-stline-<uuid>, herd-daemon.lock — and the
+    hooks create them with plain redirects, which FOLLOW SYMLINKS. On a shared box
+    another user could pre-create any of those as a link to a file of ours and have
+    a hook truncate it. XDG_RUNTIME_DIR does not have that problem (/run/user/<uid>
+    is 0700 and ours), and ~/.herd/run does not either; only /tmp did.
+
+    ONE definition, because every reader has to agree: the hooks write the caches,
+    the CLI reads them, and the daemon takes its single-instance lock here. Two
+    answers means two locks and two daemons — which is what HERD_RUNTIME in a shell
+    used to cause, and what ~/.herd/config now exists to prevent."""
+    env = os.environ if env is None else env
+    d = env.get("HERD_RUNTIME") or env.get("XDG_RUNTIME_DIR")
+    if d:
+        return d
+    # env["HOME"], not expanduser("~"): expanduser reads the REAL environment, so a
+    # caller passing an env dict (every test, and doctor asking what the DAEMON
+    # resolves) got this process's home and the parameter silently did nothing.
+    # common.sh uses $HOME here, and the two have to land on the same directory.
+    home = env.get("HOME") or os.path.expanduser("~")
+    d = os.path.join(home, ".herd", "run")
+    # Only on the fallback path, and only when absent — this is called on the hook
+    # hot path and an unconditional makedirs would be a syscall per statusline tick.
+    if mkdir and not os.path.isdir(d):
+        try:
+            os.makedirs(d, mode=0o700, exist_ok=True)
+            os.chmod(d, 0o700)          # makedirs honours umask; be explicit
+        except OSError:
+            pass                        # unwritable HOME: callers degrade already
+    return d
+
+
 def parse(text):
     """(values, problems) from KEY=value lines. Never raises — this is read on the
     import path of every herd command, so a mangled file must degrade to "no
@@ -151,7 +187,8 @@ DEFAULT_TEXT = """\
 # live session as a recycled pid and stop all of them on its first tick.
 #HERD_CLAUDE_NAME=claude   # process name the pid ancestry walk looks for
 #HERD_RUNTIME=             # per-session runtime files + the daemon lock.
-                           # Defaults to $XDG_RUNTIME_DIR, else /tmp. Setting this
+                           # Defaults to $XDG_RUNTIME_DIR, else ~/.herd/run.
+                           # Setting this
                            # in a shell only splits the lock and runs two daemons.
 
 # ── paths ───────────────────────────────────────────────────────────────────

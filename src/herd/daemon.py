@@ -248,9 +248,11 @@ def _dead(pid, procs):
 
 
 def _runtime_dir():
-    """Same anchor as lock_path(), cli._runtime_dir() and the hooks' HERD_RUNTIME."""
-    return os.environ.get("HERD_RUNTIME",
-                          os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+    """Same anchor as lock_path(), cli._runtime_dir() and the hooks' HERD_RUNTIME —
+    now literally the same function, in config.py. Four copies of this chain existed
+    and two of them were in THIS file; a reader that disagrees takes a different lock
+    and runs a second daemon."""
+    return _config.runtime_dir()
 
 
 def _valid_sid(sid):
@@ -264,7 +266,7 @@ def sweep_runtime_files(session_id):
     statusline cache.
 
     session_end.sh already does this ("or they leak one pair per session forever
-    — bounded on a tmpfs $XDG_RUNTIME_DIR, unbounded under the /tmp fallback"),
+    — bounded on a tmpfs XDG_RUNTIME_DIR, unbounded under the home-dir fallback"),
     but SessionEnd does not fire on kill -9, a crash, or a closed terminal. Those
     are the deaths THIS DAEMON exists to reap, so every one of them left a pair
     behind: 34 herd-stline-* files against 1 live session, measured. The reaper is
@@ -460,8 +462,7 @@ _LOCK_FH = None
 
 
 def lock_path():
-    return os.path.join(os.environ.get("HERD_RUNTIME",
-                        os.environ.get("XDG_RUNTIME_DIR", "/tmp")), "herd-daemon.lock")
+    return os.path.join(_runtime_dir(), "herd-daemon.lock")
 
 
 def acquire_single_instance(path=None):

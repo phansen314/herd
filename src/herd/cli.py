@@ -299,9 +299,11 @@ def _rows_text(conn):
 
 
 def _runtime_dir():
-    """Same anchor as daemon.lock_path() and the hooks' HERD_RUNTIME."""
-    return os.environ.get("HERD_RUNTIME",
-                          os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+    """Same anchor as daemon.lock_path() and the hooks' HERD_RUNTIME — one
+    definition, in config.py. The picker's rows file lands here and fzf reads it, so
+    a CLI that disagreed with the hooks would hand fzf a path nothing writes."""
+    from herd import config as _config
+    return _config.runtime_dir()
 
 
 def _rows_file(port):

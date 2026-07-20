@@ -17,6 +17,6 @@ export HERD_P_session_id="$SID" HERD_P_now="$NOW_ISO"
 run W4_end >/dev/null 2>&1
 
 # Both per-session runtime files, or they leak one pair per session forever —
-# bounded on a tmpfs $XDG_RUNTIME_DIR, unbounded under the /tmp fallback.
+# bounded on a tmpfs XDG_RUNTIME_DIR, unbounded under the ~/.herd/run fallback.
 rm -f "$HERD_RUNTIME/herd-tool-$SID" "$HERD_RUNTIME/herd-stline-$SID" 2>/dev/null
 exit 0

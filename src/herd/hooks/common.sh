@@ -58,7 +58,23 @@ herd_load_config
 # Config is default-expansion (${X:-...}) ONLY, never unconditional assignment,
 # so tests can redirect state (HERD_RUNTIME earned this — see DESIGN.md).
 HERD_DB="${HERD_DB:-$HOME/.herd/herd.db}"
-HERD_RUNTIME="${HERD_RUNTIME:-${XDG_RUNTIME_DIR:-/tmp}}"
+# HERD_RUNTIME, else XDG_RUNTIME_DIR, else ~/.herd/run — NEVER /tmp, which is what
+# this fell back to. Every name we put here is predictable (herd-db-err.$$,
+# herd-stline-<uuid>, herd-daemon.lock) and db() creates its error file with `: >`,
+# a redirect that FOLLOWS SYMLINKS: on a shared box another user could pre-create
+# that path as a link to a file of ours and have the next hook fire truncate it.
+# /run/user/<uid> is 0700 and ours, and so is ~/.herd/run; only /tmp was open.
+#
+# config.runtime_dir() is the python half of this and must agree — the daemon takes
+# its single-instance lock in this directory, so two answers means two daemons.
+HERD_RUNTIME="${HERD_RUNTIME:-${XDG_RUNTIME_DIR:-}}"
+if [ -z "$HERD_RUNTIME" ]; then
+    HERD_RUNTIME="$HOME/.herd/run"
+    # `[ -d ]` is a builtin and mkdir is a FORK, on a path that runs about once a
+    # second per session. Only pay it when the directory is actually missing.
+    [ -d "$HERD_RUNTIME" ] || { mkdir -p "$HERD_RUNTIME" 2>/dev/null && \
+                                chmod 700 "$HERD_RUNTIME" 2>/dev/null; }
+fi
 HERD_ERRLOG="${HERD_ERRLOG:-$HOME/.herd/hook-errors.log}"
 
 # writes.sql sits at hooks/../schema/. ${BASH_SOURCE%/*} not $(dirname) — no fork.

@@ -251,3 +251,23 @@ def test_the_config_template_only_documents_real_keys():
     named = set(re.findall(r"^#?(HERD_[A-Z_]+)=", herd_config.DEFAULT_TEXT, re.M))
     assert named <= set(herd_config.KNOWN), \
         f"template names unknown keys: {sorted(named - set(herd_config.KNOWN))}"
+
+
+def test_nothing_falls_back_to_tmp_for_runtime_files():
+    """The runtime dir chain lives in ONE place (config.runtime_dir) and ends at
+    ~/.herd/run. A fourth copy reintroduces both the world-writable fallback and a
+    reader that can disagree with the daemon about where the lock is — there were
+    four copies, two of them in daemon.py alone.
+
+    Matches the RESOLUTION, not the name: comments legitimately mention
+    XDG_RUNTIME_DIR to explain what the directory is."""
+    tmp_fallbacks = ('XDG_RUNTIME_DIR", "/tmp"', "XDG_RUNTIME_DIR:-/tmp")
+    resolvers = ('os.environ.get("XDG_RUNTIME_DIR"', 'env.get("XDG_RUNTIME_DIR")',
+                 '${XDG_RUNTIME_DIR')
+    for f in list((ROOT / "src" / "herd").rglob("*.py")) + list(HOOKS.glob("*.sh")):
+        src = f.read_text()
+        for pat in tmp_fallbacks:
+            assert pat not in src, f"{f.name} still falls back to /tmp"
+        if any(r in src for r in resolvers):
+            assert f.name in ("config.py", "common.sh", "install.py"), \
+                f"{f.name} resolves the runtime dir itself — use config.runtime_dir()"

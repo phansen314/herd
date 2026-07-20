@@ -246,3 +246,45 @@ def test_the_daemon_uses_the_database_the_config_file_names(tmp_path):
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+# ── the runtime directory: one answer, never /tmp ────────────────────────────
+def test_runtime_dir_prefers_herd_runtime_then_xdg(tmp_path):
+    assert cfg.runtime_dir({"HERD_RUNTIME": "/custom",
+                            "XDG_RUNTIME_DIR": "/run/user/1000"}) == "/custom"
+    assert cfg.runtime_dir({"XDG_RUNTIME_DIR": "/run/user/1000"}) == "/run/user/1000"
+
+
+def test_runtime_dir_falls_back_into_the_home_dir_not_tmp(tmp_path):
+    """/tmp was the fallback, and every name herd puts there is predictable —
+    herd-db-err.<pid>, herd-stline-<uuid>, herd-daemon.lock. db() creates its error
+    file with `: >`, a redirect that follows symlinks, so on a shared box another
+    user could pre-create one as a link and have the next hook fire truncate it.
+    /run/user/<uid> is 0700 and ours; ~/.herd/run is too."""
+    # No "/tmp not in got" check: pytest's tmp_path IS under /tmp, so it fails on
+    # the fixture rather than the behaviour. The equality above pins the location;
+    # test_nothing_falls_back_to_tmp_for_runtime_files pins the absence at source.
+    got = cfg.runtime_dir({"HOME": str(tmp_path)})
+    assert got == str(tmp_path / ".herd" / "run")
+    assert pathlib.Path(got).stat().st_mode & 0o777 == 0o700
+
+
+def test_runtime_dir_honours_the_env_it_is_given(tmp_path):
+    """expanduser("~") reads the REAL environment, so passing an env dict silently
+    did nothing — and doctor asks this question ABOUT ANOTHER PROCESS."""
+    assert cfg.runtime_dir({"HOME": "/somewhere/else"}, mkdir=False) == \
+        "/somewhere/else/.herd/run"
+
+
+@pytest.mark.shell
+def test_bash_and_python_agree_on_the_runtime_dir(tmp_path):
+    """The daemon takes its single-instance lock in this directory and the hooks
+    write the caches the CLI reads. Two answers means two daemons — the failure the
+    flock exists to prevent, arrived at by disagreement instead."""
+    env = dict(os.environ, HOME=str(tmp_path))
+    for k in ("HERD_RUNTIME", "XDG_RUNTIME_DIR"):
+        env.pop(k, None)
+    got = subprocess.run(
+        ["bash", "-c", f'. {HOOKS / "common.sh"}; printf "%s" "$HERD_RUNTIME"'],
+        env=env, capture_output=True, text=True, timeout=60).stdout
+    assert got == cfg.runtime_dir({"HOME": str(tmp_path)}) == str(tmp_path / ".herd" / "run")
