@@ -74,7 +74,10 @@ jobs:
       # A GREEN RUN MUST MEAN THE HOOK TESTS RAN. conftest skips them when bash/jq/
       # sqlite3 are missing — right on a contributor's machine, dangerous here, where
       # "0 failures" looks identical to a run that skipped them. Dropping jq alone
-      # skips 159 of 665, and nothing in a green summary would say so.
+      # takes a large fraction of the suite with it, and nothing in a green summary
+      # would say so. (No count named: this comment carried one, it went stale, and
+      # check-skips.py deliberately gates on the skip REASONS rather than a total
+      # for the same reason.)
       - name: a green run must not be a skipped run
         run: |
           for t in bash jq sqlite3; do

@@ -1,6 +1,6 @@
 """herd spawn — launch a named claude session in kitty and record its placeholder.
 
-The design seam is SpawnSpec: the CLI (now) and a template loader (later) both
+The design seam is SpawnSpec: the CLI and the template loader (template.py) both
 produce one, and this single executor consumes it — so templates never touch the DB
 or this code. Writes go through the canonical W1 statements (load_statements).
 See DESIGN.md#write-paths-schemawritessql.
@@ -25,7 +25,7 @@ def valid_job(job):
 
 @dataclass
 class SpawnSpec:
-    """A fully-resolved spawn — the contract a template file will later fill."""
+    """A fully-resolved spawn — the contract a template file fills."""
     job: str
     cwd: str
     launch_type: str = "tab"          # tab | pane

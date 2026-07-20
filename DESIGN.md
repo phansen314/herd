@@ -129,7 +129,7 @@ them the same way, terminating at the first `;`;
 `test_hooks.py::test_bash_and_python_extract_same` asserts the two agree once
 whitespace is normalized, so bash and python cannot drift. Nothing may keep its own
 transcription of a write path ([DECISIONS.md#transcription](DECISIONS.md#transcription)),
-enforced by `test_source_invariants.py::test_no_hook_inlines_dml`.
+enforced by `test_source_invariants.py::test_no_hook_inlines_dml` (the shell half) and `::test_no_python_module_inlines_dml` (the python half — the shell guard globbed `*.sh`, and a verbatim copy of `W1_spawn_window` sat in `focus.py` past all four places this rule is written down).
 
 Inline comments inside a statement must not contain `;` (both parsers cut there;
 `test_source_invariants.py::test_every_statement_is_complete` catches truncation
@@ -153,7 +153,7 @@ via `sqlite3.complete_statement()`).
 | `W5b_adopt` | Statusline adoption ("Path C"): statusline is a child of claude, inherits `KITTY_*` like a hook, so a reconciled session picks up metrics with no hooks wired. Same liveness JOIN as W2. |
 | `W6a_arm` / `W6c_ack` / `W6d_rearm` / `W6d_rearm_sid` | Attention (see [attention](#attention)). `W6d_rearm_sid` is the UUID-keyed variant a hook needs (hooks lack the surrogate pk) — same keyed-two-ways pattern as W2 vs W2b. |
 | `W6e_sweep_dead` | Reclaims `herd_attention` rows whose session has stopped. The attention tick cannot do it: that tick visits only live rows, so the orphan it would need to see is filtered out before it looks. Runs **unconditionally**, not under the `HERD_ATTENTION` gate — it is garbage collection, not herd's opinion, and gating it meant the one mode where nothing else clears those rows was the mode that never ran it. See [small lies](DECISIONS.md#small-lies). |
-| `R1_list` | The **one** live-session read: `sessions` + `herd_sessions` + `herd_attention`, attention-first ordering. `ls`, the picker, `rows` and the preview all go through it. Selects **only what a renderer consumes** — see [banked columns](#banked-columns). |
+| `R1_list` | The one live-session read **in the rendering path**: `sessions` + `herd_sessions` + `herd_attention`, attention-first ordering. `ls`, the picker, `rows` and the preview all go through it. Selects **only what a renderer consumes** — see [banked columns](#banked-columns). The reaper, the attention tick, `focus` and `doctor` read liveness directly for their own non-rendering questions; see [focus](#focus--jump-kittyfocuspy-clipy). |
 | `W3f_sweep_stranded` | Reclaims a phase-1 spawn reservation whose claude never reached SessionStart (the launcher raised, claude died before its first hook, or the W5b adoption lost the `session_id` race). Such a row is `pid` NULL + `session_id` NULL, which `W3d_reap` skips by design while `R_job_live` still counts it live — so the job name stayed burned until the next boot sweep. Age-gated on `HERD_STRANDED_SECS` (a reservation is legitimately pid-NULL across the launch round trip). DELETE, not `stopped_at`, for `W1_spawn_abort`'s reason: this session never existed. |
 | `R_job_live` | Spawn-time recyclable-handle check: does a *live* session already hold this job name? By JOIN, no unique index. Dead rows keep their `job_name` — reuse is by design, and resolution searches live sessions only. Run **inside** `spawn()`'s `BEGIN IMMEDIATE`, not before it: the check must be atomic with the reservation, or two concurrent spawns both pass it across the kitty launch and both insert. See [spawn](#spawn). |
 | `R_window_unadopted` | Is there an unadopted reservation in this window — i.e. anything for statusline Path C to adopt later? Exactly `W2_adopt`'s target predicate, as a read. `session_start.sh` needs it after a FAILED `W2_adopt` to tell a spawn reservation (defer, Path C will claim it) from nothing at all (insert, or the session is lost for its whole life — Path C only UPDATEs). A read answers even while the write lock is held, since WAL readers do not block on a writer, so it is reliable in precisely the case that made the write fail. |
@@ -426,11 +426,20 @@ values are unanchored regex — anchor them or `job` matches `job-2`.
 IO (`_ls`/`_focus`, `list_fn`/`focus_fn`) is injected so logic is testable
 without a live kitty — the same discipline as `daemon.py` and `common.sh`.
 
-There is exactly one live-session read: `R1_list`, loaded from `writes.sql` like
-every other shipping statement. `cli._live()` *is* that statement, and `ls`, the
-picker, `rows` and the preview pane all go through it — the preview filters it by
-id rather than issuing a second query
+There is exactly one live-session read **in the rendering path**: `R1_list`, loaded
+from `writes.sql` like every other shipping statement. `cli._live()` *is* that
+statement, and `ls`, the picker, `rows` and the preview pane all go through it — the
+preview filters it by id rather than issuing a second query
 ([DECISIONS.md#transcription](DECISIONS.md#transcription)).
+
+"In the rendering path" is load-bearing, and this sentence used to omit it. Four
+other reads filter `stopped_at IS NULL`, none of them rendering anything and none of
+them going through `R1_list`: `focus.py:80` (the placement JOIN for one pk, twenty
+lines below this paragraph's subject), `daemon.py:285` / `:326` / `:432` (the
+reaper's liveness scans and the attention tick), and `doctor.py:152` (a count).
+`test_cli_reads_live_sessions_only_through_r1_list` asserts `"FROM sessions" not in
+inspect.getsource(cli)` — true of `cli.py`, which is what it checks, and not the
+system-wide property the unqualified sentence claimed.
 
 ### The preview pane is bash, not Python {#preview}
 
@@ -527,7 +536,7 @@ All three were measured ([DECISIONS.md#poker](DECISIONS.md#poker)).
 
 The reload **reads a file the poker writes**, not a fresh `herd rows`. The diff
 above already computes the row text in-process, so spawning an interpreter to
-recompute it byte-for-byte cost 77ms a refresh against ~3ms for a `cat`
+recompute it byte-for-byte cost 77ms a refresh against 2.8ms for a `cat`
 ([DECISIONS.md#rows-handoff](DECISIONS.md#rows-handoff)). `ctrl-r` deliberately
 keeps the python command: it is the explicit refresh-now path, and a file the poker
 has not rewritten yet would answer it with a stale list.

@@ -311,8 +311,10 @@ def _poke_loop(conn, port, send, sleep, rounds=None):
     outlive its fzf forever on an idle herd.
 
     The reload reads a FILE, not a fresh interpreter: this loop already holds the
-    row text, and `python -m herd.cli rows` costs 79ms per refresh against ~1ms for
-    a `cat`. That also keeps _line() the only row formatter. ctrl-r deliberately
+    row text, and `python -m herd.cli rows` costs 77ms per refresh against 2.8ms
+    for a `cat` (measured, 20 runs: DECISIONS.md#rows-handoff — the one place these
+    numbers live, since three paraphrases of them had drifted to three different
+    pairs). That also keeps _line() the only row formatter. ctrl-r deliberately
     keeps the python command — see _watch_flags.
     """
     rows_file = _rows_file(port)

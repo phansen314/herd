@@ -260,6 +260,23 @@ def test_every_statement_is_documented():
     assert not missing, f"statements absent from DESIGN.md: {missing}"
 
 
+def test_every_config_key_is_documented():
+    """A settable key the README never mentions is invisible.
+
+    Four of them were: HERD_DAEMON_LOG_MAX, HERD_BACKOFF_MAX_SECS,
+    HERD_ORPHAN_GRACE_SECS and HERD_CONFIG. The first bites hardest — doctor can
+    report it as malformed, naming a key the docs do not have, which reads like
+    doctor is wrong rather than the config. Same shape as the DESIGN.md statement
+    check above: the omission is easy and silent, so it gets a check."""
+    import sys
+    sys.path.insert(0, str(ROOT / "src"))
+    from herd import config as herd_config
+    readme = (ROOT / "README.md").read_text()
+    keys = set(herd_config.KNOWN) | {"HERD_CONFIG"}    # env-only, still user-facing
+    missing = sorted(k for k in keys if f"`{k}`" not in readme)
+    assert not missing, f"config keys absent from README.md: {missing}"
+
+
 def test_config_keys_match_between_python_and_bash():
     """~/.herd/config is the ONE channel that reaches both the daemon and the hooks,
     and each parses it independently — config.py in python, herd_load_config in

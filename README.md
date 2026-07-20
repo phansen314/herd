@@ -55,7 +55,13 @@ The installer:
    SQL travels with them on purpose: `common.sh` resolves `writes.sql` relative to
    the hook directory, and hooks installed without it would fail every write while
    still exiting 0. Re-run the installer after editing hooks, or use `--dev`;
-3. **wires the hooks + statusline** into `~/.claude/settings.json` — backing up each
+3. **self-tests the staged copy, then promotes it** — the hooks from step 2 are
+   staged in a temp directory and executed there against a temp DB *before* anything
+   is wired; only a PASS promotes them to `~/.herd/hooks`. This is why the step sits
+   here and not at the end: self-testing the hooks after wiring them would copy
+   broken hooks into every running session and only then report FAIL. A FAIL aborts
+   the install with `settings.json` untouched;
+4. **wires the hooks + statusline** into `~/.claude/settings.json` — backing up each
    file first (`*.herd-bak.<ts>`, plus a one-time `*.herd-bak.original`) and preserving
    anything it doesn't own (e.g. an existing PreToolUse hook). The `statusLine` key is
    pointed at herd's `statusline.sh`, except where a `~/.claude/custom-status-line.sh`
@@ -63,24 +69,24 @@ The installer:
    else it does. A `statusLine` running a script herd doesn't recognise is **left
    alone and reported**: point it at `src/herd/hooks/statusline.sh` yourself, or herd
    records no cost/context/branch (that hook is the only writer of those columns);
-4. **installs the daemon** to start on login and restart on exit — a `systemd --user`
+5. **installs the daemon** to start on login and restart on exit — a `systemd --user`
    service (`herd.service`) on Linux, a LaunchAgent (`com.codingzen.herd`) on macOS,
    where it also logs to `~/.herd/daemon.{out,err}.log` because launchd keeps no
    journal. Where neither manager exists (headless/containers) this step is a
    graceful no-op — run the daemon yourself.
-5. **symlinks the CLI** — `herd` into `~/.local/bin` and bash completion into
+6. **symlinks the CLI** — `herd` into `~/.local/bin` and bash completion into
    `~/.local/share/bash-completion/completions` (WARNs if `~/.local/bin` isn't on
    your PATH);
-6. **offers to enable kitty remote control** — only when it can see that it's off
+7. **offers to enable kitty remote control** — only when it can see that it's off
    (running inside kitty with no socket). Opt-in, backed up, and removed again by
    `--uninstall`; see [kitty setup](#kitty-setup);
-7. **self-tests** — runs the wired hooks against a temp DB and prints PASS/FAIL.
 
 If you use [klawde](https://github.com/wolffiex/klawde), note that the installer
 **unwires it**: any hook command under `/.klawde/` is dropped from `settings.json`
 (the two tools both own the statusline and would fight).
 
-Undo it — hooks, statusline, service, and the CLI symlinks — with:
+Undo it — hooks, statusline, service, the CLI symlinks, and the installed hook tree
+under `~/.herd/hooks` and `~/.herd/schema` — with:
 
 ```bash
 PYTHONPATH=src python3 -m herd.install --uninstall
@@ -92,6 +98,18 @@ original statusline invocation, and removes herd's block from `kitty.conf` if th
 installer added one. Everything else in `settings.json` is left exactly as it is: permission grants, MCP servers, and other tools' hooks all survive, including
 ones added long after the install. Each file is backed up (`*.herd-bak.<ts>`) before
 it is written.
+
+The hook tree is removed **only if the unwiring succeeded**. If `settings.json` or
+the wrapper can't be unwired — a hand edit it can't parse, or a wrapper with no
+pre-herd invocation to restore — uninstall says so, exits nonzero, and *keeps*
+`~/.herd/hooks`, because those files are still referenced by the wiring it just
+declined to touch. Removing them anyway would turn a merely stale config into a
+broken one, with every hook and the `statusLine` pointing at paths that no longer
+exist. Resolve what it named and re-run.
+
+Only files herd's own extensions match are removed (`*.sh`, `*.sql`), and the
+directory is kept if anything else is in it. A `--dev` install is refused outright:
+there, `~/.herd/hooks` *is* the checkout.
 
 One key is deliberately left behind. If `preferredNotifChannel` is set, uninstall
 names it and moves on: herd's opt-in and your own setting are the same value on disk,
@@ -371,6 +389,17 @@ Also read from the same file, by the hooks and CLI:
 | `HERD_ERRLOG_MAX` | `1048576` | bytes before the log rotates to `.1`; `0` keeps everything |
 | `HERD_RUNTIME` | `$XDG_RUNTIME_DIR`, else `~/.herd/run` | per-session throttle + statusline cache files, and the daemon's single-instance lock |
 
+Read by the daemon only, and rarely worth setting — listed because `herd doctor`
+can name them in a warning, and a key it reports but the README never mentions
+reads like a typo:
+
+| var | default | meaning |
+|---|---|---|
+| `HERD_DAEMON_LOG_MAX` | `1048576` | bytes before the daemon truncates its own stderr log; `0` disables the cap |
+| `HERD_BACKOFF_MAX_SECS` | `60` | ceiling on the retry backoff after consecutive failed ticks |
+| `HERD_ORPHAN_GRACE_SECS` | `300` | age before a runtime file whose session is gone is swept |
+| `HERD_CONFIG` | `~/.herd/config` | the config file itself — env only, since the file cannot name its own path |
+
 ## Notifications (kitty tab bell)
 
 herd sends no notifications itself — **Claude Code rings the bell, kitty flags the
@@ -490,8 +519,12 @@ It runs the real bash hooks and the real Python against throwaway databases, and
 proves the invariants the design rests on — the tier boundary, the identity model,
 the two-clocks attention thesis, the reaper's liveness rules, that every hook exits 0
 under every degradation, and that the hooks and daemon load the same canonical SQL.
-New behavior is added test-first (red before green); the suite is the project's only
-CI gate. (Fixture layout and why it runs the real hooks:
+New behavior is added test-first (red before green). CI runs the suite plus one
+other hard gate: a green run must not be a *skipped* run. `conftest` skips the hook
+tests when `bash`, `jq` or `sqlite3` is missing — correct on a contributor's
+machine, dangerous on a runner, where "0 failures" looks identical to a run that
+never executed them. `.github/check-skips.py` fails the build on any skip whose
+reason isn't whitelisted. (Fixture layout and why it runs the real hooks:
 [DESIGN.md#testing](DESIGN.md#testing).)
 
 How it works lives in [`DESIGN.md`](DESIGN.md) and why it works that way in
@@ -510,6 +543,9 @@ src/herd/
   db.py          statement loader + connection policy
   daemon.py      the reaper + attention tick
   install.py     hooks/statusline/service/CLI wiring
+  settings.py    THE definition of what herd owns in ~/.claude/settings.json
+  doctor.py      `herd doctor` — the diagnosis layer, safe on a sick machine
+  config.py      ~/.herd/config — one settings file the daemon and hooks both read
   cli.py         the `herd` CLI (ls, spawn, jump, watch + fzf preview machinery)
   spawn.py       `herd spawn` — SpawnSpec, resolve_spec, reserve-then-launch
   template.py    ~/.herd/templates/*.toml -> SpawnSpec defaults (herd spawn -t)

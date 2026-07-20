@@ -17,9 +17,14 @@ python3 -m pytest          # from the repo root
 ```
 
 If `bash`, `jq` or `sqlite3` is missing, the suite **skips** the tests that need it
-and says so in the header — it does not fail. You will still get a useful run
-(~385 of 623 tests with all three absent), just not a complete one. Install the
-missing tool before trusting a green result on hook changes.
+and says so in the header — it does not fail. You still get a useful run, just not a
+complete one: most of the suite execs the real hooks, so a large fraction of it goes
+with them. Install the missing tool before trusting a green result on hook changes.
+
+No count is quoted here on purpose. This paragraph used to name one, it went stale
+within a few dozen commits, and a wrong number is worse than none — CI does not
+trust one either: `.github/check-skips.py` fails the build on any non-whitelisted
+skip rather than comparing against a hardcoded total.
 
 ## Working on hooks
 
