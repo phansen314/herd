@@ -255,10 +255,17 @@ def test_a_shifted_parse_still_records_the_session(hook_env):
         (root / "hooks" / f.name).write_text(f.read_text())
     for f in (HOOKS.parent / "schema").glob("*.sql"):
         (root / "schema" / f.name).write_text(f.read_text())
+    # Break the sentinel where it now LIVES: payload_read in common.sh, shared by
+    # every hook. It used to be inline in session_start.sh, and this test caught the
+    # move by failing its own guard rather than passing against nothing.
     sl = root / "hooks" / "session_start.sh"
-    broken = sl.read_text().replace('EOR"\'', 'NOPE"\'')
-    assert broken != sl.read_text(), "sentinel literal moved — update this test"
-    sl.write_text(broken)
+    common = root / "hooks" / "common.sh"
+    # Only the APPENDED literal, not the comparison. Replacing every "EOR" changed
+    # both sides of the check, so the sentinel still matched and this test passed
+    # against a parse that was never broken.
+    broken = common.read_text().replace('EOR"\'', 'NOPE"\'')
+    assert broken != common.read_text(), "sentinel literal moved — update this test"
+    common.write_text(broken)
     env = dict(os.environ, HERD_DB=hook_env.path, HERD_RUNTIME=hook_env.runtime,
                HERD_ERRLOG=f"{hook_env.runtime}/err.log",
                KITTY_WINDOW_ID="", KITTY_LISTEN_ON="")

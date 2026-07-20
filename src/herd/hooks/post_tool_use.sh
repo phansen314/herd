@@ -11,7 +11,11 @@ __d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."
 HERD_TOOL_THROTTLE="${HERD_TOOL_THROTTLE:-2}"
 
 read_input
-SID=$(jq_in -r '.session_id // empty')
+# payload_read, as every hook does — see common.sh. One field, so a shift is not
+# reachable here (valid_sid rejects a mangled id and there is nothing after it to
+# displace); it uses the shared reader so that all five parse payloads the same
+# way and no one has to remember which two were exceptions.
+payload_read '.session_id' SID
 valid_sid "$SID" || exit 0
 
 now_pair    # one fork, gives ISO + epoch; the throttle needs epoch

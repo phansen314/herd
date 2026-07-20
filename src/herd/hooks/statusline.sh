@@ -16,10 +16,11 @@ read_input
 # ── parse: ONE jq into \x1f-separated fields ──────────────────────────────
 # \x1f (Unit Separator), NOT tab (tab is IFS whitespace and collapses empties).
 # model is an OBJECT here (.model.id). resets_at is a UNIX EPOCH.
-IFS=$'\x1f' read -r SID MODEL SNAME CTX COST RL5 RL5RESET RL7 RL7RESET CWD API_MS \
-                    CTXSIZE OCWD LADD LDEL TOKIN TOKOUT VER GWT EXC200 OSTYLE \
-                    RL5FMT RL7FMT EOR <<JQ
-$(jq_in -rj '[
+# payload_read strips \n, \r AND the separator from all 23 fields and checks a
+# sentinel — see common.sh, which every hook now shares. The stripping is not
+# cosmetic: a session_name carrying one separator shifted every later value into
+# the next column and W5_statusline COALESCEd the wrong ones in permanently.
+payload_read '
   .session_id,
   .model.id,
   .session_name,
@@ -66,36 +67,10 @@ $(jq_in -rj '[
   (try (if (.rate_limits.seven_day.resets_at | type) == "number"
         then (.rate_limits.seven_day.resets_at | strflocaltime("%m/%d %I:%M%p")
               | sub("^0"; "") | sub("/0"; "/") | sub(" 0"; " "))
-        else "" end) catch "")
-]
-# STRIP NEWLINES *AND THE SEPARATOR ITSELF*, in every field. The 23 values
-# are joined with \u001f and read by ONE `read`, which stops at the first newline — so a single one anywhere emptied
-# every field AFTER it. A /rename can carry a newline, and a directory name may
-# legally contain one.
-#
-# The damage is a frozen statusline, NOT a corrupted row: W5_statusline COALESCEs
-# every column against its current value, so the NULLs those empty fields bind to
-# are ignored and the old values SURVIVE — verified. What breaks is that they
-# never move again. Cost, context, branch and both rate limits stop updating for
-# the life of the session, while the rendered line drops every segment after the
-# name and shows a permanent 0%. Nothing is logged, because nothing failed.
-#
-# THE SEPARATOR WAS NOT STRIPPED, AND THAT ONE CORRUPTS THE ROW. It does not
-# truncate the read, it SHIFTS it: every field after the offending one moves
-# down a slot, so each value is sunk into the parameter for the NEXT column.
-# Verified: a session_name carrying one rendered the context percentage 12.5 as
-# cost "$12.50" and wrote total_cost_usd into rate_limit_5h_percent. COALESCE
-# cannot save this: the values are non-NULL, merely wrong, and every one is
-# sticky for the life of the row. Same class as the newline, opposite failure
-# mode, strictly worse — the newline froze the display but preserved the data.
-| map(. // "" | tostring | gsub("[\\n\\r\u001f]"; " ")) | join("\u001f")
-# Trailing sentinel: the read below takes one variable MORE than there are
-# fields, so a separator that somehow survives the gsub shows up as a field
-# count the guard can SEE, instead of silently shifting values into the DB.
-# preview.sh carries the same idea as `NF != 20`. Appended AFTER the join,
-# where no payload value can reach it.
-| . + "\u001fEOR"')
-JQ
+        else "" end) catch "")' \
+    SID MODEL SNAME CTX COST RL5 RL5RESET RL7 RL7RESET CWD API_MS \
+    CTXSIZE OCWD LADD LDEL TOKIN TOKOUT VER GWT EXC200 OSTYLE RL5FMT RL7FMT
+PARSE_OK=$?
 
 # ── the sentinel check. Cheap (no fork) and it must come BEFORE anything reads a
 # field: a shifted parse makes every value plausible and wrong, and the sink is
@@ -105,11 +80,11 @@ JQ
 # as though they were real. Say so instead: SID is field 1 and a shift can only
 # start at or after the field that carried the separator, so the id survives even
 # when nothing else does (preview.sh relies on the same fact for NF != 20).
-if [ "$EOR" != "EOR" ]; then
+if [ "$PARSE_OK" -ne 0 ]; then
     # now_pair before herd_log, or the line stamps "?" — it reads $NOW_ISO, which
     # nothing has set this early. One fork, on an error path that should never run.
     now_pair
-    herd_log "statusline: payload parse shifted (sentinel=[$EOR]) — no DB write"
+    herd_log "statusline: payload parse shifted (sentinel=[$HERD_PARSE_TAIL]) — no DB write"
     printf '%s' "⬢ ? | herd: payload parse error"
     exit 0
 fi

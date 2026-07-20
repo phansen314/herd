@@ -410,10 +410,15 @@ def test_the_sentinel_blocks_the_sink_rather_than_writing_a_shifted_row(hook_env
         (root / "hooks" / f.name).write_text(f.read_text())
     for f in (HOOKS.parent / "schema").glob("*.sql"):
         (root / "schema" / f.name).write_text(f.read_text())
+    # The sentinel lives in payload_read (common.sh) now, shared by every hook, and
+    # only the APPENDED literal may be broken — replacing every "EOR" would change
+    # the comparison too, leaving a parse that still matches and a test that proves
+    # nothing.
     sl = root / "hooks" / "statusline.sh"
-    broken = sl.read_text().replace('EOR"\'', 'NOPE"\'')
-    assert broken != sl.read_text(), "sentinel literal moved — update this test"
-    sl.write_text(broken)
+    common = root / "hooks" / "common.sh"
+    broken = common.read_text().replace('EOR"\'', 'NOPE"\'')
+    assert broken != common.read_text(), "sentinel literal moved — update this test"
+    common.write_text(broken)
 
     env = dict(os.environ, HERD_DB=hook_env.path, HERD_RUNTIME=hook_env.runtime,
                HERD_ERRLOG=f"{hook_env.runtime}/err.log")

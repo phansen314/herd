@@ -165,6 +165,49 @@ herd_log() {
 #
 # stderr stays discarded rather than captured: this runs on the statusline's
 # ~1/sec path, and merging it risks a jq warning landing in the parsed output.
+# ── payload parsing: ONE reader for all five hooks + the statusline ────────
+# Extract fields into named variables. Callers pass a jq expression list and the
+# variable names to fill:
+#
+#     payload_read '.session_id, .cwd' SID CWD || <the parse shifted>
+#
+# THE POINT IS THAT THERE IS ONE OF THESE. Every hook used to hand-roll its own,
+# and the same bug shipped twice in two different shapes:
+#
+#   * `{ read -r A; read -r B; }` over newline-delimited jq output splits on the
+#     first newline IN ANY FIELD. A cwd may legally contain one, so the values
+#     after it each moved down a slot and were persisted that way.
+#   * joining on \x1f without stripping \x1f from the values is the same shift with
+#     a different trigger. The statusline shipped exactly that: a session_name
+#     carrying one wrote the context percentage into the cost column.
+#
+# So the separator and both newline forms are stripped from every field, and a
+# sentinel field is appended AFTER the join where no value can reach it. A caller
+# that gets a nonzero return has a shifted parse and must decide what to do:
+# statusline.sh refuses to write (a wrong row is permanent, a wrong render lasts one
+# tick), session_start.sh writes anyway minus the untrusted fields (it is the only
+# thing that ever creates the row, so refusing loses the session for its whole life).
+#
+# On a nonzero return HERD_PARSE_TAIL holds whatever arrived where the sentinel
+# should have been. It is deliberately a documented output rather than an internal:
+# every caller logs it, and that string is the only clue to what the payload did.
+#
+# NO APOSTROPHES IN A CALLER EXPRESSION: it arrives here as a single-quoted bash
+# string at the call site, so one would end it and hand the rest to the shell.
+payload_read() {
+    local __expr="$1"; shift
+    local __out
+    # The expression is concatenated into a SINGLE-quoted filter rather than
+    # interpolated into a double-quoted one: jq filters are full of double quotes
+    # ("number", "%I:%M%p"), and escaping them at every call site is how the
+    # apostrophe rule above gets broken by accident.
+    __out=$(jq_in -rj '['"$__expr"'] | map(. // "" | tostring | gsub("[\\n\\r\u001f]"; " ")) | join("\u001f") | . + "\u001fEOR"') || return 1
+    IFS=$'\x1f' read -r "$@" HERD_PARSE_TAIL <<JQEOF
+$__out
+JQEOF
+    [ "$HERD_PARSE_TAIL" = "EOR" ]
+}
+
 jq_in() {
     local out rc
     out=$(printf '%s' "$INPUT" | jq "$@" 2>/dev/null); rc=$?

@@ -271,3 +271,40 @@ def test_nothing_falls_back_to_tmp_for_runtime_files():
         if any(r in src for r in resolvers):
             assert f.name in ("config.py", "common.sh", "install.py"), \
                 f"{f.name} resolves the runtime dir itself — use config.runtime_dir()"
+
+
+def test_every_hook_parses_its_payload_through_payload_read():
+    """One reader for all five hooks and the statusline (common.sh: payload_read).
+
+    Each used to hand-roll its own extraction, and the same defect shipped twice in
+    two shapes: `{ read -r A; read -r B; }` splits on the first newline in ANY field
+    (session_start), and joining on \\x1f without stripping \\x1f from the values is
+    that same shift with a different trigger (statusline). Both were fixed in the
+    file where they were noticed, which is exactly how the second one survived the
+    first fix. A hook that goes back to parsing for itself gets to rediscover them."""
+    for f in sorted(HOOKS.glob("*.sh")):
+        if f.name in ("common.sh", "preview.sh"):     # the reader; and argv, not stdin
+            continue
+        src = f.read_text()
+        if "jq_in" not in src and "payload_read" not in src:
+            continue                                   # parses no payload at all
+        assert "payload_read" in src, \
+            f"{f.name} does not use payload_read"
+        # jq_in is the discriminator, and it is enough: the payload arrives as JSON on
+        # stdin, so a hook cannot extract a field without it. Matching `read -r`
+        # instead flagged a comment ABOUT the old bug, the throttle-file read in
+        # post_tool_use, and the statusline cache read — text, not behaviour.
+        assert "jq_in" not in src, \
+            f"{f.name} still calls jq_in directly — use payload_read"
+
+
+def test_the_payload_reader_strips_the_separator_it_joins_on():
+    """The stripping and the joining have to name the same character. If they ever
+    drift, every field after a value containing it moves down a slot and is written
+    to the next column — non-NULL, wrong, and permanent under W5_statusline's
+    COALESCE. This is the assertion that would have caught the original bug."""
+    src = (HOOKS / "common.sh").read_text()
+    body = src.split("payload_read() {", 1)[1].split("\n}", 1)[0]
+    assert 'join("\\u001f")' in body
+    assert "gsub" in body and "\\u001f" in body.split("gsub", 1)[1].split(";", 1)[0], \
+        "payload_read joins on \\u001f but does not strip it"
