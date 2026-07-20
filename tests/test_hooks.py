@@ -668,3 +668,55 @@ def test_a_date_without_percent_3n_still_latches(tmp_path):
         capture_output=True, text=True,
         env=dict(os.environ, PATH=f"{tmp_path}:{os.environ['PATH']}"))
     assert r.stdout.strip().endswith(".000Z")
+
+
+# ── the hooks must never CREATE a database ──────────────────────────────────
+@pytest.mark.shell
+def test_a_hook_refuses_a_missing_database_instead_of_creating_one(tmp_path):
+    """db.py:connect() has said "create=False IS THE POINT" since 0546942 — but that
+    fixed the python half of a two-half system. `sqlite3 <path>` defaults to rwc, so
+    the five hooks still created whatever HERD_DB named.
+
+    The failure that produced: a typo'd HERD_DB (`herd.bd`). The daemon refused to
+    start with "cannot open" — correct and loud. The next SessionStart then created
+    an empty, schema-less file at the typo'd path, so the daemon's error silently
+    became "no such table: sessions" forever, and the operator now had a real file
+    on disk that looked like it ought to work. Only the installer may bring a
+    database into being."""
+    missing = tmp_path / "typo" / "herd.bd"
+    missing.parent.mkdir()
+    env = dict(os.environ, HERD_DB=str(missing), HERD_RUNTIME=str(tmp_path),
+               HERD_ERRLOG=str(tmp_path / "err.log"), HOME=str(tmp_path))
+    r = subprocess.run(["bash", str(HOOKS / "session_start.sh")],
+                       input=json.dumps({"session_id": "no-db-1", "cwd": "/x",
+                                         "model": {"id": "m"}, "transcript_path": "/t"}),
+                       env=env, capture_output=True, text=True, timeout=60)
+    assert not missing.exists(), "the hook created the database it was pointed at"
+    assert r.returncode == 0, "a hook must still never block Claude"
+    # and the reason has to be recoverable — this is the only trace a hook leaves
+    assert "unable to open database" in (tmp_path / "err.log").read_text()
+
+
+@pytest.mark.shell
+def test_a_path_containing_a_question_mark_still_opens(tmp_path):
+    """The path goes into a file: URI now, so '?' would start a query string and '#'
+    a fragment. Percent-encoding them is what keeps a legal-but-odd path working
+    rather than silently opening a DIFFERENT database — the same hazard db.py's
+    urllib.parse.quote() call exists to close."""
+    import sqlite3
+    SCHEMA = pathlib.Path(__file__).resolve().parent.parent / "src" / "herd" / "schema"
+    odd = tmp_path / "why?not#here.db"
+    c = sqlite3.connect(odd)
+    for f in ("core.sql", "herd.sql"):
+        c.executescript((SCHEMA / f).read_text())
+    c.commit(); c.close()
+    env = dict(os.environ, HERD_DB=str(odd), HERD_RUNTIME=str(tmp_path),
+               HERD_ERRLOG=str(tmp_path / "err.log"), HOME=str(tmp_path))
+    subprocess.run(["bash", str(HOOKS / "session_start.sh")],
+                   input=json.dumps({"session_id": "odd-1", "cwd": "/x",
+                                     "model": {"id": "m"}, "transcript_path": "/t"}),
+                   env=env, capture_output=True, text=True, timeout=60)
+    c = sqlite3.connect(odd)
+    got = c.execute("SELECT session_id FROM sessions").fetchall()
+    c.close()
+    assert got == [("odd-1",)], "the URI encoding opened the wrong file"

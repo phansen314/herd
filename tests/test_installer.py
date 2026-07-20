@@ -1197,3 +1197,75 @@ def test_a_freshly_written_config_sets_nothing(home):
     inst.bootstrap_db()
     values, problems = herd_config.load(home / "config")
     assert values == {} and problems == []
+
+
+def test_a_failed_selftest_leaves_the_installed_hooks_untouched(home, monkeypatch):
+    """The gate was decorative on every install but the FIRST.
+
+    sync_hooks() ran before the self-test, and settings.json from the previous
+    install already pointed at ~/.herd/hooks/ — so a broken hook was copied over
+    the working one and went live immediately. The wiring never had to change for
+    the damage to land. The installer then printed "ABORTED — nothing was rewired",
+    which was true and irrelevant: every running Claude session was already
+    executing the broken copy.
+
+    Simulates an upgrade: a good hook is installed, the self-test fails, and the
+    good hook must still be the one on disk."""
+    good = home / "hooks" / "stop.sh"
+    good.parent.mkdir(parents=True, exist_ok=True)
+    good.write_text("#!/bin/sh\n# the working copy from the previous install\n")
+    good.chmod(0o755)
+    monkeypatch.setattr(inst, "selftest", lambda *a, **k: (False, {"timed_out": "stop.sh"}))
+
+    assert inst.install() == 1
+    assert good.read_text() == "#!/bin/sh\n# the working copy from the previous install\n", \
+        "the failed install overwrote the live hooks it refused to wire"
+
+
+def test_the_selftest_runs_against_a_staged_copy_not_the_install_dir(home, monkeypatch):
+    """The gate is only a gate if it execs something nothing else is running yet."""
+    seen = {}
+
+    def spy(hooks_dir=None):
+        # Recorded HERE: the staging dir is a TemporaryDirectory and is gone by the
+        # time install() returns, which is the point — nothing keeps executing it.
+        d = pathlib.Path(hooks_dir)
+        seen["dir"] = d
+        seen["had_schema"] = (d.parent / "schema" / "writes.sql").exists()
+        seen["had_hooks"] = (d / "common.sh").exists()
+        return True, {"status": "working", "context_percent": 10}
+
+    monkeypatch.setattr(inst, "selftest", spy)
+    inst.install()
+    assert seen["dir"] != inst.INSTALLED_HOOKS, "self-test ran on the live install dir"
+    assert seen["had_hooks"]
+    assert seen["had_schema"], \
+        "staged hooks need their sibling schema — common.sh resolves ../schema"
+
+
+def test_a_passing_selftest_still_promotes_the_hooks(home):
+    """The other half of the gate: PASS must actually install them."""
+    assert inst.install() in (None, 0)
+    assert (inst.INSTALLED_HOOKS / "common.sh").exists()
+    assert (inst.INSTALLED_SCHEMA / "writes.sql").exists()
+    assert os.access(inst.INSTALLED_HOOKS / "stop.sh", os.X_OK)
+
+
+def test_the_selftest_refuses_a_hook_that_cannot_parse(tmp_path):
+    """The gate execs only session_start.sh and statusline.sh, so a broken stop.sh
+    used to sail through it — observed end to end: the staged copy self-tested
+    PASS and the unparseable hook was promoted over a working one. A hook that
+    cannot parse is a hook that silently does nothing, which is the exact class
+    this function refuses to wire."""
+    hd = tmp_path / "hooks"
+    hd.mkdir()
+    for src in sorted(inst.HOOKS_DIR.glob("*.sh")):
+        dst = hd / src.name
+        dst.write_text(src.read_text())
+        dst.chmod(0o755)
+    (hd / "stop.sh").write_text("#!/bin/bash\nif this never closes ((((\n")
+    (hd / "stop.sh").chmod(0o755)
+
+    ok, detail = inst.selftest(hd)
+    assert not ok
+    assert "stop.sh" in detail.get("syntax_error", {}), detail

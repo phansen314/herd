@@ -2,12 +2,11 @@
 
 Every failure this reports is one the system is DESIGNED to survive silently:
 hooks never print to Claude, a missing dependency exits 0, the daemon logs to a
-journal you have to know to read. That is the right behaviour at runtime and a
-terrible one to debug, so the diagnosis has to be somewhere — here.
+journal you have to know to read. The diagnosis has to live somewhere — here.
 
-Checks are pure functions returning (level, headline, detail) and take their
-inputs explicitly, so the suite can drive every branch without a broken machine.
-Nothing here writes: doctor must be safe on a system that is already sick.
+Checks are pure functions returning (level, headline, detail) and take their inputs
+explicitly, so the suite can drive every branch without a broken machine. Nothing
+here writes: doctor must be safe on a system that is already sick.
 """
 import json
 import os
@@ -30,11 +29,10 @@ _MARK = {OK: "✔", WARN: "!", FAIL: "✘"}
 REQUIRED = ("jq", "sqlite3", "ps", "bash")
 OPTIONAL = ("kitten", "fzf")
 
-# strflocaltime, which the statusline formats both reset stamps with. PRESENCE IS
-# NOT ENOUGH HERE: on jq 1.5 that function does not exist, the call raises, and a
-# raise aborts the WHOLE filter — so all 23 fields come back empty and the
-# statusline sinks nothing, silently. The per-field `try` wrappers in statusline.sh
-# cannot help; they catch a bad field, not an unknown function.
+# strflocaltime, which the statusline formats both reset stamps with. Presence of
+# jq is not enough: on 1.5 that function does not exist, and the raise aborts the
+# WHOLE filter, so all 23 fields come back empty. statusline.sh's per-field `try`
+# wrappers cannot help — they catch a bad field, not an unknown function.
 JQ_MIN = (1, 6)
 
 
@@ -43,24 +41,19 @@ def _db_path():
 
 
 # ── settings.json, defensively ───────────────────────────────────────────────
-# EVERY shape below is treated as suspect. This file is hand-edited, written by
-# other tools, and half of what doctor exists to diagnose IS a malformed one —
-# `b["hooks"]` raised KeyError on a block carrying only a matcher, so the command
-# you run to find out why herd is broken died with a traceback instead of naming
-# the block. install._strip_managed has always used .get() here; doctor did not.
+# EVERY shape below is suspect: the file is hand-edited, written by other tools,
+# and half of what doctor exists to diagnose IS a malformed one.
 def _hook_commands(data):
-    """Delegates to settings.hook_commands — the walk install uses too."""
+    """The same walk install uses."""
     return _settings.hook_commands(data)
 
 
 def _statusline_command(data):
-    """Delegates to settings.statusline_command."""
     return _settings.statusline_command(data)
 
 
 def _readable(path):
-    """(text, problem). Never raises: a file doctor cannot read is a FINDING, and
-    the one file it must report on is the one it just failed to open."""
+    """(text, problem). Never raises: a file doctor cannot read is a FINDING."""
     try:
         return pathlib.Path(path).read_text(), None
     except FileNotFoundError:
@@ -84,9 +77,9 @@ def check_deps(which=shutil.which):
 
 
 def check_jq_version(which=shutil.which, run=None):
-    """`which jq` answers the wrong question — jq 1.5 is on PATH and still breaks
-    the statusline outright (see JQ_MIN). Returns [] when jq is absent, because
-    check_deps already FAILs that and two lines for one cause is noise."""
+    """`which jq` answers the wrong question — 1.5 is on PATH and still breaks the
+    statusline (see JQ_MIN). Returns [] when jq is absent: check_deps already FAILs
+    that, and two lines for one cause is noise."""
     if which("jq") is None:
         return []
     run = run or (lambda: subprocess.run(["jq", "--version"], capture_output=True,
@@ -109,10 +102,9 @@ def check_jq_version(which=shutil.which, run=None):
 
 
 def check_python(version_info=None, executable=None):
-    """The dependency doctor is standing inside. bin/herd proves python3 EXISTS
-    (`command -v`) and herd/__init__ enforces the floor at import — but neither is
-    visible in a report, and 'why isn't herd recording' has been answered by 'that
-    is the system python, not the one you installed for' more than once."""
+    """The dependency doctor is standing inside. bin/herd and herd/__init__ already
+    enforce the floor, but neither is visible in a report — and "that is the system
+    python, not the one you installed for" is a recurring answer here."""
     vi = version_info or sys.version_info
     exe = executable or sys.executable
     cur = (vi[0], vi[1])
@@ -157,13 +149,12 @@ def check_db(path, connect_fn=None):
 
 
 def check_wiring(settings_text, hook_roots, statusline_paths, events):
-    """Are herd's hooks and statusline actually wired into settings.json, and do
-    the wired paths still exist?
+    """Are herd's hooks and statusline wired into settings.json, and do the wired
+    paths still exist?
 
     hook_roots / statusline_paths are the ACCEPTABLE locations, in preference
     order: the installed copy (~/.herd/hooks) and the checkout (a --dev install).
-    Accepting either is what lets doctor report the mode rather than mistaking a
-    deliberate --dev install for broken wiring."""
+    Accepting either is what stops a deliberate --dev install reading as broken."""
     if settings_text is None:
         return [(FAIL, "settings.json missing", "run: python3 -m herd.install")]
     try:
@@ -176,12 +167,9 @@ def check_wiring(settings_text, hook_roots, statusline_paths, events):
     for ev, cmd in _hook_commands(data):
         wired.setdefault(ev, []).append(cmd)
     for event in events:
-        # settings.is_managed, NOT a substring test against the current roots. The
-        # broader match is deliberate (see settings.py): a prefix test misses an
-        # install made from a checkout that has since MOVED — which is precisely the
-        # case install._is_managed exists to handle, and which doctor used to report
-        # as `<event> not wired` about hooks that were running fine. Two definitions
-        # of ownership, one file apart; now one.
+        # settings.is_managed, NOT a substring test against the current roots: a
+        # prefix test misses an install made from a checkout that has since MOVED
+        # and reports working hooks as `<event> not wired`. See settings.py.
         cmds = [c for c in wired.get(event, [])
                 if _settings.is_managed(c, hook_roots)]
         if not cmds:
@@ -202,9 +190,8 @@ def check_wiring(settings_text, hook_roots, statusline_paths, events):
     if sl in statusline_paths or any(str(r) in sl for r in hook_roots):
         out.append((OK, "statusLine", sl))
         return out
-    # The wrapper read is the one place doctor opens a file whose contents it does
-    # not control. A statusLine naming a DIRECTORY, an unreadable file, or one that
-    # is not UTF-8 all raised straight out of here — verified.
+    # The one place doctor opens a file whose contents it does not control: a
+    # statusLine may name a directory, an unreadable file, or non-UTF-8 bytes.
     wrapper, problem = _readable(sl) if os.path.exists(sl) else (None, None)
     if problem:
         out.append((WARN, "statusLine unreadable", f"{sl}: {problem}"))
@@ -218,11 +205,9 @@ def check_wiring(settings_text, hook_roots, statusline_paths, events):
 def check_hook_mode(settings_text, installed_root, checkout_root, current=None):
     """Which hooks are actually running, and are they current?
 
-    A --dev install wires the checkout, so a `git checkout`, stash or rebase
-    changes what every live Claude session executes — that is a legitimate choice
-    while developing hooks, but it should never be a surprise. A copy install is
-    stable, and gains the opposite failure: edits to the tree do nothing until you
-    re-install. Both are quiet, so both are reported."""
+    A --dev install wires the checkout, so a checkout/stash/rebase changes what
+    every live session executes; a copy install has the opposite failure, where
+    edits do nothing until you re-install. Both are quiet, so both are reported."""
     if settings_text is None:
         return [(FAIL, "hook mode unknown", "settings.json missing")]
     try:
@@ -261,8 +246,8 @@ def _hooks_current():
 
 
 def check_daemon(lock_path, holder=None, alive=None):
-    """The daemon is the only reaper of silent deaths, so 'not running' shows up
-    as sessions that never leave `herd ls` — never as an error."""
+    """The daemon is the only reaper of silent deaths, so "not running" shows up as
+    sessions that never leave `herd ls`, never as an error."""
     alive = alive if alive is not None else _pid_alive
     if not os.path.exists(lock_path):
         return [(FAIL, "daemon not running", "sessions will never leave `herd ls`")]
@@ -274,9 +259,8 @@ def check_daemon(lock_path, holder=None, alive=None):
 
 
 def _service_start_hint():
-    """The service manager herd installed the daemon under differs by platform, and
-    handing a macOS user a systemctl line is the kind of advice that reads as herd
-    being broken rather than the hint being wrong."""
+    """The service manager differs by platform; a systemctl line on macOS reads as
+    herd being broken rather than the hint being wrong."""
     from herd import install                            # local, as in _hooks_current
     if sys.platform == "darwin":
         return f"launchctl kickstart gui/{os.getuid()}/{install.LAUNCHD_LABEL}"
@@ -294,14 +278,10 @@ def _pid_alive(pid):
 def check_config(environ, path=None, daemon_env=None):
     """The config file, and whether the running daemon actually got it.
 
-    Two failures live here, and only the second is obvious. A malformed line is
-    reported by the parser. The quiet one is DIVERGENCE: the hooks are children of
-    your shell and the systemd daemon inherits nothing from it, so a key set in one
-    place and not the other is obeyed by half of herd. That is not hypothetical —
-    HERD_CLAUDE_NAME exported in .bashrc made the hooks store a pid the reaper then
-    read as recycled, stopping every live session on its first tick. Reading the
-    live daemon's /proc environ is the only way to state what it is REALLY running
-    with, rather than what this process happens to see."""
+    The quiet failure is DIVERGENCE: the hooks are children of your shell and the
+    systemd daemon inherits nothing from it, so a key set in one place and not the
+    other is obeyed by half of herd. Reading the live daemon's /proc environ is the
+    only way to see what it is really running with."""
     from herd import config as herd_config
     out = []
     values, problems = herd_config.load(path)
@@ -318,8 +298,8 @@ def check_config(environ, path=None, daemon_env=None):
         else:
             out.append((OK, key, val))
 
-    # The daemon is the reader that CANNOT be checked from here by inference: it is
-    # a different process with a different environment. Ask it.
+    # The daemon cannot be checked by inference — different process, different
+    # environment. Ask it.
     env = daemon_env if daemon_env is not None else _daemon_environ()
     if env is None:
         return out
@@ -338,9 +318,8 @@ def check_config(environ, path=None, daemon_env=None):
 
 def _daemon_environ(lock_path=None, read=None):
     """The live daemon's environment, or None when it cannot be read (not running,
-    not Linux, or a daemon owned by another user). Linux-only by design: /proc is
-    the only place a process's real environment is legible, and everywhere else
-    this check simply stays quiet rather than guessing."""
+    not Linux, or owned by another user). Linux-only by design: /proc is the only
+    place a process's real environment is legible; elsewhere this stays quiet."""
     holder = None
     try:
         p = pathlib.Path(lock_path or daemon.lock_path())
@@ -361,13 +340,11 @@ def _daemon_environ(lock_path=None, read=None):
 
 
 def check_env(environ):
-    """A malformed threshold used to traceback every command; now it silently falls
-    back to the default, so say which ones are being ignored."""
+    """A malformed threshold silently falls back to the default, so say which ones
+    are being ignored."""
     out = []
-    # Every knob _int_env validates, plus the two log caps — the list had drifted
-    # from the daemon's, so a malformed HERD_DAEMON_LOG_MAX (which daemon._int_env
-    # does reject) was reported by nobody, and the docstring's promise was only
-    # two-thirds true.
+    # Must stay in step with every knob daemon._int_env validates, plus the two log
+    # caps — a knob missing here is one nobody reports.
     for name in ("HERD_WAIT_SECS", "HERD_APPROVAL_SECS", "HERD_STUCK_SECS",
                  "HERD_STRANDED_SECS", "HERD_TOOL_THROTTLE",
                  "HERD_DAEMON_LOG_MAX", "HERD_ERRLOG_MAX"):
@@ -379,20 +356,17 @@ def check_env(environ):
         except ValueError:
             out.append((WARN, f"{name} is not an integer", f"{raw!r} — using the default"))
             continue
-        # Kept in step with daemon._int_env, which rejects these: a negative grace
-        # period is a cutoff in the FUTURE, and doctor reporting it as OK while the
-        # daemon ignores it is the worst of both.
+        # daemon._int_env rejects these too: a negative grace period is a cutoff in
+        # the FUTURE, and reporting it OK while the daemon ignores it is the worst
+        # of both.
         if val < 0:
             out.append((WARN, f"{name} is negative", f"{raw!r} — using the default"))
         else:
             out.append((OK, name, raw))
 
-    # HERD_CLAUDE_NAME is not a threshold, and its failure is the loudest of any
-    # knob here: `ps -o comm=` reads /proc/pid/stat, capped at 15 chars, so a
-    # longer name can never match what the reaper observes and _dead reads the
-    # mismatch as a recycled pid — every live session reaped on the first tick.
-    # The reaper truncates to compare (daemon._is_claude), so this is a warning
-    # about a name that no longer breaks anything, not a failure.
+    # `ps -o comm=` reads /proc/pid/stat, capped at 15 chars, so a longer name can
+    # never match what the reaper observes. daemon._is_claude truncates to compare,
+    # so this is a WARN about a name that no longer breaks anything.
     name = environ.get("HERD_CLAUDE_NAME")
     if name:
         if len(name) > daemon._COMM_MAX:
@@ -402,8 +376,8 @@ def check_env(environ):
         else:
             out.append((OK, "HERD_CLAUDE_NAME", name))
 
-    # Not an integer and not a name: the tier-2 switch. Off is a legitimate choice
-    # (core-only collection), but "herd_attention is empty" has an obvious cause.
+    # The tier-2 switch. Off is legitimate (core-only collection), but it is the
+    # obvious cause of "herd_attention is empty".
     if environ.get("HERD_ATTENTION", "").strip().lower() in ("0", "false", "no", "off"):
         out.append((WARN, "HERD_ATTENTION is off",
                     "core-only: the reaper runs, nothing is ever marked for attention"))
@@ -411,17 +385,15 @@ def check_env(environ):
 
 
 def check_errlog(path, tail=3, read=None):
-    """The hooks' only voice. Empty is good news; recent entries are the answer to
-    most 'herd isn't recording' questions."""
+    """The hooks' only voice. Empty is good news; recent entries answer most
+    "herd isn't recording" questions."""
     read = read or (lambda p: pathlib.Path(p).read_text())
     if not os.path.exists(path):
         return [(OK, "hook errors", "none logged")]
     try:
         lines = [ln for ln in read(path).splitlines() if ln.strip()]
     # ValueError, not just OSError: a hook killed mid-write (the statusline is
-    # killed on timeout as a matter of course) can leave bytes that are not UTF-8,
-    # and UnicodeDecodeError escaped this handler — from the check reporting on
-    # "the hooks' only voice".
+    # killed on timeout routinely) can leave bytes that are not UTF-8.
     except (OSError, ValueError) as e:
         return [(WARN, "hook error log unreadable", str(e))]
     if not lines:
@@ -433,13 +405,8 @@ def check_errlog(path, tail=3, read=None):
 # ── driver ───────────────────────────────────────────────────────────────────
 def _safe(label, fn, *a, **kw):
     """Run a check; turn an unexpected exception into a FINDING, not a traceback.
-
-    The specific crash paths are fixed at their source, but this is the property
-    that matters and it should not depend on having thought of every input: doctor
-    runs on a machine that is already sick, by someone who has just been told
-    nothing is being recorded. A traceback there costs them the other five
-    sections' worth of diagnosis too.
-    """
+    The property must not depend on having thought of every input: a traceback here
+    costs the user the other seven sections' worth of diagnosis."""
     try:
         return fn(*a, **kw)
     except Exception as e:                       # noqa: BLE001 — that is the point
@@ -450,23 +417,19 @@ def _safe(label, fn, *a, **kw):
 def check_kitty(environ, which=shutil.which, run=None):
     """Is kitty's remote control actually available to herd?
 
-    Returns [] when kitten is absent — check_deps already WARNs it, and two lines
-    for one cause is noise (same rule as check_jq_version).
-
-    This reads the ENVIRONMENT, never kitty.conf: that file has includes and
-    last-wins overrides, so a parse could confidently declare a working setup
-    broken. See herd.kitty.config for the full argument. WARN and never FAIL —
-    kitten/fzf are OPTIONAL and herd still records sessions without kitty; only
-    placement, spawn and jump are lost.
+    Returns [] when kitten is missing — check_deps already WARNs it (same rule as
+    check_jq_version). Reads the ENVIRONMENT, never kitty.conf: that file has
+    includes and last-wins overrides, so a parse could confidently declare a
+    working setup broken (see herd.kitty.config). WARN and never FAIL — without
+    kitty only placement, spawn and jump are lost.
     """
     from herd.kitty import config
     if which("kitten") is None:
         return []
     st = config.state(environ)
     if st == config.NOT_KITTY:
-        # Unverifiable, not broken. check_hook_mode's unknown-state branch is the
-        # precedent: a check that cries wolf where it cannot see teaches people to
-        # ignore it.
+        # Unverifiable, not broken — a check that cries wolf where it cannot see
+        # teaches people to ignore it. Same as check_hook_mode's unknown branch.
         return [(OK, "kitty remote control unverified",
                  "not running inside kitty — run `herd doctor` in a kitty window")]
     if st == config.OFF:
@@ -479,7 +442,7 @@ def check_kitty(environ, which=shutil.which, run=None):
                  f"      then {config.RESTART}")]
     sock = environ["KITTY_LISTEN_ON"]
     # focus._ls() is deliberately not reused: it collapses timeout, missing binary
-    # and dead socket into "", and the whole point here is to report WHICH.
+    # and dead socket into "", and the point here is to report WHICH.
     run = run or (lambda: subprocess.run(["kitten", "@", "--to", sock, "ls"],
                                          capture_output=True, text=True, timeout=5))
     try:
@@ -499,13 +462,10 @@ def collect(environ=None, settings_path=None):
     from herd import install                      # local: pulls in pathlib/HOME only
     environ = environ if environ is not None else os.environ
     settings = pathlib.Path(settings_path or install.SETTINGS)
-    # A settings.json that EXISTS but cannot be read is its own finding — read_text
-    # raised straight out of collect (PermissionError, verified), and an unreadable
-    # settings.json is a first-class reason herd records nothing.
+    # A settings.json that EXISTS but cannot be read is its own finding.
     text, problem = _readable(settings)
-    # When it is unreadable, that finding REPLACES the two checks that parse it —
-    # both would only report "settings.json missing", which is a different problem
-    # with a different fix and contradicts the line above it.
+    # That finding REPLACES the two checks that parse it: both would only report
+    # "settings.json missing", a different problem with a different fix.
     wiring = ([(FAIL, "settings.json unreadable", f"{settings}: {problem}")] if problem
               else None)
     errlog = environ.get("HERD_ERRLOG",
@@ -534,9 +494,8 @@ def report(sections, out=print):
     """Render, and return an exit code: nonzero when anything FAILed."""
     worst = OK
     for name, results in sections:
-        # A section with nothing to say prints nothing. "config" is empty in the
-        # common case (no file), and a bare header reads like a check that failed to
-        # run rather than one with no findings.
+        # A section with nothing to say prints nothing: "config" is empty in the
+        # common case, and a bare header reads like a check that failed to run.
         if not results:
             continue
         out(f"\n  {name}")
@@ -566,9 +525,8 @@ USAGE = """usage: herd doctor
 
 
 def main(argv=None):
-    """Unknown argv is REFUSED, as in install/daemon/cli. `herd doctor --help` ran
-    a full diagnostic and `herd doctor --json` silently did the same — a flag this
-    command cannot read means the caller wanted output it is not producing."""
+    """Unknown argv is REFUSED, as in install/daemon/cli: a flag this command
+    cannot read means the caller wanted output it is not producing."""
     argv = argv if argv is not None else sys.argv[1:]
     unknown = [a for a in argv if a not in _FLAGS]
     if unknown:

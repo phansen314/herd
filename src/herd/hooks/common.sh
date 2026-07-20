@@ -1,29 +1,26 @@
 # herd/hooks/common.sh — shared hook library. SOURCE THIS, don't run it.
-# bash 3.2 compatible. Rationale + gotchas: DESIGN.md#the-hooks-hookssh.
+# bash 3.2 compatible (macOS ships 3.2). Rationale: DESIGN.md#the-hooks-hookssh.
 #
 # NOTHING HERE MAY BLOCK CLAUDE — every hook exits 0. The SQL lives in
 # schema/writes.sql and is NOT copied here (test_source_invariants.py forbids inline
 # DML; test_hooks.py guards bash/python drift).
 #
+# FORK COST IS THE RECURRING CONSTRAINT in this file: the statusline sources it and
+# fires ~1/sec/session, so builtins are preferred over $(...) throughout, and where
+# the code looks odd it is usually for that reason.
+#
 # ── the config file (~/.herd/config), read BEFORE the defaults below ──────
-# The daemon and the hooks do not share an environment: these scripts are children
-# of your shell, the daemon is started by systemd and inherits nothing from it. A
-# setting that only reaches one of them is not a preference, it is a divergence —
-# HERD_CLAUDE_NAME exported in .bashrc made the hooks store a pid the reaper then
-# read as a recycled one, stopping every live session on its first tick. So both
-# sides read this file, by the same rules. herd/config.py is the python half;
-# test_source_invariants pins the two key lists together.
+# The daemon (systemd, empty env) and the hooks (children of your shell) share no
+# environment, so both read this file by the same rules. herd/config.py is the
+# python half; test_source_invariants pins the two key lists together.
 #
-# NO FORKS. `read` is a builtin and the redirect costs no process, which matters on
-# the statusline path (~1/sec/session). Skipped entirely when there is no file.
-#
-# The environment WINS over the file — same precedence as config.py — so a test
-# that exports HERD_RUNTIME still redirects state, and a one-off override works.
-# `${!k+x}` is not used to test that: indirect expansion with a modifier is not
-# bash 3.2, and macOS ships 3.2. eval is safe here only because $k has already been
-# matched against the literal list below, never taken from the file as-is.
+# The environment WINS over the file — same precedence as config.py. `${!k+x}` is
+# not used to test that: indirect expansion with a modifier is not bash 3.2. eval is
+# safe here only because $k has already been matched against the literal list below,
+# never taken from the file as-is.
 herd_load_config() {
     local f="${HERD_CONFIG:-$HOME/.herd/config}" line k v cur
+    local tab=$'\t'
     [ -r "$f" ] || return 0
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in
@@ -32,10 +29,23 @@ herd_load_config() {
             *) continue ;;                  # no '=': config.py reports it, we skip
         esac
         k="${line%%=*}"; v="${line#*=}"
-        # trim surrounding whitespace, and the `export ` muscle memory invites
-        k="${k#"${k%%[! ]*}"}"; k="${k%"${k##*[! ]}"}"; k="${k#export }"
-        k="${k#"${k%%[! ]*}"}"
-        v="${v#"${v%%[! ]*}"}"; v="${v%"${v##*[! ]}"}"
+        # trim surrounding whitespace, and the `export ` muscle memory invites.
+        # SPACE AND TAB, both ends: python trims with .strip()/.rstrip(), which eat
+        # both. A space-only class here let `HERD_DB=/a/b.db<TAB># c` bind a path
+        # with a trailing tab on the bash side while python bound the clean one —
+        # sqlite creates that file, so the hooks recorded into it and the daemon
+        # read the real DB, with nothing erroring on either side.
+        k="${k#"${k%%[! $tab]*}"}"; k="${k%"${k##*[! $tab]}"}"; k="${k#export }"
+        k="${k#"${k%%[! $tab]*}"}"
+        v="${v#"${v%%[! $tab]*}"}"
+        # INLINE COMMENT, cut before the trailing trim. A '#' opens one only at the
+        # start of the value or after whitespace — `/srv/repo#2/herd.db` keeps its
+        # '#'. The rule is config._strip_inline_comment's, character for character.
+        case "$v" in
+            "#"*) v="" ;;
+            *[" $tab"]"#"*) v="${v%%[ $tab]#*}" ;;
+        esac
+        v="${v%"${v##*[! $tab]}"}"
         case "$k" in
             HERD_ATTENTION|HERD_WAIT_SECS|HERD_APPROVAL_SECS|HERD_STUCK_SECS|\
             HERD_STRANDED_SECS|HERD_DAEMON_LOG_MAX|HERD_CLAUDE_NAME|HERD_RUNTIME|\
@@ -56,22 +66,18 @@ herd_load_config() {
 herd_load_config
 
 # Config is default-expansion (${X:-...}) ONLY, never unconditional assignment,
-# so tests can redirect state (HERD_RUNTIME earned this — see DESIGN.md).
+# so tests can redirect state.
 HERD_DB="${HERD_DB:-$HOME/.herd/herd.db}"
-# HERD_RUNTIME, else XDG_RUNTIME_DIR, else ~/.herd/run — NEVER /tmp, which is what
-# this fell back to. Every name we put here is predictable (herd-db-err.$$,
-# herd-stline-<uuid>, herd-daemon.lock) and db() creates its error file with `: >`,
-# a redirect that FOLLOWS SYMLINKS: on a shared box another user could pre-create
-# that path as a link to a file of ours and have the next hook fire truncate it.
-# /run/user/<uid> is 0700 and ours, and so is ~/.herd/run; only /tmp was open.
-#
-# config.runtime_dir() is the python half of this and must agree — the daemon takes
-# its single-instance lock in this directory, so two answers means two daemons.
+# HERD_RUNTIME, else XDG_RUNTIME_DIR, else ~/.herd/run — NEVER /tmp. Our names here
+# are predictable and db() creates its error file with `: >`, a redirect that
+# FOLLOWS SYMLINKS: on a shared box another user could pre-create that path as a
+# link to a file of ours and have the next hook truncate it. Only a 0700 dir we own
+# is safe. config.runtime_dir() must agree — the daemon takes its single-instance
+# lock here, so two answers means two daemons.
 HERD_RUNTIME="${HERD_RUNTIME:-${XDG_RUNTIME_DIR:-}}"
 if [ -z "$HERD_RUNTIME" ]; then
     HERD_RUNTIME="$HOME/.herd/run"
-    # `[ -d ]` is a builtin and mkdir is a FORK, on a path that runs about once a
-    # second per session. Only pay it when the directory is actually missing.
+    # `[ -d ]` is a builtin, mkdir is a fork: only pay it when actually missing.
     [ -d "$HERD_RUNTIME" ] || { mkdir -p "$HERD_RUNTIME" 2>/dev/null && \
                                 chmod 700 "$HERD_RUNTIME" 2>/dev/null; }
 fi
@@ -83,43 +89,35 @@ __herd_dir="${BASH_SOURCE%/*}"
 HERD_WRITES="${HERD_WRITES:-$__herd_dir/../schema/writes.sql}"
 
 # ── payload ───────────────────────────────────────────────────────────────
-# Slurp stdin into INPUT with NO FORK. `$(cat)` cost a subshell plus an exec —
-# measured 2.9ms, on the statusline's ~1/sec/session path and on PostToolUse's
-# per-tool-call path — to move a few KB that bash can read itself.
+# Slurp stdin into INPUT with NO FORK ($(cat) is a subshell plus an exec).
 #
-# NEVER `$(</dev/stdin)`: Claude's invocation makes that empty (learned the hard
-# way; the comment it replaces in session_start.sh said so). read -d '' is a
+# NEVER `$(</dev/stdin)`: Claude's invocation makes that empty. `read -d ''` is a
 # different mechanism — it reads fd 0 directly, to EOF.
 #
 # A JSON payload contains no NUL, so read never finds its delimiter and returns
 # nonzero at EOF with INPUT fully populated. `|| :` keeps that expected rc off
-# `set -e` and out of the caller's $?. IFS= stops leading/trailing whitespace
-# being stripped from the payload.
+# `set -e` and out of the caller's $?. IFS= stops whitespace being stripped.
 read_input() { IFS= read -r -d '' INPUT || :; }
 
 # ── time ──────────────────────────────────────────────────────────────────
 # now_pair emits ISO + epoch from a SINGLE fork (throttle needs epoch, write
 # needs ISO).
 #
-# GNU-vs-BSD is detected from the REAL call, not a separate `date -u +%3N`
-# probe. That probe ran at SOURCE time — so every hook fire, including the
-# statusline's ~1/sec/session, paid a fork (0.6ms) to answer a question that is
-# constant per machine. Now the first call optimistically asks for %3N and
-# checks whether it came back as digits; a date without it costs one retry and
-# latches $__HERD_FMT for the rest of the process, so BSD pays the same two
-# forks it always did and GNU pays one instead of two.
+# GNU-vs-BSD is detected from the REAL call, not a separate probe (that would be a
+# fork per hook fire to answer a per-machine constant). The first call asks for %3N
+# and checks whether digits came back; BSD costs one retry and latches $__HERD_FMT
+# for the rest of the process.
 __HERD_FMT='+%Y-%m-%dT%H:%M:%S.%3NZ %s'
 
 NOW_ISO=""; NOW_EPOCH=""
 now_pair() {
     local __o __ms
     __o=$(date -u "$__HERD_FMT")
-    # millis field of "<iso>.<ms>Z <epoch>". Non-digits (or empty) mean this date
-    # left %3N unexpanded — BSD renders it literally, e.g. "...:00.3NZ".
-    # Latch ONLY on a positive BSD detection — output that arrived and left %3N
-    # unexpanded. An EMPTY $__o means `date` failed, which says nothing about the
-    # format, and latching on it downgraded every later stamp in the process to
-    # whole seconds after a single transient failure. No output, no conclusion.
+    # millis field of "<iso>.<ms>Z <epoch>". Non-digits mean %3N went unexpanded —
+    # BSD renders it literally, e.g. "...:00.3NZ". Latch ONLY on that positive
+    # detection: an EMPTY $__o means `date` failed and says nothing about the
+    # format, so latching on it would downgrade the whole process to whole seconds
+    # after one transient failure.
     if [ -n "$__o" ]; then
         __ms="${__o%Z *}"; __ms="${__ms##*.}"
         case "$__ms" in
@@ -133,11 +131,8 @@ now_pair() {
 }
 
 # ── logging ───────────────────────────────────────────────────────────────
-# Cap the log. A persistent fault logs on EVERY hook fire — a missing jq means six
-# scripts complaining per prompt, and the statusline alone runs ~1/sec/session — so
-# without a cap this grows without bound and buries today's error under weeks of
-# history. One rotation, not a numbered series: the point is a bounded file you can
-# actually read, and .1 keeps the previous window for anything mid-investigation.
+# Cap the log: a persistent fault logs on EVERY hook fire, so uncapped it buries
+# today's error. One rotation, not a numbered series — .1 keeps the previous window.
 HERD_ERRLOG_MAX="${HERD_ERRLOG_MAX:-1048576}"       # bytes; 0 disables rotation
 
 herd_log_rotate() {
@@ -154,43 +149,23 @@ herd_log() {
     herd_log_rotate
 }
 
-# ── payload parsing ───────────────────────────────────────────────────────
-# jq_in <jq args...> — filter $INPUT, and LOG when jq itself fails.
-#
-# A hook that parses no session_id exits 0 and records nothing, which is correct:
-# the payload wasn't for us. A MISSING jq produced the identical outcome — exit 0,
-# nothing written, and an empty HERD_ERRLOG, the file troubleshooting tells you to
-# check first — so herd silently recorded nothing forever with no way to tell why.
-# rc=127 is the missing-binary case; anything else is a real jq/payload error.
-#
-# stderr stays discarded rather than captured: this runs on the statusline's
-# ~1/sec path, and merging it risks a jq warning landing in the parsed output.
 # ── payload parsing: ONE reader for all five hooks + the statusline ────────
-# Extract fields into named variables. Callers pass a jq expression list and the
-# variable names to fill:
+# payload_read '<jq exprs>' VAR... — extract fields into named variables:
 #
 #     payload_read '.session_id, .cwd' SID CWD || <the parse shifted>
 #
-# THE POINT IS THAT THERE IS ONE OF THESE. Every hook used to hand-roll its own,
-# and the same bug shipped twice in two different shapes:
-#
-#   * `{ read -r A; read -r B; }` over newline-delimited jq output splits on the
-#     first newline IN ANY FIELD. A cwd may legally contain one, so the values
-#     after it each moved down a slot and were persisted that way.
-#   * joining on \x1f without stripping \x1f from the values is the same shift with
-#     a different trigger. The statusline shipped exactly that: a session_name
-#     carrying one wrote the context percentage into the cost column.
-#
-# So the separator and both newline forms are stripped from every field, and a
-# sentinel field is appended AFTER the join where no value can reach it. A caller
-# that gets a nonzero return has a shifted parse and must decide what to do:
+# Field values may legally contain newlines (a cwd) or the separator (a /rename'd
+# session_name), and either one shifts every later value down a slot — silently and
+# permanently, since these get persisted. So the separator and both newline forms
+# are stripped from every field, and a sentinel is appended AFTER the join where no
+# value can reach it. A nonzero return means a shifted parse and the caller decides:
 # statusline.sh refuses to write (a wrong row is permanent, a wrong render lasts one
 # tick), session_start.sh writes anyway minus the untrusted fields (it is the only
-# thing that ever creates the row, so refusing loses the session for its whole life).
+# thing that ever creates the row).
 #
-# On a nonzero return HERD_PARSE_TAIL holds whatever arrived where the sentinel
-# should have been. It is deliberately a documented output rather than an internal:
-# every caller logs it, and that string is the only clue to what the payload did.
+# HERD_PARSE_TAIL is a documented output, not an internal: on a nonzero return it
+# holds whatever arrived where the sentinel should have been, and every caller logs
+# it as the only clue to what the payload did.
 #
 # NO APOSTROPHES IN A CALLER EXPRESSION: it arrives here as a single-quoted bash
 # string at the call site, so one would end it and hand the rest to the shell.
@@ -208,6 +183,12 @@ JQEOF
     [ "$HERD_PARSE_TAIL" = "EOR" ]
 }
 
+# jq_in <jq args...> — filter $INPUT, and LOG when jq itself fails. Without the
+# log, a MISSING jq is indistinguishable from "the payload wasn't for us": exit 0,
+# nothing written, empty errlog. rc=127 is the missing-binary case.
+#
+# stderr stays discarded rather than captured — merging it risks a jq warning
+# landing in the parsed output.
 jq_in() {
     local out rc
     out=$(printf '%s' "$INPUT" | jq "$@" 2>/dev/null); rc=$?
@@ -250,16 +231,14 @@ claude_pid() { ps -eo pid=,ppid=,comm= 2>/dev/null | _walk_claude "$$"; }
 # -bail is LOAD-BEARING for run_tx: without it the CLI skips a failed statement
 # and COMMITs anyway, half-committing. busy_timeout is not optional (WAL
 # serialises writers). See DESIGN.md#commonsh-internals.
-# ONE errfile per process, reaped by an EXIT trap, instead of an `rm` fork per
-# call. The statusline makes 2-3 db() calls a tick at ~1/sec/session, so that
-# `rm` was ~1.8ms/tick spent deleting a file we immediately recreate. `>` is a
-# builtin truncate, so reuse costs nothing. No hook sets its own EXIT trap
-# (checked); if one ever does, it must call herd_db_cleanup itself.
-# Trapped on the SIGNALS too, not just EXIT: the statusline is killed on timeout
-# as a matter of course, and an EXIT-only trap does not run for SIGTERM — so the
-# old per-call `rm` left nothing behind while this leaked one file per killed
-# hook, forever, with no sweeper anywhere. SIGKILL still leaks (nothing can trap
-# it); those are zero-byte and rare enough to live with.
+# ONE errfile per process, reaped by a trap, instead of an `rm` fork per db() call
+# (the statusline makes 2-3 a tick). `>` is a builtin truncate, so reuse is free.
+# No hook sets its own EXIT trap; if one ever does, it must call herd_db_cleanup.
+#
+# Trapped on the SIGNALS too, not just EXIT: the statusline is killed on timeout as
+# a matter of course and an EXIT-only trap does not run for SIGTERM, which would
+# leak one file per killed hook forever with no sweeper anywhere. SIGKILL still
+# leaks; those are zero-byte and rare enough to live with.
 __HERD_ERRFILE="$HERD_RUNTIME/herd-db-err.$$"
 herd_db_cleanup() { rm -f "$__HERD_ERRFILE" 2>/dev/null; }
 trap herd_db_cleanup EXIT
@@ -267,15 +246,35 @@ trap 'herd_db_cleanup; exit 143' TERM
 trap 'herd_db_cleanup; exit 130' INT
 trap 'herd_db_cleanup; exit 129' HUP
 
+# mode=rw, NEVER rwc, and never a bare path (sqlite3's default CREATES). A typo'd
+# HERD_DB must fail, not silently produce an empty schema-less file that the daemon
+# then reports as "no such table: sessions" forever. db.py:connect() says
+# create=False for the same reason; only the installer may create a database.
+#
+# The path goes into a URI, so '?' would start a query string and '#' a fragment,
+# and '%' is how a URI escapes anything — percent-encode all three, '%' FIRST or
+# the escapes we add get re-escaped. Mirrors urllib.parse.quote in db.py.
+#
+# CACHED via pure parameter expansion, deliberately not $(...): that is a fork and
+# db() runs 2-3 times a tick. Recomputed only when HERD_DB actually changes.
+__HERD_DB_URI=""; __HERD_DB_URI_FOR=""
+herd_db_uri() {
+    local u="${HERD_DB//%/%25}"
+    u="${u//\?/%3F}"; u="${u//#/%23}"
+    __HERD_DB_URI="file:$u?mode=rw"
+    __HERD_DB_URI_FOR="$HERD_DB"
+}
+
 db() {
     local err="$__HERD_ERRFILE" rc
     : > "$err" 2>/dev/null              # builtin truncate: no stale stderr leaks in
+    [ "$__HERD_DB_URI_FOR" = "$HERD_DB" ] || herd_db_uri
     sqlite3 \
         -bail \
         -cmd ".timeout 3000" \
         -cmd "PRAGMA foreign_keys=ON" \
         -cmd "PRAGMA synchronous=NORMAL" \
-        "$HERD_DB" "$@" 2>"$err"
+        "$__HERD_DB_URI" "$@" 2>"$err"
     rc=$?
     if [ $rc -ne 0 ] && [ -s "$err" ]; then
         { printf '%s\t%s\trc=%d\t' "${NOW_ISO:-?}" "${0##*/}" "$rc"
@@ -289,7 +288,7 @@ db() {
 # Pull one `-- :name X` block out of writes.sql, stopping at the first `;`
 # (mirrors herd.db.load_statements(); test_hooks.py asserts they agree). Stopping
 # at `;` also keeps bind() from substituting `:name` mentions in trailing prose.
-# awk (0.7ms) beats pure-bash (1.6ms) — measured.
+# awk despite the fork: it beats pure-bash here.
 stmt() {
     awk -v want="$1" '
         index($0, "-- :name ") == 1 { f = ($0 == "-- :name " want); next }
@@ -298,9 +297,9 @@ stmt() {
     ' "$HERD_WRITES"
 }
 
-# The :param substitution, as an awk FUNCTION so extract-and-bind can be one fork
-# instead of two. Composed into both bind() and stmt_bind() below — ONE copy of
-# the rule, two entry points. Do not inline it into either.
+# The :param substitution, as an awk FUNCTION so extract-and-bind is one fork, not
+# two. Composed into both bind() and stmt_bind() — one copy of the rule, two entry
+# points. Do not inline it into either.
 __HERD_BINDFN='
 function bindline(s,   out, name, key, val, q) {
     q = sprintf("%c", 39)
@@ -355,9 +354,8 @@ stmt_bind() {
 run() {
     local bound rc
     bound=$(stmt_bind "$1"); rc=$?
-    # Empty output means the NAME did not match (an unbound param still emits the
-    # statement, with `:name` left in place, and only sets rc) — so the emptiness
-    # check has to come first or a typo'd name reports as an unbound param.
+    # Emptiness FIRST: an unbound param still emits the statement and only sets rc,
+    # so checking rc first would report a typo'd name as an unbound param.
     if [ -z "$bound" ]; then herd_log "no such statement: $1"; return 1; fi
     if [ "$rc" -ne 0 ]; then herd_log "unbound params in $1"; return 1; fi
     if [ -n "$2" ]; then

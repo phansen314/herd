@@ -27,15 +27,9 @@ from herd.db import connect, load_statements
 
 W = load_statements()
 
-# BEFORE the constants below, which are read at import — a config file applied
-# after them would parse fine and change nothing, the silent no-op this file is
-# meant to end. cli.py imports this module, so every python entry point gets the
-# same settings from the same place the hooks read.
-#
-# Kept as module state rather than logged here: _log is not defined yet at this
-# point in the file, and a daemon that printed a config summary on every `herd ls`
-# would be noise. run() reports it once at startup; `herd doctor` reports it on
-# demand.
+# MUST stay before the constants below, which read the env at import. Kept as
+# module state rather than logged: _log is not defined yet here, and cli.py imports
+# this module, so logging would fire on every `herd ls`. run() reports it once.
 CONFIG_APPLIED, CONFIG_SHADOWED, CONFIG_PROBLEMS = _config.apply()
 
 
@@ -44,21 +38,12 @@ def _now_iso():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-# Cap for a stderr that is a FILE. journald rotates and a terminal scrolls, but
-# launchd's StandardErrorPath is a plain file nothing ever truncates — and
-# KeepAlive restarts the daemon on ANY exit, including the exit(1) it takes when
-# another instance holds the lock. Running the daemon by hand (which README still
-# documents) alongside the LaunchAgent is therefore a permanent 5s restart loop
-# writing one line each time: ~17k lines/day, forever, into the file README points
-# you at. 0 disables. See DECISIONS.md#launchd-log.
+# Cap for a stderr that is a FILE — launchd's StandardErrorPath is a plain file
+# nothing truncates, and KeepAlive restarts on any exit. 0 disables.
+# See DECISIONS.md#launchd-log.
 #
-# BOUND FIRST, as a literal, and overridden below once _int_env exists. "_log
-# resolves it at call time" is true of every call except the ones that happen
-# DURING the constant block: _int_env reports a malformed value through _log, and
-# _log reads this name, so a bad HERD_WAIT_SECS raised NameError at import instead
-# of the ValueError _int_env was written to swallow — and cli.py imports this
-# module, so `HERD_WAIT_SECS=fast herd ls` tracebacked. Same for a bad
-# HERD_DAEMON_LOG_MAX, which reports through _log while defining itself.
+# BOUND FIRST as a literal, overridden below once _int_env exists: _int_env reports
+# malformed values through _log, and _log reads this name during the constant block.
 DAEMON_LOG_MAX = 1048576
 
 
@@ -72,9 +57,8 @@ def _stderr_is_a_regular_file():
 
 def _truncate_stderr_if_huge():
     """Truncate rather than rotate, in place. launchd holds the file open in append
-    mode, so RENAMING it would leave the daemon writing to an unlinked inode and the
-    visible log permanently empty — the opposite of the intent. With O_APPEND a
-    truncate simply sends the next write to offset 0."""
+    mode, so RENAMING it would leave the daemon writing to an unlinked inode. With
+    O_APPEND a truncate sends the next write to offset 0."""
     if not DAEMON_LOG_MAX or not _stderr_is_a_regular_file():
         return False
     try:
@@ -87,12 +71,11 @@ def _truncate_stderr_if_huge():
 
 
 def _log(msg):
-    """Daemon diagnostics -> stderr. systemd captures that into the journal, which
-    is where README sends you (`journalctl --user -u herd`); a foreground daemon
-    shows it inline. The hooks' HERD_ERRLOG is theirs, not ours.
+    """Daemon diagnostics -> stderr (the journal under systemd). The hooks'
+    HERD_ERRLOG is theirs, not ours.
 
-    Bounded when stderr is a file (launchd) — see DAEMON_LOG_MAX. A no-op under
-    systemd and in a terminal, where stderr is not a regular file."""
+    Bounded when stderr is a regular file (launchd) — see DAEMON_LOG_MAX; a no-op
+    under systemd and in a terminal."""
     if _truncate_stderr_if_huge():
         print(f"{_now_iso()} herd.daemon: log exceeded {DAEMON_LOG_MAX} bytes — truncated",
               file=sys.stderr, flush=True)
@@ -100,9 +83,8 @@ def _log(msg):
 
 
 def _int_env(name, default):
-    """A malformed threshold must not take down every herd command. These are read
-    at IMPORT time and cli.py imports this module, so `HERD_WAIT_SECS=fast herd ls`
-    used to be a ValueError traceback with no hint which variable was at fault."""
+    """Env int with a fallback. A malformed threshold must not take down every herd
+    command: these are read at IMPORT time and cli.py imports this module."""
     raw = os.environ.get(name, "")
     if raw == "":
         return default
@@ -111,14 +93,9 @@ def _int_env(name, default):
     except ValueError:
         _log(f"{name}={raw!r} is not an integer — using {default}")
         return default
-    # A NEGATIVE grace period is not a shorter grace period, it is a cutoff in the
-    # FUTURE. HERD_STRANDED_SECS=-60 made sweep_stranded delete every spawn
-    # reservation the instant it was created — verified: a brand-new in-flight
-    # reservation swept on the first tick, so every `herd spawn` loses its row while
-    # kitty is still starting. The negative attention thresholds are milder (arm
-    # instantly, always) but equally not what anyone meant. This function exists so a
-    # malformed threshold cannot break things; -60 is malformed in every sense except
-    # int() accepting it. Zero is left alone — "no grace" is a coherent choice.
+    # A NEGATIVE grace period is a cutoff in the FUTURE, not a shorter one:
+    # HERD_STRANDED_SECS=-60 sweeps every spawn reservation the instant it is
+    # created. Zero is left alone — "no grace" is a coherent choice.
     if val < 0:
         _log(f"{name}={raw!r} is negative — using {default}")
         return default
@@ -129,10 +106,9 @@ def _int_env(name, default):
 # HERD_CLAUDE_NAME so hook and reaper stay consistent.
 CLAUDE_NAME = os.environ.get("HERD_CLAUDE_NAME", "claude")
 
-# Linux caps a process's comm at TASK_COMM_LEN-1 = 15 chars (`ps -o comm=` reads
-# /proc/pid/stat), so a CLAUDE_NAME of 16+ can NEVER equal what ps reports. _dead
-# reads a comm mismatch as a recycled pid, so that override reaped every live
-# session on the first tick. macOS reports the full basename, hence both forms.
+# Linux caps comm at TASK_COMM_LEN-1 = 15 chars, so a CLAUDE_NAME of 16+ can never
+# equal what ps reports — and _dead reads a comm mismatch as a recycled pid, i.e.
+# death. macOS reports the full basename, hence _is_claude accepting both forms.
 _COMM_MAX = 15
 
 # Attention: "needs attention" is DERIVED each tick from status + time-in-status
@@ -149,20 +125,16 @@ ATTENTION_SECS = {
 # exceed a kitty launch round trip + claude's startup to its first hook.
 STRANDED_SECS = _int_env("HERD_STRANDED_SECS", 120)
 
-# Bound for a stderr that is a FILE — see _truncate_stderr_if_huge. 0 disables.
 # The literal above is the default this overrides; both must stay in step.
 DAEMON_LOG_MAX = _int_env("HERD_DAEMON_LOG_MAX", DAEMON_LOG_MAX)
 
-# Ceiling for the retry backoff. A permanent fault — HERD_DB pointing at something
-# that is not a herd database, a full disk — used to retry at the normal 2s cadence
-# forever and log TWICE per tick (the failure, then "reconnected"): 86,400 journal
-# lines a day for a condition that will never resolve on its own. The daemon must
-# keep trying (a locked DB IS transient and recovers), just not at that price.
+# Ceiling for the retry backoff. A permanent fault (HERD_DB pointing at a non-herd
+# file, a full disk) must keep retrying — a locked DB IS transient — but not at the
+# 2s cadence, which cost ~86k journal lines a day.
 BACKOFF_MAX_SECS = _int_env("HERD_BACKOFF_MAX_SECS", 60)
 
-# One tick's `ps` must not outlive the tick. Generous — a loaded box can be slow —
-# but finite, because a hung ps freezes the reaper while the process stays alive,
-# so systemd's Restart never fires.
+# One tick's `ps` must not outlive the tick: a hung ps freezes the reaper while the
+# process stays alive, so systemd's Restart never fires.
 PS_TIMEOUT = 5
 
 
@@ -178,7 +150,7 @@ DEFAULT_DB = os.environ.get("HERD_DB", str(pathlib.Path.home() / ".herd" / "herd
 # ── IO (swappable in tests) ──────────────────────────────────────────────────
 def _parse_proc_table(text):
     """`pid stat comm` lines -> {pid: (state_char, comm_basename)}. split(None, 2)
-    keeps a comm containing spaces intact; junk/short lines are skipped."""
+    keeps a comm containing spaces intact; junk lines are skipped."""
     procs = {}
     for line in text.splitlines():
         f = line.split(None, 2)
@@ -196,18 +168,17 @@ def _parse_proc_table(text):
 
 def read_proc_table():
     """ONE ps fork per tick. Portable Linux+macOS (no /proc dependency). Returns
-    None — NOT {} — when the table can't be trusted: a nonzero ps, an exec failure,
-    or an empty parse. _dead() reads "absent from the table" as dead, so handing a
-    caller {} on a broken ps reaps every live session at once. A real `ps -eo`
-    always lists this process, so no rows means the probe failed, not that the
-    machine is idle. Callers must skip the tick on None."""
+    None — NOT {} — when the table can't be trusted: nonzero ps, exec failure, or an
+    empty parse (a real `ps -eo` always lists this process, so no rows means the
+    probe failed). _dead() reads absence as death, so {} would reap everything.
+    Callers MUST skip the tick on None."""
     try:
         p = subprocess.run(["ps", "-eo", "pid=,stat=,comm="],
                            capture_output=True, text=True, timeout=PS_TIMEOUT)
-    except subprocess.TimeoutExpired:            # a wedged ps would freeze the loop
-        return None                              # forever — and systemd's restart
-    except OSError:                              # never fires on a LIVE process
-        return None                              # ps missing from PATH, fork limit
+    except subprocess.TimeoutExpired:
+        return None
+    except OSError:                              # ps missing from PATH, fork limit
+        return None
     if p.returncode != 0:
         return None
     procs = _parse_proc_table(p.stdout)
@@ -231,10 +202,9 @@ def boot_time_iso():
 
 # ── liveness + the tick ──────────────────────────────────────────────────────
 def _is_claude(comm):
-    """Does this comm name our process? Exact, or the Linux-truncated form of a
-    CLAUDE_NAME too long to survive /proc — see _COMM_MAX. Truncating the STORED
-    name (not the observed one) keeps this from matching a short impostor: `cla`
-    never passes for `claude`."""
+    """Does this comm name our process? Exact, or the Linux-truncated form — see
+    _COMM_MAX. Truncating the STORED name, not the observed one, keeps a short
+    impostor out: `cla` never passes for `claude`."""
     return comm == CLAUDE_NAME or comm == CLAUDE_NAME[:_COMM_MAX]
 
 
@@ -255,10 +225,8 @@ def _dead(pid, procs):
 
 
 def _runtime_dir():
-    """Same anchor as lock_path(), cli._runtime_dir() and the hooks' HERD_RUNTIME —
-    now literally the same function, in config.py. Four copies of this chain existed
-    and two of them were in THIS file; a reader that disagrees takes a different lock
-    and runs a second daemon."""
+    """Same anchor as lock_path(), cli._runtime_dir() and the hooks' HERD_RUNTIME.
+    A resolver that disagrees takes a different lock and runs a second daemon."""
     return _config.runtime_dir()
 
 
@@ -272,12 +240,9 @@ def sweep_runtime_files(session_id):
     """Delete the per-session files the hooks keep — the throttle stamp and the
     statusline cache.
 
-    session_end.sh already does this ("or they leak one pair per session forever
-    — bounded on a tmpfs XDG_RUNTIME_DIR, unbounded under the home-dir fallback"),
-    but SessionEnd does not fire on kill -9, a crash, or a closed terminal. Those
-    are the deaths THIS DAEMON exists to reap, so every one of them left a pair
-    behind: 34 herd-stline-* files against 1 live session, measured. The reaper is
-    the only thing that learns about them, so the cleanup belongs here.
+    session_end.sh does this too, but SessionEnd does not fire on kill -9, a crash,
+    or a closed terminal — the deaths this daemon exists to reap. The reaper is the
+    only thing that learns about those, so the cleanup belongs here as well.
     """
     if not _valid_sid(session_id):
         return 0
@@ -292,33 +257,21 @@ def sweep_runtime_files(session_id):
 
 
 # Grace before a per-session runtime file with no live row is treated as garbage.
-# SessionStart writes the row, but the statusline can render (and cache) first, so a
-# young file whose session is simply not in the DB yet is NORMAL. Generous: the cost
-# of waiting is one stale file for another sweep, the cost of being wrong is
-# deleting a live session cache mid-startup.
+# The statusline can render (and cache) before SessionStart commits the row, so a
+# young file with no row is NORMAL. Generous on purpose: waiting costs one stale
+# file, being wrong deletes a live session's cache mid-startup.
 ORPHAN_GRACE_SECS = _int_env("HERD_ORPHAN_GRACE_SECS", 300)
 
 
 def sweep_orphan_files(conn, now=None, listdir=None, unlink=None, age_of=None):
     """Delete per-session runtime files whose session is gone or stopped.
 
-    sweep_runtime_files is ROW-DRIVEN: it is called from reap_once with a session_id
-    the daemon read out of the database. That cannot reach a file whose row no
-    longer exists — nothing knows the id, so nothing ever unlinks it. Measured on a
-    real herd: 34 herd-stline-* files, 30 of them with no row at all, against 13
-    sessions that had ever existed. The oldest was three days old.
+    DIRECTORY-driven, unlike sweep_runtime_files, and that is the whole point: a
+    row-driven sweep needs a session_id from the DB, so it can never reach a file
+    whose row is gone. boot_sweep (W3e) leaks such a pair per session by
+    construction — it stops pre-boot sessions and touches none of their files.
 
-    boot_sweep is the other half of the gap. W3e stops every session that started
-    before this boot — precisely the mass-death case where no SessionEnd ran — and
-    touches none of their files, so it leaks a pair per session by construction.
-
-    So this one is DIRECTORY-driven: read the names, ask the DB about each, delete
-    what is not live. That covers orphans and pre-boot deaths in the same pass, and
-    it is the only form that can ever shrink a set nothing has a row for.
-
-    Files younger than ORPHAN_GRACE_SECS are left alone. The statusline can render
-    before SessionStart commits the row, so "no row" on a fresh file means "not yet",
-    not "never".
+    Files younger than ORPHAN_GRACE_SECS are left alone; see that constant.
     """
     d = _runtime_dir()
     listdir = listdir or (lambda: os.listdir(d))
@@ -337,9 +290,8 @@ def sweep_orphan_files(conn, now=None, listdir=None, unlink=None, age_of=None):
             if not name.startswith(prefix):
                 continue
             sid = name[len(prefix):]
-            # The same guard sweep_runtime_files applies, for the same reason: this
-            # name came off the filesystem and is about to become a path to unlink.
-            # A file called `herd-stline-../../x` is not a session.
+            # This name came off the filesystem and is about to become a path to
+            # unlink: `herd-stline-../../x` is not a session.
             if not _valid_sid(sid) or sid in live:
                 break
             pth = os.path.join(d, name)
@@ -360,16 +312,14 @@ def reap_once(conn, procs, now, recheck=read_proc_table):
 
     `procs` is read BEFORE this SELECT, so absence from it is ambiguous: the pid
     died, OR its SessionStart landed between the two reads and it was never in the
-    snapshot to begin with. _dead() reads absence as death, so the newborn case was
-    a reap — and a permanent one, because W4_event carries `AND stopped_at IS NULL`
-    and only a fresh SessionStart (W2b_insert) clears it. A session running fine in
-    its terminal went invisible to R1_list for the rest of its life. Re-asserting
-    the pid in W3d_reap does not help: the pid we judged IS the newborn's own.
+    snapshot. Reaping a newborn is PERMANENT — W4_event carries `AND stopped_at IS
+    NULL`, so only a fresh SessionStart clears it — and re-asserting the pid in
+    W3d_reap does not help, since the pid judged IS the newborn's own.
 
     So a candidate is confirmed against a SECOND snapshot taken after the SELECT. A
-    process born before the SELECT is alive now and must appear in it; one that died
-    before the first snapshot is absent from both. Only absence from both is death.
-    The re-check is lazy — most ticks have no candidate and fork nothing."""
+    process born before the SELECT must appear in it; one that died before the first
+    snapshot is absent from both. Only absence from both is death. The re-check is
+    lazy — most ticks have no candidate and fork nothing."""
     reaped = 0
     rows = conn.execute(
         "SELECT id, pid, session_id FROM sessions "
@@ -380,21 +330,19 @@ def reap_once(conn, procs, now, recheck=read_proc_table):
         return 0
     confirm = recheck()
     if confirm is None:
-        return 0            # untrustworthy ps: skip the tick, exactly as run() does
-                            # on the first snapshot. Treating a failed re-check as
-                            # "confirmed absent" would reap every session at once.
+        return 0            # untrustworthy ps: skip the tick. Treating a failed
+                            # re-check as "confirmed absent" reaps everything.
     for r in candidates:
         # _dead again, not bare membership: a pid that reappears as a zombie or as a
         # recycled non-claude is still dead, and those signals only exist on presence.
         if _dead(r["pid"], confirm):
             # Pass the pid we JUDGED, not the row's current one — W3d_reap re-asserts
-            # it, so a resume that landed since the SELECT is a 0-row no-op instead of
-            # a live session reaped on evidence about a pid it no longer holds.
+            # it, so a resume that landed since the SELECT is a 0-row no-op.
             n = conn.execute(
                 W["W3d_reap"], {"pk": r["id"], "now": now, "pid": r["pid"]}).rowcount
             reaped += n
-            # Only when the reap actually landed: a 0-row result means the session
-            # resumed since the SELECT, and its files are live again.
+            # Only when the reap landed: 0 rows means the session resumed since the
+            # SELECT and its files are live again.
             if n:
                 sweep_runtime_files(r["session_id"])
     return reaped
@@ -402,8 +350,7 @@ def reap_once(conn, procs, now, recheck=read_proc_table):
 
 def _shift_iso(now, secs):
     """`now` minus `secs`, as an ISO-UTC stamp comparable to the stored ones, or
-    None when `now` will not parse. Shared by sweep_stranded and the arm rule so a
-    cutoff is computed one way."""
+    None when `now` will not parse."""
     at = _epoch(now)
     if at is None:
         return None
@@ -412,10 +359,11 @@ def _shift_iso(now, secs):
 
 
 def sweep_stranded(conn, now, max_age=None):
-    """Drop spawn reservations that never became a session. reap_once cannot: its
-    pid predicate skips them by design, so without this they hold their job_name
-    live until the next boot sweep. Independent of `ps` — nothing to check, the row
-    names no process. Returns count."""
+    """Drop spawn reservations that never became a session. Returns count.
+
+    reap_once cannot: its pid predicate skips pid-NULL rows, so without this they
+    hold their job_name until the next boot sweep. Independent of `ps` — the row
+    names no process."""
     age = STRANDED_SECS if max_age is None else max_age
     cutoff = _shift_iso(now, age)
     if cutoff is None:
@@ -439,7 +387,7 @@ def boot_sweep(conn, now, boot_time):
 
 # ── attention tick ───────────────────────────────────────────────────────────
 def _epoch(iso):
-    """Parse an ISO-UTC stamp (with or without millis) to epoch seconds, or None."""
+    """ISO-UTC stamp (with or without millis) -> epoch seconds, or None."""
     if not iso:
         return None
     for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
@@ -453,8 +401,7 @@ def _epoch(iso):
 
 def _silent_for(status, since, now):
     """Seconds of silence past the status threshold, or None when the status isn't
-    page-worthy / a stamp won't parse. Shared by the arm rule and the re-notify
-    rule so both measure the same way against the same knobs."""
+    page-worthy / a stamp won't parse. Shared by the arm and re-notify rules."""
     secs = ATTENTION_SECS.get(status)
     if secs is None:
         return None
@@ -488,46 +435,37 @@ def attention_tick(conn, now):
         na = needs_attention(r["status"], r["last_event_at"], now)
         if na and not r["is_armed"]:
             # Re-assert the silence at write time — see W6a_arm. A hook firing
-            # between this tick's SELECT and this write means the session is no
-            # longer silent, and the statement declines rather than marking it.
+            # between the SELECT and this write means the session is no longer
+            # silent, and the statement declines.
             cutoff = _shift_iso(now, ATTENTION_SECS[r["status"]])
             if cutoff is None:
                 continue
             armed += conn.execute(
                 W["W6a_arm"], {"pk": r["id"], "now": now, "cutoff": cutoff}).rowcount
         elif not na and r["is_armed"]:
-            # rowcount, like `armed` — this counted intent, not effect, so a W6d
-            # that matched nothing still reported a disarm.
             disarmed += conn.execute(W["W6d_rearm"], {"pk": r["id"]}).rowcount
         elif na and r["is_armed"] and r["ack_at"]:
-            # RE-NOTIFY. A jump acks the silence and the CLI stops rendering the mark,
-            # but the session is still silent and still unanswered. ack_at restarts
-            # the same per-status timer: once THAT much silence has passed since the
-            # ack, drop the row. The next tick's W6a re-arms with a fresh
-            # attention_at and ack_at NULL, and the mark comes back.
+            # RE-NOTIFY. An ack hides the mark but the session is still silent and
+            # unanswered, so ack_at restarts the same per-status timer; drop the row
+            # once it expires and the next tick's W6a re-arms fresh.
             #
-            # Dropping the row is also why the ack can't simply be "disarm on jump":
-            # W6d is a whole-row DELETE, so it takes ack_at with it. Deleting on the
-            # ack itself would leave the next tick measuring from last_event_at,
-            # which is still old — it would re-arm immediately and flap every tick.
+            # Deleting on the ack ITSELF would flap: W6d is a whole-row DELETE, so it
+            # takes ack_at with it, and the next tick would measure from the still-old
+            # last_event_at and re-arm immediately.
             over = _silent_for(r["status"], r["ack_at"], now)
             if over is not None and over >= 0:
                 disarmed += conn.execute(W["W6d_rearm"], {"pk": r["id"]}).rowcount
     return armed, disarmed
 
 
-# ── driver ───────────────────────────────────────────────────────────────────
-# ── single instance ──────────────────────────────────────────────────────────
-# Exactly one daemon, no way around it. Two are easy to end up with — the systemd
-# unit plus the manual `python3 -m herd.daemon` the README tells macOS/headless
-# users to run — and the damage is quiet: both tick attention against different
-# `now` values, so a session can arm and disarm on alternating ticks and the mark
-# flickers. Neither process is wrong; they just disagree.
+# ── driver: single instance ──────────────────────────────────────────────────────────
+# Exactly one daemon. Two (systemd unit + a manual `python3 -m herd.daemon`) tick
+# attention against different `now` values, so a session arms and disarms on
+# alternating ticks and the mark flickers.
 #
-# flock, not a pidfile: the kernel releases it on death however the process dies,
-# so a -9 or a crash cannot leave a stale lock that blocks every future start.
-# The handle is deliberately kept alive for the process lifetime — closing it,
-# including by letting it be garbage collected, drops the lock.
+# flock, not a pidfile: the kernel releases it however the process dies, so a -9
+# cannot leave a stale lock. The handle MUST stay alive for the process lifetime —
+# closing it, including by garbage collection, drops the lock.
 _LOCK_FH = None
 
 
@@ -545,12 +483,8 @@ def acquire_single_instance(path=None):
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         if fh is not None:
-            # The open SUCCEEDED and the flock did not, so this handle was left to
-            # the garbage collector. CPython's refcounting closes it at return, so
-            # this was never an observable leak — it is explicit because the
-            # guarantee is an implementation detail, not a promise. Safe either way:
-            # flock is per open-file-description, so dropping ours cannot disturb
-            # the daemon that holds the lock.
+            # The open succeeded and the flock did not. Safe to close: flock is per
+            # open-file-description, so dropping ours cannot disturb the holder.
             fh.close()
         return False
     fh.seek(0); fh.truncate(); fh.write(f"{os.getpid()}\n"); fh.flush()
@@ -582,19 +516,16 @@ def _backoff(fails, interval):
     """How long to wait before the next tick, given consecutive failures.
 
     fails <= 1 is the normal cadence on purpose: one bad tick is usually a held
-    write lock, which clears in milliseconds, and slowing down for it would make the
-    common case worse. Repeated failure is a fault that will not clear on its own —
-    retrying that every 2s logged 86,400 journal lines a day. Doubles, capped."""
+    write lock, which clears in milliseconds. Beyond that it doubles, capped at
+    BACKOFF_MAX_SECS."""
     if fails <= 1:
         return interval
     return min(interval * (2 ** min(fails - 1, 10)), BACKOFF_MAX_SECS)
 
 
 def _fault_hint(exc, db):
-    """Turn the two faults that are really configuration into the sentence that
-    fixes them. `no such table: sessions` repeated forever is technically accurate
-    and tells nobody that HERD_DB is pointing at the wrong file — which is now the
-    likely cause, since ~/.herd/config is where that gets set."""
+    """Turn the two faults that are really misconfiguration into the sentence that
+    fixes them, or None."""
     msg = str(exc).lower()
     if "no such table" in msg:
         return (f"{db} is not a herd database (no schema) — check HERD_DB in "
@@ -611,22 +542,15 @@ def run(interval=2.0, db_path=None, once=False, attend=None):
 
     A TICK MAY FAIL WITHOUT ENDING THE DAEMON. Every statement here is its own
     autocommit transaction taking the WAL write lock, against five hook scripts and
-    a per-session statusline doing the same, so `database is locked` is a normal
-    event, not a fatal one. It used to exit the process: under systemd that meant a
-    restart loop into the default start limit and a `failed` unit; on macOS or
-    headless, where install_service is a documented no-op, it meant silent-death
-    reaping simply stopped with nothing to notice.
-
-    Crashing was also the de-facto recovery for a BROKEN HANDLE (systemd restarted
-    us with a fresh one), so surviving a failure means we have to reopen the
-    connection ourselves — otherwise a dead handle would fail every tick forever and
-    reap nothing, which is the same silence with none of the restart.
+    a per-session statusline doing the same, so `database is locked` is normal, not
+    fatal. Since we no longer exit, nothing else restarts us with a fresh handle —
+    so a failed tick must reopen the connection itself (see _drop), or a dead handle
+    would fail every tick forever.
     """
     if attend is None:
         attend = _attention_enabled()
-    # Say what the config file did, ONCE, where a wrong threshold is actionable. A
-    # shadowed key is the interesting line: the file says one thing and this process
-    # is doing another, which used to be invisible.
+    # Say what the config file did, ONCE. A shadowed key is the interesting line:
+    # the file says one thing and this process is doing another.
     for key, val in sorted(CONFIG_APPLIED.items()):
         _log(f"config: {key}={val}")
     for key, (want, got) in sorted(CONFIG_SHADOWED.items()):
@@ -646,12 +570,9 @@ def run(interval=2.0, db_path=None, once=False, attend=None):
                                                       # create — see db.connect
             if not swept:
                 boot_sweep(conn, now, boot_time_iso())
-                # Right here, and not on every tick. boot_sweep just stopped every
-                # pre-boot session without touching their files, so this is the one
-                # moment the orphan set is largest and cheapest to clear. It is a
-                # readdir of a directory holding a handful of entries, so a periodic
-                # re-run would cost more than it ever reclaims — a session that dies
-                # later is handled by reap_once, which HAS the row.
+                # Right after boot_sweep, and not on every tick: that is the one
+                # moment the orphan set is largest. Later deaths are handled by
+                # reap_once, which HAS the row.
                 n = sweep_orphan_files(conn, now)
                 if n:
                     _log(f"swept {n} orphaned runtime file(s)")
@@ -662,26 +583,18 @@ def run(interval=2.0, db_path=None, once=False, attend=None):
             sweep_stranded(conn, now)                 # tier 1 — needs no proc table
             if attend:
                 attention_tick(conn, now)             # tier 2 — herd's opinion
-            # NOT gated on `attend`. W6e is garbage collection, not an opinion: it
-            # deletes herd_attention rows whose session is already stopped. Gating
-            # it meant HERD_ATTENTION=0 leaked those rows forever — verified — which
-            # is the unbounded growth W6e exists to prevent, in the one mode where
-            # nothing else would ever clear them.
+            # NOT gated on `attend`. W6e is garbage collection, not an opinion:
+            # under HERD_ATTENTION=0 nothing else would ever clear these rows.
             sweep_dead_attention(conn)
-            # "recovered", and only on a tick that actually WORKED. This used to log
-            # "reconnected" as soon as a handle opened, which for a database that
-            # exists but has no schema is every single retry — so the fault printed
-            # twice per tick rather than once, and the word claimed a recovery that
-            # had not happened.
+            # Only on a tick that actually WORKED — an opened handle is not recovery
+            # (a schema-less DB opens fine and fails every statement).
             if fails:
                 _log(f"recovered after {fails} failed tick(s)")
             fails = 0
         except Exception as e:                        # noqa: BLE001 — a daemon outlives its errors
             fails += 1
             msg = f"{type(e).__name__}: {e}"
-            # Say it when it CHANGES, and at the moments that matter (first, then
-            # thinning out), not 43,200 times a day. `fails` used to be incremented,
-            # printed, and never read for anything else.
+            # Log when the message CHANGES, and on a thinning schedule otherwise.
             if msg != last_err or fails in (1, 2, 3, 10, 30) or fails % 100 == 0:
                 hint = _fault_hint(e, db)
                 _log(f"tick failed ({msg}) — {fails} in a row, retrying"
@@ -690,8 +603,6 @@ def run(interval=2.0, db_path=None, once=False, attend=None):
             conn = _drop(conn)                        # force a fresh handle next tick
         if once:
             return
-        # Back off on a REPEATED failure only. One bad tick is usually a held write
-        # lock, which clears in milliseconds; a hundred is a fault that will not.
         time.sleep(_backoff(fails, interval))
 
 
@@ -707,12 +618,8 @@ USAGE = """usage: python3 -m herd.daemon [--once]
 
 
 def main(argv=None):
-    """Unknown argv is REFUSED, not ignored — as in herd.install.main.
-
-    `run(once="--once" in argv)` was a membership test with no validation, so
-    `--onec` started a daemon that never exits where a single tick was asked for,
-    and `--help` started one too. --once is the flag you reach for while debugging,
-    which is exactly when a silently-ignored typo costs the most.
+    """Unknown argv is REFUSED, not ignored — as in herd.install.main. A bare
+    `"--once" in argv` test would start an endless daemon on `--onec` or `--help`.
     """
     argv = argv if argv is not None else sys.argv[1:]
     unknown = [a for a in argv if a not in _FLAGS]

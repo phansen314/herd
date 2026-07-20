@@ -1,18 +1,8 @@
-"""What herd owns inside ~/.claude/settings.json — read by the installer AND by
-doctor, so the two cannot disagree about it.
+"""THE one definition of what herd owns inside ~/.claude/settings.json.
 
-They did. `install._is_managed` matches a hook by path prefix OR by basename on a
-herd-shaped path, deliberately: a prefix test alone misses an install made from a
-checkout that has since MOVED, the stale entry survives the strip, step 2 adds a
-second one, and every hook fires twice. `doctor.check_wiring` used a plain substring
-test against the two current roots — so the exact scenario _is_managed exists to
-handle was the one where doctor reported `SessionStart not wired` about hooks that
-were running fine. One question, two answers, one file apart.
-
-The walkers moved here for a second reason. doctor's tolerated any shape a hand
-edit can leave behind; install's assumed dicts of lists of dicts all the way down
-and raised AttributeError on `{"hooks": []}` or `{"hooks": {"Stop": ["x"]}}` —
-tracebacking on the one file you would run the installer to repair.
+install and doctor both import from here; they must not answer "is this hook ours?"
+differently. The walkers tolerate any shape a hand edit can leave behind, because
+they run against a file herd did not write and may be invoked to repair.
 """
 import pathlib
 
@@ -20,8 +10,8 @@ HOOKS_DIR = pathlib.Path(__file__).resolve().parent / "hooks"   # in the checkou
 HERD_DIR = pathlib.Path.home() / ".herd"
 INSTALLED_HOOKS = HERD_DIR / "hooks"                            # what actually runs
 
-# event -> (hook script, async?). Stop is herd's own (klawde had none). SessionStart
-# and SessionEnd are BLOCKING; SessionEnd blocking is the fix for klawde's async bug.
+# event -> (hook script, async?). SessionStart and SessionEnd must stay BLOCKING:
+# async SessionEnd loses the final write.
 HERD_HOOKS = {
     "SessionStart": ("session_start.sh", False),
     "Stop":         ("stop.sh",          True),
@@ -50,19 +40,16 @@ def is_managed(cmd, roots=None):
     """A command herd owns — klawde's, or any prior herd install. Everything else
     (cdh, the PreToolUse HTTP hook, anything unknown) is preserved untouched.
 
-    Recognising our own scripts BY NAME matters as much as by path: a prefix test
-    against the current roots misses an install made from a checkout that has since
-    moved, so the stale entry survives the strip and step 2 adds a second one —
-    every hook then fires twice. The herd-shaped-path condition keeps us from
-    claiming an unrelated tool's session_start.sh."""
+    Matches by NAME as well as by path prefix: a prefix test alone misses an install
+    made from a moved checkout, whose stale entry then survives the strip and gets
+    duplicated on re-add. The herd-shaped-path condition stops us claiming an
+    unrelated tool's session_start.sh."""
     if not cmd:
         return False
     if "/.klawde/" in cmd:
         return True
-    # roots is a PARAMETER because the caller's copy of these paths is the one that
-    # matters: the installer's tests redirect install.INSTALLED_HOOKS at a temp dir,
-    # and resolving against this module's own constants instead made ownership
-    # detection quietly ignore the redirect — uninstall then stripped nothing.
+    # roots is a PARAMETER: callers (and tests) redirect INSTALLED_HOOKS, and
+    # resolving against this module's constants would ignore the redirect.
     for r in (roots if roots is not None else default_roots()):
         if cmd.startswith(str(r)):
             return True
@@ -74,10 +61,8 @@ def is_managed(cmd, roots=None):
 
 
 def hook_commands(data):
-    """[(event, command), ...] from a settings dict, tolerating any shape.
-
-    Every level is checked because every level can be hand-edited into something
-    else, and this runs against a file herd did not write."""
+    """[(event, command), ...] from a settings dict. Every level is type-checked
+    because every level can be hand-edited into something else."""
     out = []
     hooks = data.get("hooks") if isinstance(data, dict) else None
     if not isinstance(hooks, dict):
@@ -98,8 +83,7 @@ def hook_commands(data):
 
 
 def statusline_command(data):
-    """settings.statusLine.command, or "" — including when statusLine is a string,
-    a list, or anything else a hand edit can leave behind."""
+    """settings.statusLine.command, or "" for any other shape."""
     if not isinstance(data, dict):
         return ""
     sl = data.get("statusLine")
@@ -110,18 +94,10 @@ def strip_managed(hooks, roots=None):
     """Remove every herd-managed command IN PLACE, dropping blocks and then events
     that become empty. cdh / PreToolUse-HTTP / others are untouched.
 
-    Shared by rewire_settings (which re-adds herd afterwards) and unwire_settings
-    (which does not). It lives in one place because the two must agree on what herd
-    owns — a strip that drifts from the re-add either doubles every hook or strands
-    one behind.
-
-    Shape-tolerant, like hook_commands. It used to assume dicts of lists of dicts
-    and raised AttributeError on `{"hooks": []}`, `{"hooks": {"Stop": ["x"]}}` or a
-    settings.json that is not an object at all — aborting the installer with a stack
-    trace on exactly the malformed file someone would run it to fix. Anything it
-    does not recognise is left ALONE rather than dropped: herd does not own a shape
-    it cannot read, and deleting a key it failed to parse would be worse than
-    refusing to touch it."""
+    Shared by rewire_settings and unwire_settings: a strip that drifts from the
+    re-add either doubles every hook or strands one behind. Shape-tolerant like
+    hook_commands, and anything unrecognised is left ALONE rather than dropped —
+    herd does not own a shape it cannot read."""
     if not isinstance(hooks, dict):
         return
     for event in list(hooks):
@@ -137,8 +113,7 @@ def strip_managed(hooks, roots=None):
             block["hooks"] = [h for h in hs
                               if not (isinstance(h, dict)
                                       and is_managed(h.get("command") or "", roots))]
-        # A block we could not parse is KEPT: `b.get("hooks")` on a non-dict raises,
-        # and treating it as empty would delete a stranger's entry.
+        # An unparseable block is KEPT — treating it as empty deletes a stranger's entry.
         kept = [b for b in blocks
                 if not isinstance(b, dict) or b.get("hooks")]
         if kept:

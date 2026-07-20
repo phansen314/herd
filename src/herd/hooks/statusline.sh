@@ -13,13 +13,9 @@ __d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."
 
 read_input
 
-# ── parse: ONE jq into \x1f-separated fields ──────────────────────────────
+# ── parse: ONE jq into \x1f-separated fields (see payload_read in common.sh) ─
 # \x1f (Unit Separator), NOT tab (tab is IFS whitespace and collapses empties).
 # model is an OBJECT here (.model.id). resets_at is a UNIX EPOCH.
-# payload_read strips \n, \r AND the separator from all 23 fields and checks a
-# sentinel — see common.sh, which every hook now shares. The stripping is not
-# cosmetic: a session_name carrying one separator shifted every later value into
-# the next column and W5_statusline COALESCEd the wrong ones in permanently.
 payload_read '
   .session_id,
   .model.id,
@@ -42,24 +38,20 @@ payload_read '
   .workspace.git_worktree,
   (if .exceeds_200k_tokens then 1 else 0 end),
   .output_style.name,
-  # The rate-limit reset stamps, FORMATTED HERE. These were two "date -d @epoch"
-  # forks per tick (1.25ms measured) on the ~1/sec/session path, doing what the jq
-  # we already fork does for free. strflocaltime is local-TZ, as "date -d" was.
+  # The rate-limit reset stamps, FORMATTED HERE rather than by two "date -d @epoch"
+  # forks per tick. strflocaltime is local-TZ, as "date -d" was.
   #
   # NO APOSTROPHES IN THESE COMMENTS: the whole filter is one single-quoted bash
   # string, so one would end it and hand the rest of the program to the shell.
   #
   # Padded %I/%m/%d with the leading zeros sub()bed off, NOT the GNU-only %-I/%-m:
   # jq calls the system strftime, and BSD has no "-" flag, so asking for it on
-  # macOS emits the format literally. sub() belongs to jq and behaves the same on
-  # both — which is also why the old BSD "date -r" fallback disappears with it.
+  # macOS emits the format literally. sub() behaves the same on both.
   #
-  # GUARD ON TYPE, AND STILL WRAP IN try. strflocaltime raises on a non-number,
-  # and a raise ABORTS THE WHOLE FILTER — so one unexpected field type emptied
-  # all 23 outputs, rendered a bare context percentage and sank NOTHING to the
-  # DB. The `date -d` forks this replaced degraded far better: they lost only
-  # their own segment. Moving the formatting into jq coupled one optional nested
-  # field to every other field, so it has to fail like the forks did, per-field.
+  # GUARD ON TYPE, AND STILL WRAP IN try. strflocaltime raises on a non-number and
+  # a raise ABORTS THE WHOLE FILTER — one unexpected field type would empty all 23
+  # outputs and sink nothing. Formatting in jq couples one optional nested field to
+  # every other field, so it must fail per-field the way the forks did.
   (try (if (.rate_limits.five_hour.resets_at | type) == "number"
         then (.rate_limits.five_hour.resets_at | strflocaltime("%I:%M%p")
               | sub("^0"; ""))
@@ -72,17 +64,14 @@ payload_read '
     CTXSIZE OCWD LADD LDEL TOKIN TOKOUT VER GWT EXC200 OSTYLE RL5FMT RL7FMT
 PARSE_OK=$?
 
-# ── the sentinel check. Cheap (no fork) and it must come BEFORE anything reads a
-# field: a shifted parse makes every value plausible and wrong, and the sink is
-# one-way — W5_statusline COALESCEs, so a wrong non-NULL value is permanent.
-#
-# Rendering the shifted values instead would show a fabricated cost and burn rate
-# as though they were real. Say so instead: SID is field 1 and a shift can only
-# start at or after the field that carried the separator, so the id survives even
-# when nothing else does (preview.sh relies on the same fact for NF != 20).
+# ── the sentinel check, BEFORE anything reads a field: a shifted parse makes every
+# value plausible and wrong, and W5_statusline COALESCEs, so a wrong non-NULL value
+# is permanent. SID is field 1 and a shift can only start at or after the field that
+# carried the separator, so the id survives even when nothing else does (preview.sh
+# relies on the same fact for NF != 20).
 if [ "$PARSE_OK" -ne 0 ]; then
-    # now_pair before herd_log, or the line stamps "?" — it reads $NOW_ISO, which
-    # nothing has set this early. One fork, on an error path that should never run.
+    # now_pair before herd_log, or the line stamps "?" — nothing has set $NOW_ISO
+    # this early.
     now_pair
     herd_log "statusline: payload parse shifted (sentinel=[$HERD_PARSE_TAIL]) — no DB write"
     printf '%s' "⬢ ? | herd: payload parse error"
@@ -93,10 +82,8 @@ fi
 BRANCH=""
 git_branch_of() {
     local dir="$1" g head ref
-    # ABSOLUTE ONLY. ${dir%/*} returns the string UNCHANGED when there is no slash
-    # left, so a relative cwd ("src", or anything with no leading /) never shrank
-    # and this spun forever — verified. In a hook that reruns about once a second
-    # and must never block, that is a core at 100% until Claude's timeout kills it.
+    # ABSOLUTE ONLY. ${dir%/*} returns the string UNCHANGED once no slash is left,
+    # so a relative cwd never shrinks and the loop below spins forever.
     case "$dir" in
         /*) ;;
         *)  return 1 ;;
@@ -108,10 +95,9 @@ git_branch_of() {
             else
                 IFS= read -r g < "$dir/.git" 2>/dev/null   # "gitdir: <path>"
                 g="${g#gitdir: }"
-                # RELATIVE gitdirs are the norm for submodules and worktrees
-                # ("gitdir: ../../.git/modules/foo"). Resolved against the HOOK's
-                # cwd instead of $dir they either miss — dropping the branch — or,
-                # worse, hit and report a DIFFERENT repo's HEAD into git_branch.
+                # RELATIVE gitdirs are the norm for submodules and worktrees, and
+                # must resolve against $dir, not the HOOK's cwd — otherwise they
+                # miss, or worse, hit a DIFFERENT repo's HEAD.
                 case "$g" in
                     /*) ;;                                 # absolute: as-is
                     *)  g="$dir/$g" ;;
@@ -180,7 +166,7 @@ render() {
         L1+=("⌛ $apifmt API")
     fi
 
-    # ⏱️ 5h rate limit — reset local TZ, 12h, no date. GNU %-I / BSD padded fallback.
+    # ⏱️ 5h rate limit — reset local TZ, 12h, no date.
     if [[ "$RL5" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
         printf -v n '%.0f' "$RL5"
         seg="⏱️ 5h ${n}%"
@@ -211,16 +197,12 @@ valid_sid "$SID" && CACHE="$HERD_RUNTIME/herd-stline-$SID"
 # ── fingerprint: skip ALL DB work when nothing changed. Cache is 3 fixed lines:
 # FP, L1, L2.
 #
-# It covers every field we RENDER *and* every field we SINK — the second set is
-# the bigger one (tokens, line counts, version, output style render nothing), and
-# it has to be there or a tick that changes only a sunk field would take a cache
-# hit and never reach the DB.
+# It must cover every field we RENDER *and* every field we SINK, or a tick that
+# changes only a sunk field takes a cache hit and never reaches the DB.
 #
-# The consequence is worth stating plainly, because it is easy to read this block
-# as a hot-path optimization and it is not: token counts move on essentially every
-# tick of an ACTIVE session, so an active session misses the cache basically
-# always. This is an IDLE-path optimization. What an active herd pays is the fork
-# count on the miss path below — see DECISIONS.md#statusline-forks.
+# This is an IDLE-path optimization, NOT a hot-path one: token counts move on
+# essentially every tick of an active session, so an active session almost always
+# misses. See DECISIONS.md#statusline-forks.
 FP="$MODEL|$SNAME|$CTX|$COST|$RL5|$RL5RESET|$RL7|$RL7RESET|$CWD|$BRANCH|$API_MS"
 FP="$FP|$CTXSIZE|$OCWD|$LADD|$LDEL|$TOKIN|$TOKOUT|$VER|$GWT|$EXC200|$OSTYLE"
 if [ -n "$CACHE" ] && [ -f "$CACHE" ]; then
@@ -255,12 +237,10 @@ CH=$(run W5_statusline "SELECT changes();" 2>/dev/null); RC=$?
 # when W5 matched nothing AND we are in kitty (env inherited from claude).
 #
 # GATE ON RC, NOT ON $CH ALONE. run prints "0" when the statement succeeded and
-# matched no row, but "" when it FAILED — and a locked DB is the common failure
-# (busy_timeout is 3s, statusline fires ~1/sec per session, the fingerprint moves
-# every tick so the cache can't absorb it). Treating an error as "not adopted"
-# spent the timeout, then an adopt, then a retry: 9s of stall per render, exactly
-# when the DB is already contended. An error means we learned nothing about
-# adoption, so the only correct move is to skip and render from the payload.
+# matched no row, but "" when it FAILED, and a locked DB is the common failure.
+# Treating an error as "not adopted" costs three 3s busy_timeouts per render,
+# exactly when the DB is already contended. An error means we learned nothing about
+# adoption, so skip and render from the payload.
 if [ "$RC" -eq 0 ] && [ "$CH" = "0" ] &&
    [ -n "${KITTY_WINDOW_ID:-}" ] && [ -n "${KITTY_LISTEN_ON:-}" ]; then
     export HERD_P_socket="$KITTY_LISTEN_ON" HERD_P_win="$KITTY_WINDOW_ID"
@@ -275,16 +255,13 @@ if [ "$CH" = "1" ]; then
     RB=$(run R_statusline 2>/dev/null)          # prev_cost|prev_sampled
     IFS='|' read -r PREV_COST PREV_AT <<< "$RB"
     if [ -n "$COST" ] && [ -n "$PREV_COST" ] && [ -n "$PREV_AT" ]; then
-        # epoch() is hand-rolled because mktime() is a GAWK EXTENSION. macOS ships
-        # one-true-awk, which has no time functions and aborts at parse — and with
-        # stderr dropped that surfaced as BURN="" and a 🔥 segment that silently
-        # never rendered on a Mac. Only POSIX awk is used below.
+        # epoch() is hand-rolled because mktime() is a GAWK EXTENSION and macOS
+        # ships one-true-awk, which aborts at parse. POSIX awk only below.
         #
         # Both stamps are ISO-8601 UTC, so the days-from-civil arithmetic is exact
         # (Hinnant's algorithm, era = 400-year cycle of 146097 days; -719468 shifts
-        # the 0000-03-01 epoch to 1970-01-01). Doing it in UTC also drops a bug the
-        # mktime version had: it fed UTC digits to a LOCAL-time parser, and the
-        # offset only cancelled in b-a outside a DST transition.
+        # the 0000-03-01 epoch to 1970-01-01). Staying in UTC also avoids feeding
+        # UTC digits to a local-time parser, which only cancels outside a DST shift.
         #
         # epoch() returns -1 on an unparseable stamp; the a<=0/b<=0 guard stops a
         # bogus "$0.00/h". Sub-cent rates are noise, hidden rather than shown as 0.
@@ -318,8 +295,7 @@ render "$SNAME" "$BURN"
 # ── cache atomically (tmp + rename — a torn write must not feed a false hit) ─
 { printf '%s\n%s\n%s\n' "$FP" "$L1S" "$L2S"; } > "$CACHE.tmp.$$" 2>/dev/null &&
     mv -f "$CACHE.tmp.$$" "$CACHE" 2>/dev/null
-rm -f "$CACHE.tmp.$$" 2>/dev/null      # the && skipped the mv: leave no debris,
-                                       # as post_tool_use.sh already does
+rm -f "$CACHE.tmp.$$" 2>/dev/null      # the && skipped the mv: leave no debris
 
 emit "$L1S" "$L2S"
 exit 0

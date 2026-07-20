@@ -2,40 +2,24 @@
 
     ~/.herd/config          # KEY=value, # comments, blank lines ignored
 
-This exists because the environment is not a shared channel between herd's parts.
-The hooks are descendants of your shell and see everything you export; the daemon
-is started by `systemctl --user`, which inherits NOTHING from a login shell. Its
-unit names PYTHONPATH and nothing else, so its real environment (verified via
-/proc) holds essentially nothing herd-shaped. So every threshold README documents — HERD_WAIT_SECS and friends,
-read only by daemon.py — was silently ignored, and two of them were worse than
-ignored:
+The environment is not a shared channel between herd's parts: the hooks descend
+from your shell, while `systemctl --user` starts the daemon with nothing from it.
+A setting that reaches only one side is a divergence, not a preference — see
+DECISIONS.md for the two that cost real sessions.
 
-  HERD_CLAUDE_NAME  the hooks saw it and stored a pid for a process named e.g.
-                    `myclaude`; the daemon did not, compared comm against its own
-                    default `claude`, read the mismatch as a recycled pid, and
-                    reaped EVERY LIVE SESSION on the first tick. Verified.
-  HERD_RUNTIME      lock_path() resolves under it, so a hand-started daemon took a
-                    DIFFERENT lock file and ran alongside the systemd one — the
-                    duplicate the flock exists to prevent.
+common.sh parses this file with the same rules; test_source_invariants pins the
+two key lists together.
 
-Both are divergence bugs, not lookup bugs: the fix is one source of truth that
-both readers agree on, which is this file. common.sh parses it with the same rules
-(see load_config there) and test_source_invariants pins the two key lists together.
-
-PRECEDENCE: a real environment variable WINS. The file supplies what the
-environment does not set, so `HERD_WAIT_SECS=5 python3 -m herd.daemon --once` still
-works for a one-off. The unit deliberately sets no HERD_* at all, so nothing
-competes with this file in normal operation.
-A shadowed key is REPORTED, never silently dropped — a config line that does
-nothing is the bug this module was written to end.
+PRECEDENCE: a real environment variable WINS, so a one-off override still works.
+A shadowed key is REPORTED rather than dropped — a config line that does nothing
+is the bug this module exists to end.
 """
 import os
 import pathlib
 
-# Every key herd reads anywhere — daemon, CLI, and hooks. A file key outside this
-# set is a typo (HERD_WAIT_SEC, HERD_STUCK_SECONDS) and is reported rather than
-# ignored: a misspelled tuning knob that stays silent is indistinguishable from
-# one that is being obeyed, which is the whole failure this file addresses.
+# A file key outside this set is a typo (HERD_WAIT_SEC, HERD_STUCK_SECONDS) and is
+# reported rather than ignored: a misspelled knob that stays silent is
+# indistinguishable from one being obeyed.
 KNOWN = (
     # daemon
     "HERD_ATTENTION", "HERD_WAIT_SECS", "HERD_APPROVAL_SECS", "HERD_STUCK_SECS",
@@ -59,29 +43,23 @@ def runtime_dir(env=None, mkdir=True):
     """The one directory for herd's per-session runtime files, the daemon lock, and
     the picker handoff. HERD_RUNTIME, else XDG_RUNTIME_DIR, else ~/.herd/run.
 
-    NEVER /tmp, which is what the fallback used to be. Every name under it is
-    predictable — herd-db-err.<pid>, herd-stline-<uuid>, herd-daemon.lock — and the
-    hooks create them with plain redirects, which FOLLOW SYMLINKS. On a shared box
-    another user could pre-create any of those as a link to a file of ours and have
-    a hook truncate it. XDG_RUNTIME_DIR does not have that problem (/run/user/<uid>
-    is 0700 and ours), and ~/.herd/run does not either; only /tmp did.
+    NEVER /tmp: the filenames under it are predictable and the hooks create them
+    with plain redirects, which follow symlinks — on a shared box another user can
+    pre-create one as a link and have a hook truncate it. /run/user/<uid> and
+    ~/.herd/run are 0700 and ours; /tmp was not.
 
-    ONE definition, because every reader has to agree: the hooks write the caches,
-    the CLI reads them, and the daemon takes its single-instance lock here. Two
-    answers means two locks and two daemons — which is what HERD_RUNTIME in a shell
-    used to cause, and what ~/.herd/config now exists to prevent."""
+    ONE definition, because every reader must agree — two answers means two daemon
+    locks and two daemons."""
     env = os.environ if env is None else env
     d = env.get("HERD_RUNTIME") or env.get("XDG_RUNTIME_DIR")
     if d:
         return d
     # env["HOME"], not expanduser("~"): expanduser reads the REAL environment, so a
-    # caller passing an env dict (every test, and doctor asking what the DAEMON
-    # resolves) got this process's home and the parameter silently did nothing.
-    # common.sh uses $HOME here, and the two have to land on the same directory.
+    # caller passing an env dict got this process's home and the parameter silently
+    # did nothing. common.sh uses $HOME and the two must land on the same directory.
     home = env.get("HOME") or os.path.expanduser("~")
     d = os.path.join(home, ".herd", "run")
-    # Only on the fallback path, and only when absent — this is called on the hook
-    # hot path and an unconditional makedirs would be a syscall per statusline tick.
+    # Called on the hook hot path: an unconditional makedirs is a syscall per tick.
     if mkdir and not os.path.isdir(d):
         try:
             os.makedirs(d, mode=0o700, exist_ok=True)
@@ -89,6 +67,21 @@ def runtime_dir(env=None, mkdir=True):
         except OSError:
             pass                        # unwritable HOME: callers degrade already
     return d
+
+
+def _strip_inline_comment(val):
+    """Cut a trailing `# comment` off a value.
+
+    A '#' opens a comment only at the START of the value or AFTER WHITESPACE.
+    Anywhere else it is an ordinary character, so `/srv/repo#2/herd.db` survives —
+    cutting at every '#' would be the same silent-wrong-value bug reversed.
+
+    herd_load_config in common.sh implements the same rule; the two are pinned by
+    test_bash_and_python_strip_inline_comments_the_same_way."""
+    for i, ch in enumerate(val):
+        if ch == "#" and (i == 0 or val[i - 1] in " \t"):
+            return val[:i].rstrip()
+    return val
 
 
 def parse(text):
@@ -104,10 +97,9 @@ def parse(text):
             problems.append(f"line {n}: no '=' in {line!r}")
             continue
         key, val = line.split("=", 1)
-        key, val = key.strip(), val.strip()
-        # `export FOO=bar` is what muscle memory types into a file like this, and
-        # silently binding a key named "export FOO" would be exactly the quiet
-        # no-op this module exists to prevent. Accept it and move on.
+        key, val = key.strip(), _strip_inline_comment(val.strip())
+        # `export FOO=bar` is what muscle memory types here, and binding a key
+        # named "export FOO" would be the silent no-op this module prevents.
         if key.startswith("export "):
             key = key[len("export "):].strip()
         if key not in KNOWN:
@@ -115,12 +107,9 @@ def parse(text):
             continue
         if key in values:
             problems.append(f"line {n}: {key} set twice — the later wins")
-        # A LEADING ~ ONLY. Nothing expands it otherwise: this file is not read by a
-        # shell, and common.sh assigns the value with eval "$k=\$v" — quoted, so bash
-        # does not expand it either. The shipped template shows `~/.herd/herd.db`, so
-        # uncommenting that line would have pointed the database at a directory
-        # literally named "~". No $VAR expansion, deliberately: one rule that both
-        # parsers can implement identically beats a shell-alike that drifts.
+        # A LEADING ~ ONLY. Nothing else expands it: this file is not read by a
+        # shell, and common.sh assigns the value quoted. No $VAR expansion either —
+        # one rule both parsers implement identically beats a drifting shell-alike.
         if val.startswith("~"):
             val = os.path.expanduser(val)
         values[key] = val
@@ -144,17 +133,15 @@ def apply(path=None, env=None):
     """Fill the environment from the file, WITHOUT overriding what is already set.
     Returns (applied, shadowed, problems) so a caller can report all three.
 
-    Called once at import from daemon.py, which cli.py imports — so every python
-    entry point gets the same settings, and the hooks get them from common.sh
-    reading the same file by the same rules."""
+    Called once at import from daemon.py, which cli.py imports, so every python
+    entry point gets the same settings."""
     env = os.environ if env is None else env
     values, problems = load(path)
     applied, shadowed = {}, {}
     for key, val in values.items():
         if env.get(key) is not None:
-            # Set in BOTH places. Not an error — a one-off override is a feature,
-            # and the test suite exports these — but never silent: the file says one
-            # thing and the process is doing another.
+            # Set in both places. Not an error — a one-off override is a feature —
+            # but never silent: the file says one thing, the process does another.
             if env.get(key) != val:
                 shadowed[key] = (val, env[key])
             continue
@@ -182,19 +169,15 @@ DEFAULT_TEXT = """\
 #HERD_STRANDED_SECS=120    # grace before an unstarted spawn reservation is dropped
 
 # ── identity and placement ──────────────────────────────────────────────────
-# HERD_CLAUDE_NAME MUST live here rather than in .bashrc. The hooks would see it
-# there and the daemon would not, and that divergence makes the reaper read every
-# live session as a recycled pid and stop all of them on its first tick.
+# Set these HERE, not in .bashrc: the hooks would see them and the daemon would
+# not, and that divergence stops every live session on the reaper's first tick.
 #HERD_CLAUDE_NAME=claude   # process name the pid ancestry walk looks for
-#HERD_RUNTIME=             # per-session runtime files + the daemon lock.
-                           # Defaults to $XDG_RUNTIME_DIR, else ~/.herd/run.
-                           # Setting this
-                           # in a shell only splits the lock and runs two daemons.
+#HERD_RUNTIME=             # runtime files + daemon lock. Defaults to
+                           # $XDG_RUNTIME_DIR, else ~/.herd/run. Setting this in a
+                           # shell only splits the lock and runs two daemons.
 
 # ── paths ───────────────────────────────────────────────────────────────────
-#HERD_DB=~/.herd/herd.db   # authoritative: the systemd unit sets no herd
-                           # settings at all, so this is the only place to move it
-                           # and the hooks read the same value.
+#HERD_DB=~/.herd/herd.db   # the only place to move it; both sides read this
 #HERD_TEMPLATES=~/.herd/templates
 #HERD_ERRLOG=~/.herd/hook-errors.log
 #HERD_ERRLOG_MAX=1048576   # bytes before rotating to .1; 0 keeps everything

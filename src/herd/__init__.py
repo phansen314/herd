@@ -1,13 +1,11 @@
 """herd — track Claude Code sessions in a local SQLite database.
 
-The version floor lives HERE, not in bin/herd: the wrapper can only prove python3
-exists (`command -v`), and proving it is new enough would cost a second interpreter
-start on every `herd ls`. This module is imported before any other herd code, so a
-too-old interpreter is caught once, at the cheapest possible point, with a message
-that names the actual problem.
+The version floor lives HERE, not in bin/herd: checking it in the wrapper would cost
+a second interpreter start on every `herd ls`. This module is imported before any
+other herd code, so a too-old interpreter is caught once, cheaply.
 
-Deliberately written in pre-3.6 syntax — %-formatting, no f-strings. A version
-check that SyntaxErrors on the versions it exists to reject reports nothing.
+Deliberately pre-3.6 syntax — %-formatting, no f-strings. A version check that
+SyntaxErrors on the versions it exists to reject reports nothing.
 """
 import sys
 

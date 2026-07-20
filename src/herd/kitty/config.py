@@ -1,24 +1,18 @@
 """kitty.conf: the two options herd needs, and the block that adds them.
 
-Pure text + environment inspection, no IO — `doctor` reads the state to report it
-and `install` reads it to decide whether to offer the edit, and neither should be
-the one that knows what the block looks like.
+Pure text + environment inspection, no IO; shared by doctor and install.
 
-**Why the environment and not kitty.conf.** kitty.conf supports `include`,
-last-wins overrides and conditional sections, so "is `allow_remote_control` on?"
-cannot be answered by reading one file — and a wrong answer here is worse than no
-answer, because it would tell someone their working setup is broken. The
-environment is the actual capability: kitty exports KITTY_LISTEN_ON only when
-remote control is on AND a socket is configured, which is exactly the pair herd
-needs. Parsing is used for one narrow question only — has herd's OWN block already
-been added — where the markers make it exact.
+State is read from the ENVIRONMENT, not by parsing kitty.conf: `include`, last-wins
+overrides and conditional sections mean no single file answers "is
+allow_remote_control on?". kitty exports KITTY_LISTEN_ON only when remote control is
+on AND a socket is configured — exactly the pair herd needs.
 """
 import pathlib
 
 KITTY_CONF = pathlib.Path.home() / ".config" / "kitty" / "kitty.conf"
 
-# Markers, not a fuzzy search: uninstall has to remove exactly what install added
-# and nothing a person wrote. Same shape as kitty's own BEGIN_KITTY_THEME.
+# Markers, not a fuzzy search: uninstall must remove exactly what install added and
+# nothing a person wrote. Same shape as kitty's own BEGIN_KITTY_THEME.
 BEGIN = "# BEGIN herd — added by `python3 -m herd.install`"
 END = "# END herd"
 
@@ -33,9 +27,7 @@ allow_remote_control yes
 listen_on unix:/tmp/kitty-{{kitty_pid}}
 {END}"""
 
-# What a person has to do after either option changes. Neither is runtime
-# reloadable — `kitten @ load-config` will not pick them up, and saying "reload"
-# would send someone looking for a bug that isn't there.
+# Neither option is runtime reloadable — `kitten @ load-config` will not pick them up.
 RESTART = "restart kitty (neither option is picked up by a config reload)"
 
 READY = "ready"                     # remote control is on and a socket is exported
@@ -46,12 +38,9 @@ NOT_KITTY = "not-kitty"             # not inside kitty at all; nothing to conclu
 def state(environ):
     """Which of the three worlds we're in.
 
-    KITTY_WINDOW_ID is what separates the two "no socket" cases: kitty exports it
-    inside every window regardless of remote control, so it present + LISTEN_ON
-    absent is precisely "you are in kitty and remote control is off" — the only
-    state worth nagging about. Without that distinction a plain xterm and a
-    misconfigured kitty look identical, and the check would have to either cry
-    wolf everywhere or stay silent where it matters.
+    KITTY_WINDOW_ID separates the two "no socket" cases: kitty exports it in every
+    window regardless of remote control, so present + LISTEN_ON absent means exactly
+    "in kitty, remote control off".
     """
     if environ.get("KITTY_LISTEN_ON"):
         return READY
@@ -65,13 +54,9 @@ def has_block(text):
 
 
 def add_block(text):
-    """Append the block. Idempotent, and appends at EOF on purpose: kitty is
-    last-wins, so this beats an `allow_remote_control no` set earlier in the file.
-
-    The one thing this does not preserve is a missing final newline — a file not
-    ending in one gets normalized. Every real kitty.conf ends in a newline, and the
-    alternative is writing a malformed line into someone's config.
-    """
+    """Append the block. Idempotent, and at EOF on purpose: kitty is last-wins, so
+    this beats an `allow_remote_control no` set earlier in the file. A file with no
+    trailing newline gets one added."""
     if has_block(text):
         return text
     if not text:
@@ -82,10 +67,8 @@ def add_block(text):
 def strip_block(text):
     """Remove exactly what add_block inserted, so strip_block(add_block(t)) == t.
 
-    Deliberately surgical rather than "rstrip and rebuild": the first version
-    normalized whitespace it did not add, and eating a trailing blank line the user
-    had written is a silent edit to a file herd does not own. A file that never had
-    a block comes back byte-identical.
+    Surgical rather than "rstrip and rebuild": whitespace herd did not add must
+    survive, and a file that never had a block comes back byte-identical.
     """
     if not has_block(text):
         return text

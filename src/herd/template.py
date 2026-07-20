@@ -1,10 +1,8 @@
 """Load spawn templates — TOML presets under ~/.herd/templates that fill SpawnSpec
-defaults. A template is just a second SpawnSpec source, merged UNDER the CLI flags
-(herd.spawn.resolve_spec) — it never touches the DB or the executor. Format is TOML
-for its triple-quoted multiline strings: a multiline `prompt` is the point.
+defaults, merged UNDER the CLI flags (herd.spawn.resolve_spec). TOML is chosen for
+its triple-quoted multiline strings: a multiline `prompt` is the point.
 
-TOML parsing uses stdlib tomllib (Python 3.11+). It is imported lazily so the rest
-of herd still runs on 3.9/3.10 — only using a template needs 3.11.
+tomllib (Python 3.11+) is imported LAZILY so the rest of herd still runs on 3.9/3.10.
 """
 import os
 import pathlib
@@ -15,8 +13,8 @@ _KEY_FIELD = {"cwd": "cwd", "type": "launch_type", "job": "job", "title": "title
 
 
 def _default_dir():
-    """Env-overridable, ~/.herd default — read at call time so HERD_TEMPLATES set
-    after import (and in tests) is honored. Same idea as daemon.DEFAULT_DB."""
+    """Read at CALL time so HERD_TEMPLATES set after import (and in tests) is
+    honored. Same idea as daemon.DEFAULT_DB."""
     return os.environ.get("HERD_TEMPLATES", str(pathlib.Path.home() / ".herd" / "templates"))
 
 
@@ -37,17 +35,15 @@ def available_templates(dir=None):
 
 def load_template(name, *, dir=None):
     """Read <dir>/<name>.toml into a dict of SpawnSpec-field overrides. Raises
-    ValueError (with a friendly message) on a bad name, missing file, bad TOML, or
-    an unknown/mistyped key — never a bare stack trace on the CLI."""
+    ValueError on a bad name, missing file, bad TOML, or an unknown/mistyped key —
+    cmd_spawn catches ValueError only, so nothing else may escape."""
     if not valid_template_name(name):
         raise ValueError(f"invalid template name {name!r}")
     path = _dir(dir) / f"{name}.toml"
     if not path.is_file():
         raise ValueError(f"no template {name!r} at {path}")
-    # The interpreter check comes AFTER the name and file checks, so the error
-    # names the caller's actual mistake. Importing first meant `herd spawn -t typo`
-    # on 3.9 answered "templates need Python 3.11+" — true, but not the problem, and
-    # it sends you to upgrade python over a misspelling.
+    # AFTER the name and file checks: importing first makes `herd spawn -t typo` on
+    # 3.9 answer "needs Python 3.11+" — true, but not the caller's mistake.
     try:
         import tomllib
     except ModuleNotFoundError:
@@ -63,7 +59,8 @@ def load_template(name, *, dir=None):
             raise ValueError(f"template {name!r}: unknown key {k!r} "
                              f"(allowed: {', '.join(sorted(_KEY_FIELD))})")
         out[_KEY_FIELD[k]] = v
-    # light shape checks — a clear error beats a mysterious failure downstream.
+    # Shape checks: everything below guards a hand-written file against a downstream
+    # TypeError. `job = 42` otherwise reaches valid_job() as a raw traceback.
     if out.get("launch_type") not in (None, "tab", "pane"):
         raise ValueError(f"template {name!r}: type must be 'tab' or 'pane'")
     if "claude_args" in out and not (isinstance(out["claude_args"], list)
@@ -72,11 +69,6 @@ def load_template(name, *, dir=None):
     if "vars" in out and not (isinstance(out["vars"], dict)
                               and all(isinstance(v, str) for v in out["vars"].values())):
         raise ValueError(f"template {name!r}: [vars] must have string values")
-    # The string-typed keys were unchecked while args/vars were validated, so
-    # `job = 42` sailed through to valid_job() and raised TypeError: expected
-    # string or bytes-like object — a raw traceback out of `herd spawn`, from a
-    # file the user hand-wrote, which is the exact failure this validation exists
-    # to prevent. cmd_spawn catches ValueError only.
     for key, label in (("job", "job"), ("cwd", "cwd"),
                        ("title", "title"), ("prompt", "prompt")):
         if key in out and not isinstance(out[key], str):

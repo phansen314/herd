@@ -4,40 +4,29 @@
 # env), else W2b insert. Also captures claude's pid (ppid-walk) — only this
 # BLOCKING hook can. See DESIGN.md#per-hook-notes.
 #
-# ${BASH_SOURCE%/*} returns the string UNCHANGED with no dir component, which
-# would leave helpers undefined and make the hook a silent no-op. Fail loud
-# (exit 1, non-blocking); never exit 2 (blocks Claude).
+# ${BASH_SOURCE%/*} unchanged with no dir component -> silent no-op; fail loud.
+# Every hook exits 1 at worst, never 2 — exit 2 blocks Claude.
 __d="${BASH_SOURCE%/*}"; [ "$__d" = "${BASH_SOURCE}" ] && __d="."
 . "$__d/common.sh" || { echo "herd: cannot source $__d/common.sh" >&2; exit 1; }
 
 read_input      # see common.sh: NOT $(</dev/stdin), which Claude leaves empty
 
-# payload_read strips both newline forms AND the separator from every field, then
-# checks a sentinel — see common.sh. Four `read -r` over newline-delimited output
-# split on the first newline in ANY field, and cwd is an arbitrary path that may
-# legally contain one: `mkdir $'/tmp/we\nird'` and starting claude there stored
-# cwd=/tmp/we, model=ird/proj, transcript=<the model>. Permanent, too — this hook
-# fires ONCE per session, so nothing ever corrects the row.
-#
-# IFS=$'\x1f' inside the helper also fixes a quieter one: `read -r SID` strips
-# leading and trailing whitespace, so a cwd with a trailing space was stored wrong.
+# payload_read, as every hook does — see common.sh. cwd is an arbitrary path that
+# may legally contain a newline or a separator, and this hook fires ONCE per
+# session, so a shifted row is never corrected.
 payload_read '.session_id, .cwd, .model, .transcript_path' SID CWD MODEL TRANSCRIPT
 PARSE_OK=$?
 # .model is a STRING on hook payloads (an OBJECT on the statusline payload).
 
-# A shifted parse must NOT cost the session its row. This hook is the only thing
-# that creates one and the only thing that captures claude's pid, and it does not
-# fire again — so exiting here would make the session invisible to herd for its
-# entire life, which this file already argues is worse than an imperfect row ("an
-# unnamed-but-visible session beats a lost one", below). SID is field 1 and a shift
-# can only start at or after the field that carried the separator, so the identity
-# survives; drop the three values that cannot be trusted and record the rest.
+# A shifted parse must NOT cost the session its row: this hook alone creates it and
+# captures claude's pid, and it does not fire again, so exiting here loses the
+# session for its whole life. SID is field 1 and survives any shift; drop the three
+# untrusted values and record the rest.
 if [ "$PARSE_OK" -ne 0 ]; then
     herd_log "session_start: payload parse shifted (sentinel=[$HERD_PARSE_TAIL]) — cwd/model/transcript dropped"
-    # "?" and not "": bind() maps an EMPTY value to SQL NULL, and sessions.cwd is
-    # NOT NULL, so blanking it made W2b_insert fail the constraint and the session
-    # got no row at all — this guard failing closed in the exact way it exists to
-    # prevent. Verified. model and transcript_path are nullable, so they can go.
+    # "?" and not "": bind() maps EMPTY to SQL NULL and sessions.cwd is NOT NULL, so
+    # blanking it fails W2b_insert and the session gets no row at all. model and
+    # transcript_path are nullable.
     CWD="?"; MODEL=""; TRANSCRIPT=""
 fi
 
@@ -64,32 +53,26 @@ if [ -n "${KITTY_WINDOW_ID:-}" ] && [ -n "${KITTY_LISTEN_ON:-}" ]; then
     ADOPTED=$(run W2_adopt "SELECT changes();" 2>/dev/null); W2_RC=$?
 fi
 
-# Adoption by WINDOW missed, but this session knows which job it is. The window
-# stamp is written by W1_spawn_window AFTER kitten @ launch returns, and that write
-# can be stuck behind the WAL write lock for up to the 3s busy_timeout while this
-# claude is already starting — so "no row for my window" does not mean "no
-# reservation for me". Ask by name instead of creating a duplicate.
+# Adoption by WINDOW missed, but this session knows which job it is. W1_spawn_window
+# writes the window stamp AFTER kitten @ launch returns and can sit behind the WAL
+# write lock for the busy_timeout while this claude is already starting — so "no row
+# for my window" does not mean "no reservation for me". Ask by name.
 if [ "$ADOPTED" != "1" ] && [ "$W2_RC" -eq 0 ] && [ -n "${HERD_JOB:-}" ]; then
     ADOPTED=$(run W2_adopt_job "SELECT changes();" 2>/dev/null) || ADOPTED=0
     [ "$ADOPTED" = "1" ] && [ "$IN_KITTY" = "1" ] && run W2b_placement >/dev/null 2>&1
 fi
 
-# W2 FAILED (a locked DB is the common case) — "0 rows changed" and "we never
-# found out" are different answers, and only the first means "no row to adopt".
-# Falling through on a failure inserted a SECOND row for this window while the
-# spawn reservation kept the job_name, so the live session was left unnamed and
-# `herd jump <job>` could never find it again.
+# W2 FAILED (a locked DB is the common case) — "0 rows changed" and "we never found
+# out" are different answers, and only the first means "no row to adopt". Falling
+# through blindly inserts a SECOND row while the reservation keeps the job_name,
+# leaving the live session unnamed. Deferring blindly is just as bad: the
+# statusline's Path C only UPDATEs an existing reservation, so a user-started claude
+# (no row anywhere, and SessionStart never fires again) is lost for its whole life.
 #
-# But deferring unconditionally was worse than the bug it fixed. Path C only ever
-# UPDATEs an existing reservation, so it can rescue a SPAWNED session and nothing
-# else. For a user-started claude there is no row at all: W5_statusline matches
-# nothing, W5b_adopt has nothing to adopt, and SessionStart never fires again — so
-# one transient SQLITE_BUSY made that session invisible to herd for its entire life.
-#
-# So ask which situation this is. R_window_unadopted is a READ, and WAL readers do
-# not block on a writer, meaning it answers reliably in exactly the case that made
-# the write fail. A reservation exists -> defer, Path C has it. Nothing there ->
-# insert, because an unnamed-but-visible session beats a lost one.
+# So ask which situation this is. R_window_unadopted is a READ and WAL readers do
+# not block on a writer, so it answers reliably in exactly the case that made the
+# write fail. Reservation -> defer to Path C. Nothing -> insert, because an
+# unnamed-but-visible session beats a lost one.
 if [ "$W2_RC" -ne 0 ]; then
     DEFER=1
     if [ "$IN_KITTY" = "1" ]; then

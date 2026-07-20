@@ -7,14 +7,13 @@
 
 Hooks are COPIED to ~/.herd/hooks (with the SQL they read) and settings.json is
 wired there, so a git checkout in the source tree cannot change what running
-Claude sessions execute. `--dev` wires the checkout directly for hook development;
-`herd doctor` reports which mode is active and whether the copy has drifted.
+Claude sessions execute. `--dev` wires the checkout directly.
 
 Idempotent. Every edited file is backed up as <file>.herd-bak.<ts> before the
 first change, and once as <file>.herd-bak.original — the pre-herd copy uninstall
 restores. Nothing is written until the self-test passes; a FAIL aborts and exits
-nonzero. Reuses herd.db for the DB bootstrap. Leaves klawde's repo and
-~/.klawde/sessions.db (history) in place — only unwires it from settings.json.
+nonzero. Leaves klawde's repo and ~/.klawde/sessions.db in place — only unwires
+it from settings.json.
 """
 import json
 import os
@@ -42,32 +41,20 @@ DB = HERD_DIR / "herd.db"
 
 
 def config_path():
-    """Settings the daemon and the hooks BOTH read — see config.py. NOT in the unit:
-    a unit file is not a thing anyone edits, and the hooks cannot read one.
-
-    A FUNCTION, not a module constant, so it follows a patched HERD_DIR. As a
-    constant it was bound at import to the real ~/.herd/config and the installer
-    tests wrote there for real — the hazard the `home` fixture already names for
-    INSTALLED_HOOKS ("unpatched, the suite writes to the real ~/.herd"). Deriving it
-    at call time means one patch covers it instead of one patch per path."""
+    """Settings the daemon and the hooks BOTH read — see config.py. A FUNCTION, not
+    a module constant, so it follows a patched HERD_DIR."""
     return HERD_DIR / "config"
 
-# Where the hooks that actually RUN live, by default. Wiring settings.json at the
-# checkout makes every Claude session on the machine execute whatever is in the
-# working tree at that instant: a `git checkout`, stash or rebase silently changes
-# the behaviour of running sessions (this is how `no such statement: W4_event_log`
-# reached a live hook-errors.log), and moving the clone breaks all five hooks at
-# once. Installing a COPY decouples the two. `--dev` opts back into the checkout.
+# Where the hooks that actually RUN live. Wiring settings.json at the checkout
+# instead would make a checkout/stash/rebase silently change running sessions, and
+# moving the clone would break all five hooks. `--dev` opts into that.
 INSTALLED_HOOKS = HERD_DIR / "hooks"
 INSTALLED_SCHEMA = HERD_DIR / "schema"
 SERVICE = HOME / ".config" / "systemd" / "user" / "herd.service"
-# macOS has no systemd; the same daemon runs as a per-user LaunchAgent. Reverse-DNS
-# label to match the other tools in this account, and it doubles as the launchctl
-# handle (`launchctl print gui/$UID/com.codingzen.herd`).
+# macOS: same daemon as a LaunchAgent. The label doubles as the launchctl handle.
 LAUNCHD_LABEL = "com.codingzen.herd"
 PLIST = HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
-# launchd keeps no journal, so the daemon's own stderr is the only record of a
-# crash loop. Into ~/.herd, next to the DB it is failing to reap.
+# launchd keeps no journal — the daemon's stderr is the only record of a crash loop.
 DAEMON_OUT = HERD_DIR / "daemon.out.log"
 DAEMON_ERR = HERD_DIR / "daemon.err.log"
 CLI_SRC = REPO / "bin" / "herd"
@@ -75,9 +62,8 @@ CLI_LINK = HOME / ".local" / "bin" / "herd"
 COMPLETION_SRC = REPO / "completions" / "herd.bash"
 COMPLETION_LINK = HOME / ".local" / "share" / "bash-completion" / "completions" / "herd"
 
-# Both now live in settings.py, which doctor reads too — see the module docstring
-# there on why one definition matters. Re-exported because the tests and the rest of
-# this module address them here.
+# Defined in settings.py, which doctor reads too. Re-exported: tests and the rest
+# of this module address them here.
 HERD_HOOKS = _settings.HERD_HOOKS
 _OUR_SCRIPTS = _settings.OUR_SCRIPTS
 
@@ -85,7 +71,7 @@ STATUSLINE = str(INSTALLED_HOOKS / "statusline.sh")
 
 # systemctl can block on a busy/degraded manager; the installer must not hang.
 SYSTEMCTL_TIMEOUT = 15
-# launchctl blocks the same way when launchd is wedged. Same bound, same reason.
+# launchctl blocks the same way when launchd is wedged.
 LAUNCHCTL_TIMEOUT = 15
 # A wired hook that hangs would hang the self-test that exists to vet it.
 SELFTEST_TIMEOUT = 20
@@ -102,13 +88,12 @@ def statusline_cmd(hooks_dir=None):
 
 
 def _is_managed(cmd):
-    """Delegates to settings.is_managed — the definition doctor uses too. The roots
-    come from THIS module, so a test that redirects INSTALLED_HOOKS still works."""
+    """Delegates to settings.is_managed. The roots come from THIS module, so a test
+    that redirects INSTALLED_HOOKS still works."""
     return _settings.is_managed(cmd, (HOOKS_DIR, INSTALLED_HOOKS))
 
 
 def _ts():
-    # no Date.now() concerns here — this is a normal process; use the clock.
     import time
     return time.strftime("%Y%m%d-%H%M%S")
 
@@ -125,11 +110,8 @@ ORIGINAL_SUFFIX = ".herd-bak.original"
 
 
 def _is_wired(path, text):
-    """Does this file already point at herd? Cheap and textual on purpose — it only
-    has to distinguish 'pristine' from 'a previous herd install'.
-
-    BOTH roots, or a copy-mode install reads as pristine and overwrites the
-    pre-herd snapshot with a herd-wired one — the uninstall trap again."""
+    """Does this file already point at herd? BOTH roots, or a copy-mode install
+    reads as pristine and overwrites the pre-herd snapshot with a herd-wired one."""
     if not text:
         return False
     return str(HOOKS_DIR) in text or str(INSTALLED_HOOKS) in text
@@ -138,10 +120,8 @@ def _is_wired(path, text):
 def backup_original(path, text):
     """Snapshot the PRE-HERD file, exactly once, under a fixed name.
 
-    The timestamped backups are per-install safety nets and are useless for
-    uninstall: the second install backs up the already-wired file, so restoring the
-    newest one reinstates herd and reports success. This is the copy uninstall wants
-    and it is never overwritten — an already-wired file is not an original."""
+    The timestamped backups are useless for uninstall: the second install backs up
+    the already-wired file. This copy is never overwritten."""
     b = path.with_name(path.name + ORIGINAL_SUFFIX)
     if b.exists() or not path.exists() or _is_wired(path, text):
         return None
@@ -150,10 +130,9 @@ def backup_original(path, text):
 
 
 def _restore_source(path):
-    """The backup uninstall should restore: the pristine original when we have one,
-    else the OLDEST timestamped backup — on a pre-ORIGINAL_SUFFIX install that is
-    the one install #1 took, i.e. the last copy that predates herd. Returns None
-    when nothing usable exists."""
+    """The backup uninstall should restore: the pristine original if we have one,
+    else the OLDEST timestamped backup (on a pre-ORIGINAL_SUFFIX install, the last
+    copy that predates herd). None when nothing usable exists."""
     orig = path.with_name(path.name + ORIGINAL_SUFFIX)
     if orig.exists():
         return orig
@@ -163,18 +142,14 @@ def _restore_source(path):
 
 
 def _atomic_write(path, text):
-    """Write via tmp + rename in the same directory. settings.json is the one file
-    whose truncation stops Claude Code from starting, and write_text() truncates in
-    place — a crash or ENOSPC mid-write leaves unparseable JSON.
+    """Write via tmp + rename in the same directory. write_text() truncates in
+    place, and a crash mid-write to settings.json leaves JSON that stops Claude Code
+    from starting.
 
-    The REPLACEMENT INHERITS THE MODE OF WHAT IT REPLACES. os.replace swaps in a
-    file created by write_text(), i.e. 0o666 & ~umask, and the destination's own
-    mode is not carried across — so rewiring custom-status-line.sh dropped it from
-    0755 to 0664. Claude then execs a file it cannot execute and the statusline
-    silently disappears, which is the exact failure sync_hooks' chmod (+x, or the
-    hook is a silent no-op) and rewire_wrapper's parse check both exist to prevent;
-    this arrived by a third route. It also widened a 0600 settings.json — which
-    holds env vars and permission grants — to 0664."""
+    The REPLACEMENT INHERITS THE MODE OF WHAT IT REPLACES (the copymode below):
+    os.replace does not carry it across, so without that a 0755 wrapper becomes
+    0664 — Claude execs a file it cannot execute and the statusline silently
+    vanishes — and a 0600 settings.json widens to 0664."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + f".herd-tmp.{os.getpid()}")
     try:
@@ -188,31 +163,43 @@ def _atomic_write(path, text):
 
 
 # ── hook installation (copy, or point at the checkout with --dev) ──────────
-def sync_hooks(dev=False, dry=False):
-    """Put the hooks where they will be RUN from, and return that directory.
+def _copy_hook_tree(hooks_dst, schema_dst):
+    """Copy hooks + SQL into a {hooks,schema} pair and return the hooks dir.
 
-    Copies the SQL too, and that is not incidental: common.sh resolves
-    HERD_WRITES as <hooks>/../schema/writes.sql, so hooks installed without their
-    schema find no statements and every write path fails with "no such statement"
-    — a herd that records nothing while every hook still exits 0."""
+    The two must always be SIBLINGS: common.sh resolves HERD_WRITES as
+    <hooks>/../schema/writes.sql, so hooks installed without their schema fail every
+    write with "no such statement" while still exiting 0."""
+    hooks_dst.mkdir(parents=True, exist_ok=True)
+    schema_dst.mkdir(parents=True, exist_ok=True)
+    for src in sorted(HOOKS_DIR.glob("*.sh")):
+        dst = hooks_dst / src.name
+        shutil.copy2(src, dst)
+        dst.chmod(dst.stat().st_mode | 0o111)   # +x, or the hook is a silent no-op
+    for src in sorted(SCHEMA_DIR.glob("*.sql")):
+        shutil.copy2(src, schema_dst / src.name)
+    return hooks_dst
+
+
+def stage_hooks(root):
+    """Copy the hooks into a throwaway <root>/{hooks,schema} for the self-test.
+
+    The gate is only a gate if it runs on a copy nothing executes yet."""
+    root = pathlib.Path(root)
+    return _copy_hook_tree(root / "hooks", root / "schema")
+
+
+def sync_hooks(dev=False, dry=False):
+    """Put the hooks where they will be RUN from, and return that directory."""
     if dev:
         return HOOKS_DIR
     if dry:
         return INSTALLED_HOOKS
-    INSTALLED_HOOKS.mkdir(parents=True, exist_ok=True)
-    INSTALLED_SCHEMA.mkdir(parents=True, exist_ok=True)
-    for src in sorted(HOOKS_DIR.glob("*.sh")):
-        dst = INSTALLED_HOOKS / src.name
-        shutil.copy2(src, dst)
-        dst.chmod(dst.stat().st_mode | 0o111)   # +x, or the hook is a silent no-op
-    for src in sorted(SCHEMA_DIR.glob("*.sql")):
-        shutil.copy2(src, INSTALLED_SCHEMA / src.name)
-    return INSTALLED_HOOKS
+    return _copy_hook_tree(INSTALLED_HOOKS, INSTALLED_SCHEMA)
 
 
 def hooks_are_current(hooks_dir=None):
     """Do the installed copies match the checkout? False means the tree moved on
-    without a re-install — the cost of the copy, and what `herd doctor` reports."""
+    without a re-install — what `herd doctor` reports."""
     hooks_dir = hooks_dir or INSTALLED_HOOKS
     if hooks_dir == HOOKS_DIR:
         return True                              # --dev: the checkout IS the copy
@@ -234,10 +221,8 @@ def bootstrap_db(dry=False):
                 f"(+ templates dir, + {config_path()} if absent)")
     HERD_DIR.mkdir(parents=True, exist_ok=True)
     (HERD_DIR / "templates").mkdir(exist_ok=True)   # spawn presets (herd spawn -t)
-    # NEVER overwritten. This is a file the user edits, and it is the only channel
-    # that reaches the daemon AND the hooks — clobbering it on a re-install would
-    # silently restore a default that the reaper acts on (see config.py on
-    # HERD_CLAUDE_NAME). Written commented-out, so a fresh file changes nothing.
+    # NEVER overwritten: the user edits this. Written commented-out, so a fresh
+    # file changes nothing.
     cfg = config_path()
     if not cfg.exists():
         _atomic_write(cfg, herd_config.DEFAULT_TEXT)
@@ -249,12 +234,10 @@ def bootstrap_db(dry=False):
 
 
 # ── daemon service (reaper + attention) ────────────────────────────────────
-# The hooks are bash (run by absolute path); the daemon is python and runs from the
-# source tree with PYTHONPATH — no pip install needed, edits picked up on restart.
+# The daemon runs from the source tree with PYTHONPATH — no pip install needed.
 def _service_python():
-    """A ROBUST interpreter for the unit: prefer system python3 over whatever ran
-    the installer (often a pyenv shim that needs PATH/init a systemd unit won't have).
-    herd is stdlib-only, so any 3.9+ works."""
+    """Prefer system python3 over whatever ran the installer — often a pyenv shim
+    needing PATH a systemd unit won't have. herd is stdlib-only, any 3.9+."""
     for cand in ("/usr/bin/python3", "/usr/local/bin/python3"):
         if os.access(cand, os.X_OK):
             return cand
@@ -266,17 +249,13 @@ def _has_systemd_user():
 
 
 def _systemctl(*args):
-    """systemctl --user, never raising and never hanging. The Linux twin of
-    _launchctl, and it exists for the same reason: `check=False` suppresses only
-    CalledProcessError, while `timeout=` still RAISES TimeoutExpired — the one case
-    the bound is here for, a wedged/degraded manager. install() calls
-    install_service() *after* rewriting settings.json and the statusline wrapper, so
-    an escaping exception left the config changed, no daemon installed, and a
-    traceback where the summary should be. Four systemctl calls run per install, so
-    that was up to 60s of hang before the crash.
+    """systemctl --user, never raising and never hanging. Returns a CompletedProcess;
+    failures show as a nonzero returncode, so callers need no new branch.
 
-    A failure is reported the way a nonzero exit already is, so callers need no new
-    branch."""
+    `check=False` suppresses only CalledProcessError — `timeout=` still RAISES
+    TimeoutExpired, the case the bound exists for. install() runs install_service()
+    *after* rewriting settings.json, so an escaping exception leaves the config
+    changed and no daemon."""
     try:
         return subprocess.run(["systemctl", "--user", *args], check=False,
                               capture_output=True, text=True,
@@ -284,7 +263,7 @@ def _systemctl(*args):
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(
             args, 124, "", f"systemctl {args[0]} timed out after {SYSTEMCTL_TIMEOUT}s")
-    except OSError as e:                      # systemctl vanished mid-install, fork limit
+    except OSError as e:
         return subprocess.CompletedProcess(args, 127, "", f"systemctl: {e}")
 
 
@@ -302,22 +281,14 @@ def service_unit_text():
         "[Service]\n"
         "Type=simple\n"
         f"Environment=PYTHONPATH={PKG_SRC}\n"
-        # PYTHONPATH ONLY. The unit deliberately sets no herd setting, because a
-        # unit file is not a thing anyone edits and the hooks cannot read one — so
-        # anything named here is a value only half of herd can see, which is the
-        # divergence ~/.herd/config exists to end. HERD_DB used to be here and it
-        # WON over the file, making the one authoritative-looking setting silently
-        # not authoritative.
-        #
-        # Losing it costs nothing: daemon.DEFAULT_DB falls back to
-        # ~/.herd/herd.db, the same path this line named, and systemd --user does
-        # provide HOME (verified) so Path.home() resolves. To move the database,
-        # set HERD_DB in ~/.herd/config, where the hooks read it too.
+        # PYTHONPATH ONLY — no herd setting belongs here. The hooks cannot read a
+        # unit file, so anything named here is seen by half of herd and WINS over
+        # ~/.herd/config. Set HERD_DB there instead; daemon.DEFAULT_DB falls back to
+        # ~/.herd/herd.db and systemd --user does provide HOME.
         f"ExecStart={_service_python()} -m herd.daemon\n"
         # always, not on-failure: a clean exit still means nothing is reaping silent
-        # deaths. StartLimitIntervalSec=0 disables the burst limit — a persistent
-        # fault (corrupt DB, full disk) must keep retrying rather than latch the
-        # unit into `failed`, where the only symptom is sessions that never leave.
+        # deaths. With StartLimitIntervalSec=0 above, a persistent fault keeps
+        # retrying instead of latching into `failed`.
         "Restart=always\n"
         "RestartSec=5\n\n"
         "[Install]\n"
@@ -326,57 +297,41 @@ def service_unit_text():
 
 
 def _has_launchd():
-    """macOS. `launchctl` alone is not enough — checking the platform too keeps a
-    stray binary on a Linux box from routing the install away from systemd."""
+    """macOS. Check the platform too, or a stray `launchctl` on a Linux box routes
+    the install away from systemd."""
     return sys.platform == "darwin" and bool(shutil.which("launchctl"))
 
 
 def plist_text():
     """The launchd LaunchAgent, as XML. Pure — testable without touching launchd.
+    The macOS half of service_unit_text(); the two must stay behaviourally equal.
 
-    The macOS half of service_unit_text(); the two must stay behaviourally equal,
-    so the reasoning below deliberately mirrors the [Service] block's.
-
-    Built with plistlib rather than a format string: HOME is user-controlled and
-    lands in five of these values, and a path holding & or < would emit XML that
-    launchd rejects with nothing more useful than "Bootstrap failed: 5".
+    plistlib rather than a format string: HOME is user-controlled and lands in five
+    of these values, and a path holding & or < emits XML launchd rejects with only
+    "Bootstrap failed: 5".
     """
     return plistlib.dumps({
         "Label": LAUNCHD_LABEL,
         "ProgramArguments": [_service_python(), "-m", "herd.daemon"],
         "EnvironmentVariables": {"PYTHONPATH": str(PKG_SRC), "HERD_DB": str(DB)},
         "RunAtLoad": True,
-        # Plain true, NOT {"SuccessfulExit": False}: like Restart=always, and for
-        # the same reason. A CLEAN exit still leaves nothing reaping silent deaths,
-        # and the only symptom is sessions that never leave `herd ls` — so restart
-        # on exit 0 too.
+        # Plain true, NOT {"SuccessfulExit": False} — the Restart=always half:
+        # restart on exit 0 too.
         "KeepAlive": True,
-        # launchd's default throttle is 10s; 5 to match RestartSec=5. There is no
-        # burst limit to disable (the systemd StartLimitIntervalSec=0 half) —
-        # launchd throttles indefinitely and never latches into a failed state,
-        # which is the behavior that setting was chosen to get.
+        # launchd's default throttle is 10s; 5 to match RestartSec=5. No burst limit
+        # to disable — launchd throttles indefinitely and never latches into failed.
         "ThrottleInterval": 5,
-        # No ProcessType. It defaults to Standard; "Background" reads right for a
-        # daemon but opts into CPU/IO throttling, and a throttled reaper shows up
-        # as exactly the stale `herd ls` this service exists to prevent.
+        # No ProcessType (defaults to Standard). "Background" opts into CPU/IO
+        # throttling, and a throttled reaper is the stale `herd ls` this prevents.
         "StandardOutPath": str(DAEMON_OUT),
         "StandardErrorPath": str(DAEMON_ERR),
     }).decode()
 
 
 def _launchctl(*args):
-    """launchctl, never raising and never hanging. Returns a CompletedProcess.
-
-    `check=False` only suppresses CalledProcessError — `timeout=` still RAISES
-    TimeoutExpired, which is the one case this bound exists for: a wedged launchd.
-    install() calls install_service() *after* rewriting settings.json and the
-    statusline wrapper, so an escaping exception left the config changed, no daemon
-    installed, and a traceback where the summary should be. Up to five launchctl
-    calls run per install, so that was up to 75s of hang before the crash.
-
-    A failure is reported the way a nonzero exit already is, so every caller's
-    `returncode != 0` handling covers it with no new branch.
-    """
+    """launchctl, never raising and never hanging. The macOS twin of _systemctl —
+    same bound, same reason. Returns a CompletedProcess; failures show as a nonzero
+    returncode."""
     try:
         return subprocess.run(["launchctl", *args], check=False,
                               capture_output=True, text=True,
@@ -384,7 +339,7 @@ def _launchctl(*args):
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(
             args, 124, "", f"launchctl {args[0]} timed out after {LAUNCHCTL_TIMEOUT}s")
-    except OSError as e:                      # launchctl vanished mid-install, fork limit
+    except OSError as e:
         return subprocess.CompletedProcess(args, 127, "", f"launchctl: {e}")
 
 
@@ -399,22 +354,20 @@ def install_launchd(dry=False):
     PLIST.parent.mkdir(parents=True, exist_ok=True)
     HERD_DIR.mkdir(parents=True, exist_ok=True)          # StandardOut/ErrPath's dir
     PLIST.write_text(plist_text())
-    # bootout first so a rewritten plist is actually re-read: bootstrap on an
-    # already-loaded label fails with EEXIST and would silently leave the OLD
-    # definition running. Failure here just means "wasn't loaded" — expected on a
-    # first install, so the result is ignored.
+    # bootout first so a rewritten plist is re-read: bootstrap on an already-loaded
+    # label fails with EEXIST and silently leaves the OLD definition running.
+    # Failure here just means "wasn't loaded", expected on a first install.
     _launchctl("bootout", f"{_gui_target()}/{LAUNCHD_LABEL}")
     r = _launchctl("bootstrap", _gui_target(), str(PLIST))
     if r.returncode != 0:
-        # bootstrap/bootout are 10.11+. Fall back to the deprecated verbs rather
-        # than fail the install on an older macOS.
+        # bootstrap/bootout are 10.11+; fall back to the deprecated verbs.
         _launchctl("unload", str(PLIST))
         r = _launchctl("load", "-w", str(PLIST))
         if r.returncode != 0:
             return (f"LaunchAgent written to {PLIST} but load FAILED "
                     f"({(r.stderr or r.stdout).strip() or f'rc={r.returncode}'}) — "
                     f"load it yourself: launchctl bootstrap {_gui_target()} {PLIST}")
-    # RunAtLoad has started it by now; report what launchd actually thinks.
+    # RunAtLoad has started it by now; report what launchd thinks.
     printed = _launchctl("print", f"{_gui_target()}/{LAUNCHD_LABEL}").stdout
     m = re.search(r"^\s*pid = (\d+)", printed, re.M)
     state = f"running (pid {m.group(1)})" if m else "loaded"
@@ -423,8 +376,7 @@ def install_launchd(dry=False):
 
 def install_service(dry=False):
     """Write + enable + (re)start the daemon unit. Idempotent. systemd --user on
-    Linux, a launchd LaunchAgent on macOS. Graceful no-op where neither exists
-    (headless/containers) — herd still works, just run the daemon yourself."""
+    Linux, a LaunchAgent on macOS, a no-op where neither exists."""
     if not _has_systemd_user():
         if _has_launchd():
             return install_launchd(dry)
@@ -444,7 +396,7 @@ def uninstall_launchd():
     if not PLIST.exists():
         return "no LaunchAgent to remove"
     _launchctl("bootout", f"{_gui_target()}/{LAUNCHD_LABEL}")
-    _launchctl("unload", str(PLIST))       # pre-10.11 fallback; a no-op after bootout
+    _launchctl("unload", str(PLIST))       # pre-10.11 fallback; no-op after bootout
     PLIST.unlink(missing_ok=True)
     return f"removed {PLIST}"
 
@@ -466,11 +418,8 @@ def uninstall_service():
 def _relink(link, target, ts=None):
     """Idempotently point `link` at `target` (symlink). mkdir parents.
 
-    A REAL FILE at the link path gets backed up first. This used to unlink
-    whatever it found, so an unrelated ~/.local/bin/herd of your own was destroyed
-    with no copy kept — and uninstall_cli() could not put it back, since it
-    (correctly) only removes symlinks resolving to our own target. Every other
-    path in this installer backs up before overwriting; this one didn't."""
+    A REAL FILE at the link path is backed up first — uninstall_cli() only removes
+    symlinks resolving to our own target, so it cannot put one back."""
     link.parent.mkdir(parents=True, exist_ok=True)
     if link.is_symlink():
         link.unlink()                       # a symlink carries nothing to preserve
@@ -508,12 +457,11 @@ def uninstall_cli():
 
 
 # ── optional: Claude terminal-bell notifications (kitty tab bell) ───────────
-# herd does NOT own this — it's a Claude-level, terminal-specific preference. So
-# the installer OFFERS it (interactive, opt-in, defaults to no) and never forces it:
-# on a non-tty it just prints a tip, and it never overrides an existing choice.
+# herd does NOT own this — a Claude-level, terminal-specific preference. Offered
+# only: opt-in, a tip on a non-tty, and never overriding an existing choice.
 def _bell_decision(current, answer):
     """Pure: the channel to set, or None to leave unchanged. Respects any existing
-    preferredNotifChannel; otherwise sets terminal_bell only on an affirmative."""
+    preferredNotifChannel."""
     if current:
         return None
     return "terminal_bell" if answer.strip().lower() in ("y", "yes") else None
@@ -539,15 +487,14 @@ def _offer_bell(new_settings):
 
 # ── kitty.conf: remote control, the one thing herd needs and cannot see ────
 # The only file herd writes that it does not own. Hence: opt-in, marker-delimited,
-# backed up, and removed again by --uninstall. It is offered at all because without
-# these two options herd records an empty placement for every session and spawn /
-# jump cannot work — and nothing about that failure points at kitty.conf.
+# backed up, removed again by --uninstall. Offered at all because without these two
+# options herd records an empty placement for every session and spawn/jump cannot
+# work — and nothing about that failure points here.
 def _kitty_decision(state, has_block, answer):
     """Pure: should we write the block? Only when we KNOW it is missing (in kitty,
-    no socket) and herd has not already added it. `not-kitty` never writes — we
-    cannot see the config from outside kitty, and appending on a guess would edit a
-    working file. `ready` never writes: the options are already on, however they got
-    there, and a duplicate block is noise at best."""
+    no socket) and herd has not already added it. `not-kitty` never writes — from
+    outside kitty we cannot see the config, and appending on a guess edits a working
+    file. `ready` never writes: the options are already on."""
     from herd.kitty import config
     if state != config.OFF or has_block:
         return False
@@ -555,8 +502,8 @@ def _kitty_decision(state, has_block, answer):
 
 
 def _kitty_tip(lead="kitty remote control is OFF"):
-    """The advice, with a caller-supplied opening clause — the decline path already
-    says "skipped", and stacking both read as two sentences arguing with each other."""
+    """The advice, with a caller-supplied opening clause (the decline path already
+    says "skipped")."""
     from herd.kitty import config
     return (f"{lead} — herd will record no window for any session and\n"
             f"    spawn/jump cannot work. Add to {config.KITTY_CONF}:\n"
@@ -577,8 +524,7 @@ def _offer_kitty(dry=False, environ=None, answer=None):
         return f"kitty remote control block already in {config.KITTY_CONF.name} — " \
                f"{config.RESTART}"
     if state == config.NOT_KITTY:
-        # Not a prompt: outside kitty we cannot tell a missing config from a fine
-        # one, and this installer runs plenty of places that are not a terminal.
+        # Not a prompt: outside kitty a missing config and a fine one look alike.
         return ("kitty not detected — if you use kitty, see README (kitty setup); "
                 "`herd doctor` in a kitty window checks it")
     if dry:
@@ -598,8 +544,7 @@ def _offer_kitty(dry=False, environ=None, answer=None):
 
 
 def _uninstall_kitty(ts):
-    """Remove herd's block. A kitty.conf herd never touched is left byte-identical —
-    this must not be the thing that reformats someone's terminal config."""
+    """Remove herd's block. A kitty.conf herd never touched is left byte-identical."""
     from herd.kitty import config
     if not config.KITTY_CONF.exists():
         return "no kitty.conf to clean"
@@ -613,8 +558,8 @@ def _uninstall_kitty(ts):
 
 # ── settings.json surgery ──────────────────────────────────────────────────
 def _statusline_cmd(data):
-    """Delegates to settings.statusline_command, which also survives a statusLine
-    that is a string or a list — this copy did not."""
+    """Delegates to settings.statusline_command, which survives a statusLine that is
+    a string or a list."""
     return _settings.statusline_command(data)
 
 
@@ -626,11 +571,9 @@ def statusline_plan(data, wrapper_exists, hooks_dir=None):
     'set'     — absent, klawde's, or already ours: wire herd's statusline directly.
     'foreign' — someone else's statusline. Never clobber it; say so instead.
 
-    Pure, so install() can report it without re-deriving the decision. The 'set'
-    case is the one that used to be missing entirely: statusline wiring happened
-    ONLY through the wrapper, so a machine without one (anybody who wasn't already
-    a klawde user) got no statusline at all while install still printed PASS —
-    and statusline.sh is the only writer of every metric column."""
+    Pure, so install() can report it without re-deriving the decision. 'set' must
+    stay: without it, wiring happens only through the wrapper, so a machine with no
+    wrapper gets no statusline — and statusline.sh writes every metric column."""
     sl = statusline_cmd(hooks_dir)
     cmd = _statusline_cmd(data)
     if not cmd or cmd == sl or "/.klawde/" in cmd:
@@ -641,8 +584,8 @@ def statusline_plan(data, wrapper_exists, hooks_dir=None):
 
 
 def _strip_managed(hooks):
-    """Delegates to settings.strip_managed. That copy is shape-tolerant; this one
-    raised AttributeError on a hand-edited settings.json."""
+    """Delegates to settings.strip_managed, which is tolerant of the shapes a
+    hand-edited settings.json can hold."""
     _settings.strip_managed(hooks, (HOOKS_DIR, INSTALLED_HOOKS))
 
 
@@ -675,27 +618,23 @@ def rewire_settings(data, wrapper_exists=False, hooks_dir=None):
 
 def unwire_settings(data, original=None):
     """Return a NEW settings dict with herd's edits REVERSED. Pure — the mirror of
-    rewire_settings: same strip, no re-add.
+    rewire_settings: same strip, no re-add. Reversing the edits rather than
+    restoring the pre-herd snapshot is the point: every permission grant, MCP server
+    and foreign hook added since the install is carried through untouched.
 
-    Reversing the edits, rather than restoring the pre-herd snapshot wholesale, is
-    the point. Uninstall used to write a months-old copy over the live file, so
-    every permission grant, MCP server and foreign hook added since the install was
-    reverted with it — and no backup was taken, so it was gone. Anything herd does
-    not own is carried through here untouched.
-
-    `original` is the pre-herd settings dict when one survives. It is consulted for
-    exactly ONE thing: what statusLine said before we set it. Nothing else is taken
-    from it, because nothing else in it is more current than what is on disk now."""
+    `original` is the pre-herd settings dict when one survives, consulted for
+    exactly ONE thing: what statusLine said before we set it. Nothing else in it is
+    more current than what is on disk now."""
     data = json.loads(json.dumps(data))          # deep copy
     hooks = data.setdefault("hooks", {})
     _strip_managed(hooks)
     if not hooks:
         del data["hooks"]            # we may have just created it; leave no residue
 
-    # statusLine: only ours to touch. _is_managed is the same ownership test
-    # install used to decide it could claim the key (klawde's counted as ours),
-    # so the two stay symmetric. 'foreign' and wrapper-pointing values fail it and
-    # are left exactly as found — install did not write them either.
+    # statusLine: only ours to touch. _is_managed is the SAME ownership test install
+    # used to claim the key, so the two stay symmetric — 'foreign' and
+    # wrapper-pointing values fail it and are left as found, since install did not
+    # write them either.
     if _is_managed(_statusline_cmd(data)):
         prev = (original or {}).get("statusLine")
         if prev is not None:
@@ -703,43 +642,30 @@ def unwire_settings(data, original=None):
         else:
             data.pop("statusLine", None)         # the key was ours to add
 
-    # preferredNotifChannel is deliberately LEFT. _offer_bell never overwrites an
-    # existing value, so herd's opt-in and the user's own choice are the same two
-    # bytes on disk — indistinguishable here. Deleting a real preference is the
-    # worse error, so uninstall names the key instead and lets the user decide.
+    # preferredNotifChannel is deliberately LEFT: _offer_bell never overwrites an
+    # existing value, so herd's opt-in and the user's own choice are indistinguishable
+    # here. Uninstall names the key instead and lets the user decide.
     return data
 
 
 # ── statusline wrapper ─────────────────────────────────────────────────────
 # The invocation token on a wrapper line: a quoted or bare path ending in
-# statusline.sh. Substituting just this token keeps the REST of the line — the
-# whole line used to be replaced by the path alone, silently dropping `exec`,
-# `"$@"`, redirects and anything chained after it. A wrapper written as
-# `exec "$HOME/.klawde/statusline.sh" "$@"` lost both exec and its arguments.
+# statusline.sh. Only the TOKEN is substituted, so the rest of the line survives —
+# replacing the whole line drops `exec`, `"$@"`, redirects and anything chained.
 #
-# The basename must be EXACTLY statusline.sh — `/statusline\.sh`, not a bare
-# suffix. A composed wrapper chains OTHER tools' statuslines, and matching the
-# suffix claimed them: the caveman plugin's `caveman-statusline.sh` looked like
-# herd's own invocation and got rewritten to point at herd.
+# Three constraints. Breaking any of them yields a bash syntax error, and a wrapper
+# that cannot parse prints NOTHING — the statusline vanishes with no log anywhere:
 #
-# The bare alternative also excludes `=`, so it cannot start before one. It was
-# `\S*statusline\.sh`, which has no left boundary, so on
-#     CAVEMAN_SL="$HOME/.../caveman-statusline.sh"
-# it matched from column 0 — the assignment, the opening quote and the path are
-# one unbroken run of non-space — and replaced the lot with a quoted herd path,
-# leaving a stray `"` behind. That is a bash SYNTAX ERROR, so the wrapper emitted
-# nothing at all and the statusline silently vanished from every session.
-#
-# `$( … )` MUST be part of the token, in both the quoted and bare forms. The
-# first fix for the above still broke the commonest wrapper idiom there is:
-#     exec "$(dirname "$0")/statusline.sh" "$@"
-# The quoted alternative anchored on the INNER quotes — it matched `")/statusline.sh"`,
-# the run from the closing quote of `"$0"` — and ate the `)` that closed the
-# substitution. Same syntax error, same silent disappearance, different idiom.
-# So a command substitution is matched as a unit (and may contain quotes), which
-# also stops the quoted alternative from starting mid-string on a line like
-#     echo "hi" ; exec "$SL/statusline.sh"
-# where a naive non-greedy `"..."` would swallow `hi" ; exec "`.
+#  1. The basename must be EXACTLY statusline.sh (`/statusline\.sh`, never a bare
+#     suffix), or a composed wrapper's other tools get claimed — e.g.
+#     `caveman-statusline.sh`.
+#  2. The bare alternative excludes `=`, giving it a left boundary. Without one,
+#     `SL="$HOME/.../statusline.sh"` matches from column 0 (assignment, quote and
+#     path are one unbroken non-space run) and leaves a stray `"`.
+#  3. `$( … )` must match as a UNIT in both forms, or on
+#     `exec "$(dirname "$0")/statusline.sh" "$@"` the quoted alternative anchors on
+#     the INNER quotes and eats the `)`. It also stops the quoted form starting
+#     mid-string on `echo "hi" ; exec "$SL/statusline.sh"`.
 _SUBST = r'\$\((?:[^()"\n]|"[^"\n]*")*\)'          # $( … ), quotes allowed inside
 _SL_TOKEN = re.compile(
     rf'"(?:{_SUBST}|[^"\n])*/statusline\.sh"'      # "…/statusline.sh"
@@ -774,16 +700,12 @@ def rewire_wrapper(text, hooks_dir=None):
     """Point the wrapper's statusline invocation at herd's, leaving the rest of
     each line intact. Idempotent.
 
-    Comment lines are skipped: rewriting inside `#` changes nothing executable, but
-    it still reported replaced=True, so the installer claimed to have wired a
-    wrapper it had not.
+    Comment lines are skipped: rewriting inside `#` changes nothing executable but
+    would still report replaced=True.
 
-    THE PARSE CHECK IS THE POINT. Twice now a regex that looked right has turned a
-    working wrapper into a bash syntax error, and the blast radius is the same both
-    times: a syntax error prints NOTHING, so the statusline silently disappears from
-    every running session with nothing in any log to explain it. Rather than trust
-    the third regex, refuse to hand back a wrapper that does not parse when the one
-    we were given did. The caller then leaves the file alone and says so.
+    THE PARSE CHECK IS THE POINT — never trust the regex. If our rewrite fails to
+    parse and the input did, hand back the input unchanged; the caller leaves the
+    file alone and says so.
     """
     sl = statusline_cmd(hooks_dir)
     out = []
@@ -804,10 +726,9 @@ def unwire_wrapper(text, original_text):
     """Point the wrapper's statusline invocation back at whatever it named before
     herd. Returns (text, changed). Pure — the mirror of rewire_wrapper.
 
-    It needs the pre-herd text because the original token is the one thing the
-    rewired file no longer records. Without a usable original we change NOTHING and
-    say so: a wrapper pointed at a path we invented is worse than one still pointed
-    at herd, which the user can see and edit."""
+    Needs the pre-herd text: the original token is the one thing the rewired file no
+    longer records. Without a usable original, change NOTHING — a wrapper pointed at
+    a path we invented is worse than one still pointed at herd."""
     if not original_text:
         return text, False
     m = _SL_TOKEN.search(original_text)
@@ -827,13 +748,11 @@ def unwire_wrapper(text, original_text):
 
 # ── self-test: run the WIRED hook against a temp DB ────────────────────────
 def selftest(hooks_dir=None):
-    """Prove the wired hooks actually write, using a throwaway DB so the real one
-    is untouched.
+    """Prove the wired hooks actually write, using a throwaway DB.
 
     Invokes each script the way PRODUCTION does — directly, NOT via `bash <path>`.
-    That distinction is the whole point: settings.json and the statusline wrapper
-    exec these paths, so a missing +x is a silent no-op. Running them through
-    `bash` here would mask exactly the bug that shipped a blank statusline.
+    settings.json and the wrapper exec these paths, so a missing +x is a silent
+    no-op that running them through `bash` here would mask.
     """
     # session_id must satisfy valid_sid() — alphanumerics + hyphens only.
     SID = "herd-selftest-0000-4000-8000-000000000001"
@@ -848,6 +767,18 @@ def selftest(hooks_dir=None):
         if not_exec:
             return False, {"not_executable": not_exec}
 
+        # PARSE EVERY SCRIPT — the exec path below only runs session_start.sh and
+        # statusline.sh, so without this a stop.sh with a syntax error passes the
+        # gate. A hook that cannot parse silently does nothing.
+        unparseable = {}
+        for p in sorted(hd.glob("*.sh")):
+            r = subprocess.run(["bash", "-n", str(p)], capture_output=True,
+                               text=True, timeout=SELFTEST_TIMEOUT)
+            if r.returncode != 0:
+                unparseable[p.name] = r.stderr.strip().splitlines()[-1:] or ["?"]
+        if unparseable:
+            return False, {"syntax_error": unparseable}
+
         try:
             subprocess.run([hook_cmd("session_start.sh", hd)],      # direct exec
                            input=f'{{"session_id":"{SID}","cwd":"/x","model":"m","source":"startup"}}',
@@ -859,9 +790,7 @@ def selftest(hooks_dir=None):
                                 capture_output=True, text=True, env=env,
                                 timeout=SELFTEST_TIMEOUT)
         except subprocess.TimeoutExpired as e:
-            # A hook that hangs is a FAIL, not a hung installer — and since the
-            # self-test now gates the write, this is the difference between
-            # refusing to wire a hanging hook and wedging on it.
+            # A hook that hangs is a FAIL, not a hung installer.
             return False, {"timed_out": e.cmd[0] if e.cmd else "?"}
         c = connect(f"{tmp}/t.db", create=True)
         row = c.execute("SELECT status, context_percent FROM sessions "
@@ -879,21 +808,22 @@ def install(dry=False, dev=False):
     print(f"herd install  (ts={ts}{', DEV' if dev else ''})\n")
     print("  " + bootstrap_db(dry))
 
-    hooks_dir = sync_hooks(dev=dev, dry=dry)
+    # NOTHING IS COPIED YET on the real path. hooks_dir names where the hooks WILL
+    # run from so the settings/wrapper plan can be built against it; the copy is
+    # deferred until the self-test below passes.
+    hooks_dir = sync_hooks(dev=dev, dry=True) if not dev else sync_hooks(dev=True)
     if dev:
         print(f"  hooks: WIRED TO THE CHECKOUT {hooks_dir}")
         print("     --dev: a git checkout/stash changes what running sessions execute.")
+    elif dry:
+        print(f"  would copy hooks + schema -> {hooks_dir}")
     else:
-        print(f"  {'would copy' if dry else 'copied'} hooks + schema -> {hooks_dir}")
+        print(f"  will copy hooks + schema -> {hooks_dir} (after the self-test passes)")
 
-    # A first-time machine may have no settings.json at all — treat that as empty
-    # rather than a traceback. rewire_settings() setdefaults "hooks", backup()
-    # no-ops on a missing file, so the absent case needs no other special-casing.
-    # NOT a bare json.loads. A truncated or hand-broken settings.json raised
-    # JSONDecodeError straight out of install(), and a mode-000 one PermissionError
-    # — a stack trace from the command you run precisely BECAUSE your config is
-    # broken. _uninstall_settings has always caught both and said something useful;
-    # this end of the module did not.
+    # No settings.json is just empty: rewire_settings() setdefaults "hooks" and
+    # backup() no-ops on a missing file. NOT a bare json.loads — a truncated or
+    # mode-000 file must not traceback out of the command you run BECAUSE your
+    # config is broken.
     settings = {}
     if SETTINGS.exists():
         try:
@@ -903,15 +833,14 @@ def install(dry=False, dev=False):
             print("  fix the file (or move it aside) and re-run; nothing was changed.")
             return 2
     if not isinstance(settings, dict):
-        # A settings.json that is a list or a string parses fine and is not a
-        # settings file. Wiring into it would produce something Claude cannot read.
+        # A list or a string parses fine and is not a settings file; wiring into it
+        # produces something Claude cannot read.
         print(f"herd install: {SETTINGS} is not a JSON object — nothing was changed.")
         return 2
     if "hooks" in settings and not isinstance(settings["hooks"], dict):
-        # rewire_settings does hooks.setdefault(event, ...), which is an
-        # AttributeError on a list. Refusing is right rather than coercing: `hooks`
-        # holding something unexpected is a file herd did not write and does not
-        # understand, and replacing it with {} would delete whatever the user meant.
+        # rewire_settings does hooks.setdefault(event, ...) — AttributeError on a
+        # list. Refuse rather than coerce: replacing it with {} deletes whatever the
+        # user meant.
         print(f"herd install: {SETTINGS} has a `hooks` key that is not an object "
               f"({type(settings['hooks']).__name__}) — nothing was changed.")
         return 2
@@ -944,30 +873,35 @@ def install(dry=False, dev=False):
             print(f"    {e}: {cmds}")
         return
 
-    # GATE THE WRITE. selftest execs the hooks on disk against a throwaway DB — it
-    # depends on nothing we are about to write, so it can run first. Running it
-    # afterwards (as this used to) meant a provably broken set of hooks was already
-    # wired into the user's global config by the time we found out.
-    ok, row = selftest(hooks_dir)
-    print(f"\n  self-test (wired hooks -> temp DB): {'PASS' if ok else 'FAIL'}  {row}")
+    # GATE THE WRITE — on a STAGED copy. settings.json already points at
+    # ~/.herd/hooks/, so copying there and THEN self-testing puts broken hooks live
+    # in every running session before the "ABORTED" line prints; the wiring never
+    # has to change for the damage to land. So: copy into a temp {hooks,schema}
+    # pair, exec THAT, promote only on PASS. --dev runs the checkout by definition,
+    # so there is nothing to stage.
+    if dev:
+        ok, row = selftest(hooks_dir)
+    else:
+        with tempfile.TemporaryDirectory(prefix="herd-staging-") as staging:
+            ok, row = selftest(stage_hooks(staging))
+    print(f"\n  self-test (staged hooks -> temp DB): {'PASS' if ok else 'FAIL'}  {row}")
     if not ok:
-        print("\n  ABORTED — nothing was rewired. The hooks do not work as installed;")
-        print("  wiring them would have broken every Claude session silently.")
+        print("\n  ABORTED — nothing was rewired and nothing was copied. The hooks do")
+        print("  not work as installed; wiring them would have broken every Claude")
+        print("  session silently. The hooks already on disk are untouched.")
         return 1
 
+    if not dev:
+        sync_hooks()                    # PROMOTE: the staged copy passed
+        print(f"  copied hooks + schema -> {hooks_dir}")
+
     had_bell = "preferredNotifChannel" in new_settings
-    bell_note = _offer_bell(new_settings)   # interactive opt-in; may set the key before we write
-    # Re-read: _offer_bell blocks on input(), and Claude Code writes settings.json
-    # (permission grants) while we wait. Merging onto the on-disk copy at write time
-    # keeps a grant made during the prompt from being clobbered by our stale read.
-    #
-    # Merge ONLY the keys herd owns, onto the fresh copy. `fresh.update(new_settings)`
-    # did the reverse of what this comment promises: update() replaces whole top-level
-    # VALUES, so a `permissions` key that already existed at our stale read was
-    # overwritten wholesale by the stale value — clobbering exactly the grant this
-    # re-read exists to preserve. Only brand-new keys survived it. statusLine is ours
-    # only when the plan said 'set'; on 'wrapper'/'foreign' rewire_settings left it
-    # alone and copying it here would push a stale value back over a fresh one.
+    bell_note = _offer_bell(new_settings)   # interactive; may set the key
+    # _offer_bell blocks on input() and Claude Code writes settings.json (permission
+    # grants) while we wait, so re-read and merge ONLY the keys herd owns onto the
+    # fresh copy — NOT `fresh.update(new_settings)`, which replaces whole top-level
+    # values and puts our stale `permissions` back over the fresh one. statusLine is
+    # ours only when the plan said 'set'.
     owned = ["hooks"]
     if plan == "set":
         owned.append("statusLine")
@@ -981,19 +915,16 @@ def install(dry=False, dev=False):
                     fresh[k] = new_settings[k]
             new_settings = fresh
         except (OSError, json.JSONDecodeError):
-            pass                                # unreadable now — go with what we built
+            pass                                # unreadable — go with what we built
     backup_original(SETTINGS, SETTINGS.read_text() if SETTINGS.exists() else "")
     backup(SETTINGS, ts)
     _atomic_write(SETTINGS, json.dumps(new_settings, indent=2) + "\n")
     print(f"  rewired {SETTINGS} (backup: *.herd-bak.{ts})")
     print(f"  {sl_note}")
     if WRAPPER.exists():
-        # wrap_ok, not WRAPPER.exists(). This wrote and printed "rewired"
-        # unconditionally, so it claimed success in the two cases that matter: the
-        # wrapper names no statusline at all, and rewire_wrapper's parse check
-        # REFUSED the rewrite to avoid handing back a bash syntax error. In both,
-        # wrapper_text IS the input text — there is nothing to write, and a backup
-        # of an unchanged file is noise.
+        # wrap_ok, not WRAPPER.exists(): the wrapper may name no statusline at all,
+        # or rewire_wrapper's parse check may have REFUSED the rewrite. In both
+        # wrapper_text IS the input — nothing to write, and no backup to take.
         if wrap_ok:
             backup_original(WRAPPER, WRAPPER.read_text())
             backup(WRAPPER, ts)
@@ -1018,7 +949,7 @@ def install(dry=False, dev=False):
 
 def _revert_to_original(path, ts):
     """--restore-original: put the pre-herd snapshot back, wholesale. Backs up the
-    live file first — that omission is what made this path destructive."""
+    live file first — without that this path is destructive."""
     ref = _restore_source(path)
     if not ref:
         print(f"  NO PRE-HERD BACKUP for {path} — left as-is, edit it by hand")
@@ -1089,14 +1020,11 @@ def _uninstall_wrapper(ts, restore_original):
 def uninstall(restore_original=False):
     """Reverse herd's edits to each file it wired, + remove service & CLI.
 
-    Default is SURGICAL: strip what herd owns from the live file and leave the rest.
-    --restore-original is the old wholesale revert to the pre-herd snapshot, kept as
-    an escape hatch for a settings.json this cannot parse.
-
-    Both paths back the file up before writing. Neither used to, and that was the
-    bug: the wholesale revert wrote a months-old snapshot over the live file with no
-    copy kept, so a month of permission grants, MCP servers and foreign hooks was
-    unrecoverable."""
+    Default is SURGICAL: strip what herd owns from the live file, leave the rest.
+    --restore-original is the wholesale revert to the pre-herd snapshot, an escape
+    hatch for a settings.json this cannot parse. Both paths back the file up first —
+    without that the wholesale revert drops a months-old snapshot over the live
+    file with no copy kept."""
     print("  " + uninstall_service())
     print("  " + uninstall_cli())
     ts = _ts()
@@ -1105,8 +1033,7 @@ def uninstall(restore_original=False):
     return rc | _uninstall_wrapper(ts, restore_original)
 
 
-# Every flag main() understands. An argv token outside this set is a TYPO, and the
-# only safe reading of a typo on this command is "do nothing" — see main().
+# Every flag main() understands. Anything outside this set is a TYPO — see main().
 _FLAGS = {"--uninstall", "--restore-original", "--dry-run", "--dev", "--help", "-h"}
 
 USAGE = """usage: python3 -m herd.install [--dev] [--dry-run]
@@ -1123,16 +1050,9 @@ USAGE = """usage: python3 -m herd.install [--dev] [--dry-run]
 
 
 def main(argv=None):
-    """Unknown argv is REFUSED, not ignored.
-
-    This used to be `install(dry="--dry-run" in argv, ...)` — a membership test per
-    flag and no validation — so every unrecognized token fell through to a full
-    install. `--help` installed. `--dry-runn` installed, having been asked to touch
-    nothing. That is the worst possible reading of a typo on a command that rewrites
-    settings.json, rewires the statusline and restarts a systemd unit.
-
-    A flag this command does not understand means the caller wanted something we are
-    not doing, so the only safe move is to do NOTHING and say so.
+    """Unknown argv is REFUSED, not ignored. Membership tests alone
+    (`install(dry="--dry-run" in argv)`) let every unrecognized token fall through
+    to a full install — `--dry-runn` installs, having been asked to touch nothing.
     """
     argv = argv if argv is not None else sys.argv[1:]
     unknown = [a for a in argv if a not in _FLAGS]
@@ -1143,11 +1063,10 @@ def main(argv=None):
         print()
         print(USAGE)
         return 2
-    # Validating tokens INDIVIDUALLY was not enough. `--dry-run --uninstall` passed
-    # — both are real flags — and then `--uninstall` won the dispatch below, so it
-    # unwired settings.json, deleted the service and removed the symlinks, having
-    # been explicitly told to touch nothing. uninstall() takes no `dry`, so there is
-    # nothing to honour; the only safe answer is to refuse the combination.
+    # Validating tokens INDIVIDUALLY is not enough: `--dry-run --uninstall` are both
+    # real flags, and --uninstall wins the dispatch below — so it would unwire
+    # settings.json having been told to touch nothing. uninstall() takes no `dry`,
+    # so there is nothing to honour; refuse the combination.
     if "--uninstall" in argv:
         conflicts = [a for a in ("--dry-run", "--dev") if a in argv]
         if conflicts:

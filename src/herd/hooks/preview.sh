@@ -5,9 +5,8 @@
 # common.sh (stmt/db + the HERD_* defaults) and because install.py's copy, drift
 # and +x checks all glob hooks/*.sh, so it ships and stays current for free.
 #
-# WHY BASH. fzf runs --preview through `sh -c` on EVERY highlight change. The
-# python verb it replaces cost 78ms, ~60ms of which was bare interpreter startup
-# — nothing inside it was optimizable. This is ~5ms. See DESIGN.md#preview.
+# WHY BASH. fzf runs --preview through `sh -c` on EVERY highlight change, and most
+# of a python verb's cost here is bare interpreter startup. See DESIGN.md#preview.
 #
 # BYTE-FOR-BYTE TWIN of cli._preview_text(). The duplication is deliberate and
 # pinned: tests/test_preview_bash.py asserts this script's stdout equals that
@@ -41,15 +40,10 @@ printf '.mode list\n.separator "%s" "%s"\n%s\n' $'\037' $'\036' "$SQL" | db | aw
         mark["needs_approval"] = "🔐"; reason["needs_approval"] = "needs approval"
         mark["working"] = "🥱"; reason["working"] = "stuck — no activity"
     }
-    # A record with the wrong field count means a VALUE contained \x1f or \x1e —
-    # session_name is arbitrary /rename text and cwd is an arbitrary path. Skipping
-    # it is right (rendering a mis-split row would show another session data), but
-    # counting it matters: without that, an unparseable row is indistinguishable
-    # from a dead one and the pane says "(session gone)" about a live session.
-    # Only OUR row being unreadable is worth reporting. The id is field 1 and the
-    # corruption is always later in the row, so $1 still identifies the record even
-    # when a value split it — which keeps "(session gone)" exact for an id that
-    # genuinely is not there, in a DB that happens to hold some other broken row.
+    # Wrong field count means a VALUE contained \x1f or \x1e. Skip it, but COUNT it:
+    # otherwise an unparseable row is indistinguishable from a dead one and the pane
+    # says "(session gone)" about a live session. Count only OUR row — the id is
+    # field 1 and corruption is always later, so $1 still identifies the record.
     NF != 20 { if ($1 == want) bad++; next }
     $1 != want { next }
     {

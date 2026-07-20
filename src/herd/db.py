@@ -19,10 +19,10 @@ _NAME_RE = re.compile(r"^--\s*:name\s+(\S+)\s*$")
 
 def load_statements():
     """Parse `-- :name X` blocks out of writes.sql -> {name: sql}. Every consumer
-    loads the SHIPPING statements through here (nothing keeps its own
-    transcription — that let write paths rot). Mirrors common.sh stmt(); both cut
-    at the first ';' and test_hooks.py::test_bash_and_python_extract_same asserts they
-    agree. See DESIGN.md#write-paths-schemawritessql."""
+    loads statements through here rather than keeping its own transcription.
+    Mirrors common.sh stmt() — both cut at the first ';', and
+    test_hooks.py::test_bash_and_python_extract_same asserts they agree.
+    See DESIGN.md#write-paths-schemawritessql."""
     text = WRITES.read_text()
     out, name, buf = {}, None, []
     for line in text.splitlines():
@@ -43,20 +43,17 @@ def load_statements():
 
 
 def connect(path, readonly=False, create=False):
-    """Open a connection with herd's required pragmas. busy_timeout is NOT
-    optional on ANY connection (incl. the bash hooks): WAL serialises writers, so
-    without it a hook fails the moment the daemon/TUI holds the write lock, on
-    claude's tool loop where the user feels it.
+    """Open a connection with herd's required pragmas. busy_timeout is NOT optional
+    on ANY connection (incl. the bash hooks): WAL serialises writers, so without it
+    a hook fails the moment the daemon/TUI holds the write lock.
 
-    create=False IS THE POINT. A plain `file:` URI defaults to rwc, so a path that
-    does not exist was silently CREATED — and the daemon does not apply the schema
-    (that is the installer's job), so a typo in HERD_DB produced an empty 0-byte
-    database, not even in WAL, and then `no such table: sessions` on every tick
-    forever. Verified. Only the installer may bring a database into being; everyone
-    else asking for a file that is not there is a mistake worth an error."""
-    # The path goes into a URI, so `?` starts a query and `#` a fragment — an
-    # unescaped HERD_DB containing either silently opened the WRONG file (or
-    # failed obscurely). quote() leaves ordinary paths untouched.
+    create=False IS THE POINT. A plain `file:` URI defaults to rwc, so a missing
+    path is silently created — and nothing here applies the schema, so a typo in
+    HERD_DB yields an empty database and `no such table: sessions` on every tick
+    forever. Only the installer may bring a database into being."""
+    # The path goes into a URI, so `?` starts a query and `#` a fragment: an
+    # unescaped HERD_DB containing either opens the WRONG file. quote() leaves
+    # ordinary paths untouched.
     safe = urllib.parse.quote(str(path))
     mode = "ro" if readonly else ("rwc" if create else "rw")
     uri = f"file:{safe}?mode={mode}"
@@ -68,8 +65,8 @@ def connect(path, readonly=False, create=False):
 
 
 def apply_schema(conn, tier2=True):
-    """Apply tier 1, then (optionally) tier 2. tier2=False is a real supported
-    mode: tier 1 must stand up alone or its herd-independence is just a comment."""
+    """Apply tier 1, then (optionally) tier 2. tier2=False is a supported mode:
+    tier 1 must stand up alone."""
     conn.executescript(CORE_SCHEMA.read_text())
     if tier2:
         conn.executescript(HERD_SCHEMA.read_text())

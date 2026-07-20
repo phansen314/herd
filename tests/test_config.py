@@ -288,3 +288,83 @@ def test_bash_and_python_agree_on_the_runtime_dir(tmp_path):
         ["bash", "-c", f'. {HOOKS / "common.sh"}; printf "%s" "$HERD_RUNTIME"'],
         env=env, capture_output=True, text=True, timeout=60).stdout
     assert got == cfg.runtime_dir({"HOME": str(tmp_path)}) == str(tmp_path / ".herd" / "run")
+
+
+# ── inline comments: the shipped template's own lines ────────────────────────
+def test_the_shipped_template_parses_to_the_values_it_documents():
+    """THE bug this pair of parsers existed to prevent, committed by the file the
+    installer itself writes. Every documented line in DEFAULT_TEXT carries a
+    trailing comment, and nothing stripped it — so uncommenting the HERD_DB line
+    bound `/home/u/.herd/herd.db   # authoritative: ...`. sqlite creates a file
+    with that literal name, so nothing errored anywhere: herd recorded into a junk
+    path and `herd ls` came back empty, with `problems` reporting nothing.
+
+    Asserted against DEFAULT_TEXT rather than a hand-written sample on purpose —
+    a sample would have passed throughout, because the sample had no comments."""
+    vals, problems = cfg.parse(cfg.DEFAULT_TEXT.replace("#HERD_", "HERD_"))
+    assert problems == []
+    assert vals["HERD_DB"] == os.path.expanduser("~/.herd/herd.db")
+    assert vals["HERD_CLAUDE_NAME"] == "claude"
+    assert vals["HERD_ATTENTION"] == "1"
+    assert vals["HERD_TOOL_THROTTLE"] == "2"
+    assert vals["HERD_ERRLOG_MAX"] == "1048576"
+    for k, v in vals.items():
+        assert "#" not in v, f"{k} kept its inline comment: {v!r}"
+
+
+def test_a_hash_inside_a_value_is_part_of_the_value():
+    """A '#' opens a comment at the start of the value or after whitespace, and is
+    an ordinary character anywhere else. Cutting at every '#' would be the same
+    silent-wrong-path bug pointing the other way."""
+    vals, _ = cfg.parse("HERD_DB=/srv/repo#2/herd.db\n")
+    assert vals["HERD_DB"] == "/srv/repo#2/herd.db"
+
+
+def test_a_value_that_is_only_a_comment_is_empty():
+    """`HERD_RUNTIME=   # defaults to XDG` is in the shipped template, and it means
+    'leave the default alone', not 'set it to the words of the comment'."""
+    vals, _ = cfg.parse("HERD_RUNTIME=      # per-session runtime files\n")
+    assert vals["HERD_RUNTIME"] == ""
+
+
+@pytest.mark.shell
+def test_bash_and_python_strip_inline_comments_the_same_way(tmp_path):
+    """Two parsers, one file. Both sides missed comments identically, which is why
+    the drift test that pins their key lists stayed green through the whole bug.
+
+    So this asserts the LITERAL expected value on both sides, not merely that they
+    match. Written as an agreement-only test first, it PASSED against the unfixed
+    parsers — they agreed on being wrong, which is the failure mode this whole file
+    is about. An oracle that only compares two implementations cannot see a bug
+    they share."""
+    # A SINGLE tab is the one arrangement that proves nothing: the comment cut
+    # takes the tab with it, so both halves come out clean even when only one of
+    # them trims tabs. The first version of this list had only that case, and it
+    # stayed green while bash's trims used `[! ]` — space only — and python used
+    # .strip()/.rstrip(), which eat tabs too. Every tab case below except that one
+    # failed on the bash side before common.sh's four bracket classes were fixed.
+    cases = [
+        ("/a/b.db   # trailing comment",  "/a/b.db"),
+        ("/srv/repo#2/herd.db",           "/srv/repo#2/herd.db"),
+        ("/a/b.db\t# tab before hash",    "/a/b.db"),
+        ("#immediately a comment",        ""),
+        # tabs: trailing, leading, and doubled before a comment
+        ("/a/b.db\t\t# two tabs",         "/a/b.db"),
+        ("/a/b.db\t",                     "/a/b.db"),
+        ("\t/a/b.db",                     "/a/b.db"),
+        ("/a/b.db \t \t# mixed run",      "/a/b.db"),
+        ("\t/srv/repo#2/herd.db\t",       "/srv/repo#2/herd.db"),
+    ]
+    for raw, want in cases:
+        p = _write(tmp_path, f"HERD_DB={raw}\n")
+        env = dict(os.environ, HERD_CONFIG=str(p), HOME=str(tmp_path))
+        env.pop("HERD_DB", None)
+        got = subprocess.run(
+            ["bash", "-c", f'. {HOOKS / "common.sh"}; printf "%s" "$HERD_DB"'],
+            env=env, capture_output=True, text=True, timeout=60).stdout
+        py = cfg.parse(f"HERD_DB={raw}\n")[0].get("HERD_DB", "")
+        assert py == want, f"python got {py!r} for {raw!r}, wanted {want!r}"
+        # an empty value leaves common.sh on its own default, which is the same
+        # "the file said nothing" outcome python reports as ""
+        assert got == (want or str(tmp_path / ".herd" / "herd.db")), \
+            f"bash got {got!r} for {raw!r}, wanted {want!r}"
