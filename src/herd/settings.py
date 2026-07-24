@@ -13,11 +13,14 @@ INSTALLED_HOOKS = HERD_DIR / "hooks"                            # what actually 
 # event -> (hook script, async?). SessionStart and SessionEnd must stay BLOCKING:
 # async SessionEnd loses the final write.
 HERD_HOOKS = {
-    "SessionStart": ("session_start.sh", False),
-    "Stop":         ("stop.sh",          True),
-    "SessionEnd":   ("session_end.sh",   False),
-    "Notification": ("notification.sh",  True),
-    "PostToolUse":  ("post_tool_use.sh", True),
+    "SessionStart":     ("session_start.sh", False),
+    "Stop":             ("stop.sh",          True),
+    "SessionEnd":       ("session_end.sh",   False),
+    "Notification":     ("notification.sh",  True),
+    "PostToolUse":      ("post_tool_use.sh", True),
+    # Tier-2 enrichment: capture the live kitty tab title. Async — best-effort, must
+    # not block the prompt. Runs alongside the tier-1 hooks, never inside them.
+    "UserPromptSubmit": ("tab_sync.sh",      True),
 }
 
 OUR_SCRIPTS = {s for s, _ in HERD_HOOKS.values()} | {"statusline.sh", "common.sh"}

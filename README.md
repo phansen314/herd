@@ -22,7 +22,9 @@ Every Claude Code session writes into `~/.herd/herd.db` as it lives:
 - **Identity & state** — session UUID, cwd, model, and Claude's own status:
   `working`, `waiting` (turn ended, wants input), `needs_approval` (permission
   prompt), `stopped`.
-- **Placement** — the kitty socket + window it's running in (the jump target).
+- **Placement** — the kitty socket + window it's running in (the jump target), plus
+  the live tab title (captured per prompt, so a dead session can be reopened under its
+  real name — see [`herd restart`](#herd-restart--bring-back-dead-sessions)).
 - **Metrics** — context %, cost, burn rate, token counts, lines changed, rate-limit
   windows (from the statusline).
 - **Liveness** — a background daemon reaps sessions whose process died *silently*
@@ -212,6 +214,7 @@ herd jump               # fuzzy-pick a session (fzf) with a live preview, and fo
 herd jump <query>       # herd id, name (/rename), job, uuid, or cwd; unique match jumps
 herd watch              # the picker as a permanent dashboard
 herd watch --one-shot   # same picker, exits after one jump (kitty overlay panel)
+herd restart            # fzf multi-select of dead sessions -> resume each in a new tab
 herd doctor             # why isn't herd recording anything? (see Troubleshooting)
 ```
 
@@ -296,6 +299,30 @@ Plain `herd watch` keeps the original behavior for a dedicated tab or a spare mo
 it loops, and Esc re-opens the picker rather than exiting — a window you can't
 accidentally fall out of. (Why fzf and not a curses TUI:
 [DESIGN.md#watch](DESIGN.md#watch).)
+
+### `herd restart` — bring back dead sessions
+
+A reboot (or a crash, or closing kitty) kills every live session at once. Because herd
+records a session's death by *marking* the row, not deleting it, the UUID, cwd and tab
+title all survive — enough to rebuild the session exactly. `herd restart` is the
+recovery:
+
+```bash
+herd restart            # inside kitty; needs fzf
+```
+
+It opens an fzf **multi-select** of the dead-but-resumable sessions, most-recently-dead
+first (a reboot reaps them all near boot, so the ones you just lost sit at the top).
+`Tab` marks, `Enter` confirms. Each pick opens a new kitty tab running
+`claude --resume <uuid>` in that session's original cwd, **titled with the tab's real
+name** — the one you'd captured while it was alive, not a generic fallback. Resuming
+reuses the same session, so its herd row is revived in place (no duplicate); pick five
+at once and you're back where the reboot left you.
+
+Runs inside kitty (it opens tabs) and requires `fzf` — the multi-select *is* the whole
+UI, so there is no non-fzf fallback. (Why it launches directly instead of through
+`spawn`, and why the tab title is the one kitty value herd persists:
+[DESIGN.md#restart](DESIGN.md#restart).)
 
 ### Reading the database directly
 

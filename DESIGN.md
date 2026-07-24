@@ -152,12 +152,14 @@ via `sqlite3.complete_statement()`).
 | `W5_statusline` | The sink for **every** field the statusLine payload carries — metrics, plus `claude_code_version`, `output_style`, `git_worktree`, `original_cwd` — and `git_branch`, which the hook derives from its own `.git` walk. Nothing else writes these; a field absent from this statement is a column that stays NULL forever. UPDATE only (never creates a row — would resurrect stopped sessions / invent empty cwd). Never touches `last_event_*`. Resets_at arrives as unix epoch, converted to ISO in SQLite (zero date forks); `COALESCE` keeps prior value on NULL. The `prev_cost` pair (burn-rate delta, resampled >300s) is correct as written: an UPDATE's RHS sees the OLD row, so `prev_cost_usd` captures the previous total before this statement overwrites it. |
 | `W5b_adopt` | Statusline adoption ("Path C"): statusline is a child of claude, inherits `KITTY_*` like a hook, so a reconciled session picks up metrics with no hooks wired. Same liveness JOIN as W2. |
 | `W6a_arm` / `W6c_ack` / `W6d_rearm` / `W6d_rearm_sid` | Attention (see [attention](#attention)). `W6d_rearm_sid` is the UUID-keyed variant a hook needs (hooks lack the surrogate pk) — same keyed-two-ways pattern as W2 vs W2b. |
+| `W7_tab_title` | Tier-2 enrichment: the live kitty **tab title**, captured by `tab_sync.sh` on every `UserPromptSubmit`. Keyed by `session_id` → the surrogate pk; a session with no `herd_sessions` row (outside kitty) matches nothing. Trailing `IS NOT` guard suppresses no-op WAL churn (the hook fires per prompt, the title rarely moves), as `W2b_placement` does. The ONE persisted piece of kitty render state — a dead session cannot be re-derived from `kitten @ ls`, and `restart` needs its real title — a deliberate, narrow exception to [kitty off the write path](#restart). |
 | `W6e_sweep_dead` | Reclaims `herd_attention` rows whose session has stopped. The attention tick cannot do it: that tick visits only live rows, so the orphan it would need to see is filtered out before it looks. Runs **unconditionally**, not under the `HERD_ATTENTION` gate — it is garbage collection, not herd's opinion, and gating it meant the one mode where nothing else clears those rows was the mode that never ran it. See [small lies](DECISIONS.md#small-lies). |
 | `R1_list` | The one live-session read **in the rendering path**: `sessions` + `herd_sessions` + `herd_attention`, attention-first ordering. `ls`, the picker, `rows` and the preview all go through it. Selects **only what a renderer consumes** — see [banked columns](#banked-columns). The reaper, the attention tick, `focus` and `doctor` read liveness directly for their own non-rendering questions; see [focus](#focus--jump-kittyfocuspy-clipy). |
 | `W3f_sweep_stranded` | Reclaims a phase-1 spawn reservation whose claude never reached SessionStart (the launcher raised, claude died before its first hook, or the W5b adoption lost the `session_id` race). Such a row is `pid` NULL + `session_id` NULL, which `W3d_reap` skips by design while `R_job_live` still counts it live — so the job name stayed burned until the next boot sweep. Age-gated on `HERD_STRANDED_SECS` (a reservation is legitimately pid-NULL across the launch round trip). DELETE, not `stopped_at`, for `W1_spawn_abort`'s reason: this session never existed. |
 | `R_job_live` | Spawn-time recyclable-handle check: does a *live* session already hold this job name? By JOIN, no unique index. Dead rows keep their `job_name` — reuse is by design, and resolution searches live sessions only. Run **inside** `spawn()`'s `BEGIN IMMEDIATE`, not before it: the check must be atomic with the reservation, or two concurrent spawns both pass it across the kitty launch and both insert. See [spawn](#spawn). |
 | `R_window_unadopted` | Is there an unadopted reservation in this window — i.e. anything for statusline Path C to adopt later? Exactly `W2_adopt`'s target predicate, as a read. `session_start.sh` needs it after a FAILED `W2_adopt` to tell a spawn reservation (defer, Path C will claim it) from nothing at all (insert, or the session is lost for its whole life — Path C only UPDATEs). A read answers even while the write lock is held, since WAL readers do not block on a writer, so it is reliable in precisely the case that made the write fail. |
 | `R_statusline` | Render input: feeds only the burn rate (the `prev_cost` pair). One read per fingerprint miss. |
+| `R_dead_resumable` | `R1_list` inverted — the dead-but-resumable rows `herd restart` offers: `stopped_at IS NOT NULL`, a non-NULL `session_id` (the uuid `claude --resume` needs), not already revived, newest death first. Same columns/joins as `R1_list` so the picker and preview render it unchanged. `restart` LAUNCHES from these but WRITES nothing: the revival is `W2b_insert`'s `ON CONFLICT(session_id)` on the resumed session's own SessionStart hook, so `restart` never touches the row it resurrects. Going through `spawn()` instead would insert a placeholder whose `W2_adopt` collides on that UNIQUE uuid — see [restart](#restart). |
 
 **Routing read, not data read:** in an adopt writer (W2, W5b, W2b_placement) a
 `herd_*` reference may appear only *after* `WHERE` (to pick which row), never in
@@ -380,6 +382,45 @@ Python 3.11; the rest of herd stays on 3.9. Unknown keys raise rather than being
 ignored (a mistyped `promt` should say so, not silently do nothing), and `load_template`
 raises `ValueError` with a friendly message for every failure mode — bad name, missing
 file, bad TOML, wrong type — so the CLI prints `✗ …` instead of a stack trace.
+
+## Restart — resume the dead, don't reserve (`cli.py`) {#restart}
+
+A machine reboot kills every live session; herd already holds what rebuilds them,
+because death is an UPDATE (`stopped_at`), never a DELETE — the dead row keeps its
+`session_id`, `cwd` and name. `herd restart` is an fzf **multi-select** of those rows
+(`R_dead_resumable`, `R1_list` inverted); each pick opens a kitty tab running
+`claude --resume <session_id>` in the stored `cwd`.
+
+The load-bearing decision is that restart **launches directly** (`build_launch_argv` /
+`launch`) and does **not** go through `spawn()`. `spawn()` exists to name a session
+*before* its UUID is known, so it inserts a placeholder and lets the SessionStart hook
+adopt the UUID via `W2_adopt`. But a resumed session already carries the dead row's
+UUID, and `session_id` is `TEXT UNIQUE` — so that adoption `UPDATE` collides, the hook
+defers forever, the placeholder becomes a permanent orphan live row, and the dead row
+is never revived. Launching direct with no reservation (and, per
+[spawn identity](DECISIONS.md#spawn-identity), no `HERD_JOB` unless the dead row had a
+job to restamp) drops the resumed session onto the ordinary user-ran-`claude --resume`
+path, where `W2b_insert`'s `ON CONFLICT(session_id) DO UPDATE … stopped_at=NULL`
+revives the exact row by its UUID. One row, no orphan. The consequence for
+classification: restart is **readonly** — the revival write is the resumed claude's,
+not restart's.
+
+### The tab title — a deliberate exception to "kitty off the write path" {#tab-title}
+
+Restart re-titles the resumed tab from the stored `herd_sessions.tab_title`, falling
+back to the picker label (`_name`) when there is none. That column exists only because
+restart forced the one case herd's placement model does not cover. Placement
+(`kitty_socket`, `window_id`) is [a cache, not a fact](#focus--jump-kittyfocuspy-clipy):
+re-derived live from `kitten @ ls` on every jump, and `window_title`/`tab_id`/
+`os_window_id` were dropped precisely to keep kitty off the write path
+(`test_no_render_only_kitty_columns`). But re-derivation assumes kitty is queryable —
+**false for a dead session**, whose tab is gone. So the tab title is the one kitty
+value herd *persists*, captured while the session is alive by a **dedicated** tier-2
+hook (`tab_sync.sh` on `UserPromptSubmit`, `W7_tab_title`). "Dedicated" is the point:
+the tier-1 lifecycle hooks stay free of any `kitten` fork, and all live kitty-state
+capture lives in one script — the seam for richer tier-2 data later. The rule is
+narrowed, not repealed: everything derivable is still derived; only the un-derivable
+(a dead tab's title) is stored.
 
 ---
 

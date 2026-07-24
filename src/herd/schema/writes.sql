@@ -323,6 +323,19 @@ DELETE FROM herd_attention
 WHERE session_pk NOT IN (SELECT id FROM sessions WHERE stopped_at IS NULL);
 
 
+-- ── W7_tab_title. Tier-2 enrichment: the live kitty TAB title, captured by
+-- tab_sync.sh (UserPromptSubmit). Keyed by session_id (the hook's key) resolved to
+-- the surrogate pk; a session with no herd_sessions row (outside kitty) matches
+-- nothing. The trailing IS NOT guard suppresses no-op WAL churn, as W2b_placement
+-- does — the title rarely changes but the hook fires every prompt. tab_title is the
+-- ONE persisted piece of kitty render state: a dead session can't be re-derived from
+-- kitten @ ls, and restart needs its real title. See DESIGN.md#restart.
+-- :name W7_tab_title
+UPDATE herd_sessions SET tab_title = :tab_title
+WHERE session_pk = (SELECT id FROM sessions WHERE session_id = :session_id)
+  AND tab_title IS NOT :tab_title;
+
+
 -- ── R_statusline. RENDER INPUT (statusline.sh): feeds only the burn rate (the
 -- prev_cost pair). One read per fingerprint miss. '|'-joined for a single bash read.
 -- :name R_statusline
@@ -368,4 +381,28 @@ WHERE s.stopped_at IS NULL
 ORDER BY a.attention_at IS NULL,   -- attention first
          a.attention_at ASC,       -- longest-waiting first
          s.started_at DESC,
+         s.id DESC;
+
+
+-- ── R_dead_resumable. R1_list inverted: the DEAD rows a `herd restart` can revive.
+-- R1_list's columns and joins (so _line/_row_line/_parse_pick/preview work unchanged)
+-- PLUS h.tab_title, which restart uses to re-title the resumed tab. session_id IS NOT
+-- NULL is what makes a row resumable (claude --resume needs the uuid). The NOT IN
+-- excludes a session already brought back to life, so a second restart never re-offers
+-- what the first one revived. session_id is globally UNIQUE, so no dedup is needed.
+-- Reboot reaps everything near boot, so stopped_at DESC floats the just-crashed to top.
+-- :name R_dead_resumable
+SELECT s.id, s.session_id, s.pid, s.cwd, s.status, s.status_source, s.model, s.session_name,
+       s.context_percent, s.total_cost_usd, s.git_branch,
+       s.last_event_at, s.last_event_type, s.started_at, s.updated_at,
+       h.job_name, h.kitty_socket, h.window_id, h.tab_title,
+       a.attention_at, a.ack_at
+FROM sessions s
+LEFT JOIN herd_sessions  h ON h.session_pk = s.id
+LEFT JOIN herd_attention a ON a.session_pk = s.id
+WHERE s.stopped_at IS NOT NULL
+  AND s.session_id IS NOT NULL
+  AND s.session_id NOT IN (SELECT session_id FROM sessions
+                           WHERE stopped_at IS NULL AND session_id IS NOT NULL)
+ORDER BY s.stopped_at DESC,
          s.id DESC;

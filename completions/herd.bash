@@ -18,7 +18,7 @@ _herd_complete() {
     local cur=${COMP_WORDS[COMP_CWORD]}
     local prev=${COMP_WORDS[COMP_CWORD-1]}
     if [ "$COMP_CWORD" -eq 1 ]; then
-        _herd_offer "$cur" "ls jump spawn watch doctor"
+        _herd_offer "$cur" "ls jump spawn watch restart doctor"
     elif [ "${COMP_WORDS[1]}" = jump ]; then
         _herd_offer "$cur" "$(herd complete 2>/dev/null)"
     elif [ "${COMP_WORDS[1]}" = spawn ] && { [ "$prev" = -t ] || [ "$prev" = --template ]; }; then

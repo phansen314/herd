@@ -8,7 +8,8 @@
 -- Mutability contract (test_mutability.py::test_refire_mutability_contract):
 --   IMMUTABLE: job_name, created_at (set at spawn); herd_var (a hook can't know the
 --              spawn var); source (provenance must not decay to 'hook')
---   MUTABLE  (a hook re-fire may overwrite): kitty_socket, window_id, verified_at
+--   MUTABLE  (a hook re-fire may overwrite): kitty_socket, window_id, verified_at,
+--            tab_title
 CREATE TABLE IF NOT EXISTS herd_sessions (
     session_pk   INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
 
@@ -26,7 +27,13 @@ CREATE TABLE IF NOT EXISTS herd_sessions (
                                   -- liveness. Match values are unanchored regex, so anchor them.
     source       TEXT NOT NULL CHECK (source IN ('spawn','hook')),
                               -- 'spawn' (W1) or 'hook' (W2b_placement).
-    verified_at  TEXT NOT NULL    -- re-stamped when focus re-derives placement.
+    verified_at  TEXT NOT NULL, -- re-stamped when focus re-derives placement.
+
+    -- The kitty TAB title, captured live by tab_sync.sh (UserPromptSubmit) via
+    -- W7_tab_title. The ONE piece of kitty render state herd persists: a dead
+    -- session can't be re-derived from `kitten @ ls`, and restart needs its real
+    -- title. See DESIGN.md#restart. NULL until first captured / outside kitty.
+    tab_title    TEXT
 );
 
 -- PLAIN, non-unique lookups. Uniqueness ("one live session per window", "recyclable

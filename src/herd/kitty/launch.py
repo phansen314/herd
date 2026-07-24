@@ -26,9 +26,13 @@ def build_launch_argv(spec, socket):
     argv = ["kitten", "@", "--to", socket, "launch",
             "--type", _KITTY_TYPE.get(spec.launch_type, "tab"),
             "--cwd", spec.cwd,
-            "--tab-title", spec.title,
-            "--var", f"HERD_JOB={spec.job}",
-            "--env", f"HERD_JOB={spec.job}"]
+            "--tab-title", spec.title]
+    # A restart resumes a session by its known uuid, so it needs NO adoption and sets
+    # no job: an empty spec.job omits HERD_JOB entirely, and the SessionStart(resume)
+    # hook revives the dead row by session_id instead. spawn() always has a valid job.
+    if spec.job:
+        argv += ["--var", f"HERD_JOB={spec.job}",
+                 "--env", f"HERD_JOB={spec.job}"]
     for k, v in (spec.vars or {}).items():
         argv += ["--var", f"{k}={v}"]
     argv += [CLAUDE_NAME, *spec.claude_args]

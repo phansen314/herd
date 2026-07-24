@@ -6,6 +6,7 @@
     herd spawn <job>        # launch a named claude session in a kitty tab/pane
     herd watch              # the picker as a permanent dashboard (dedicated tab)
     herd watch --one-shot   # same picker, exits after one jump (kitty overlay panel)
+    herd restart            # fzf multi-select of dead sessions -> resume each in a new tab
     herd preview <id>       # session detail (used by the fzf preview pane)
 
 `jump` focuses immediately on a unique query match (scriptable); otherwise it opens
@@ -26,7 +27,8 @@ import sys
 from herd.db import connect, load_statements
 from herd.daemon import DEFAULT_DB, _fault_hint, _now_iso
 from herd.kitty.focus import focus_session
-from herd.spawn import resolve_spec, spawn
+from herd.kitty.launch import launch, LaunchError
+from herd.spawn import resolve_spec, spawn, SpawnSpec
 from herd.template import load_template, available_templates
 
 _HOME = os.path.expanduser("~")
@@ -38,6 +40,12 @@ _STMT = load_statements()
 def _live(conn):
     """The one live-session read: writes.sql's R1_list, not a private transcription."""
     return conn.execute(_STMT["R1_list"]).fetchall()
+
+
+def _dead(conn):
+    """The dead-but-resumable read: R1_list inverted. Rows a `herd restart` can bring
+    back — dead, with a session_id, not already revived. Same columns as _live."""
+    return conn.execute(_STMT["R_dead_resumable"]).fetchall()
 
 
 def _name(r):
@@ -136,6 +144,17 @@ def _parse_pick(rows, fzf_stdout):
     return next((r for r in rows if r["id"] == sid), None)
 
 
+def _parse_picks(rows, fzf_stdout):
+    """Every row fzf returned under --multi (one `<id>\\t<display>` line each), by
+    leading id. Skips blank/garbage lines. Empty on cancel."""
+    picked = []
+    for line in fzf_stdout.splitlines():
+        r = _parse_pick(rows, line)
+        if r is not None:
+            picked.append(r)
+    return picked
+
+
 def _has_fzf():
     return bool(shutil.which("fzf")) and sys.stdin.isatty()
 
@@ -188,6 +207,12 @@ def _fzf_run(rows, query, extra=()):
 def _fzf_pick(rows, query, extra=()):
     """Interactive fuzzy pick with a live preview pane. Returns a row or None."""
     return _parse_pick(rows, _fzf_run(rows, query, extra)[0])
+
+
+def _fzf_pick_multi(rows, query, extra=()):
+    """Multi-select pick (fzf --multi: Tab marks, Enter confirms). Returns a list of
+    rows, empty on Esc/cancel."""
+    return _parse_picks(rows, _fzf_run(rows, query, ("--multi", *extra))[0])
 
 
 # ── preview (its own process, spawned by fzf per highlight — reads live) ──────
@@ -596,6 +621,43 @@ def cmd_spawn(conn, args):
     return 0 if ok else 1
 
 
+def cmd_restart(conn, args):
+    """Multi-select fzf of dead-but-resumable sessions; each pick opens a new kitty tab
+    running `claude --resume <session_id>` in its stored cwd. Launches DIRECTLY (no
+    spawn placeholder): the session_id already exists on the dead row, so claude's own
+    SessionStart(resume) hook revives it — spawn() would collide on that UNIQUE uuid."""
+    socket = os.environ.get("KITTY_LISTEN_ON")
+    if not socket:
+        print("✗ herd restart needs to run inside kitty (KITTY_LISTEN_ON unset)")
+        return 1
+    if not _has_fzf():
+        print("✗ herd restart needs fzf and a terminal (its multi-select is the whole UI)")
+        return 2
+    rows = _dead(conn)
+    if not rows:
+        print("  (no resumable sessions)")
+        return 0
+    picks = _fzf_pick_multi(rows, "")
+    if not picks:
+        return 0
+    ok_all = True
+    for r in picks:
+        # r["job_name"] via --env only (no reservation) restamps job_name onto the
+        # revived row; absent, "" omits HERD_JOB entirely (launch.build_launch_argv).
+        # tab_title (captured live by tab_sync.sh) restores the tab's real name; a
+        # session never seen in kitty has none, so fall back to the picker label.
+        spec = SpawnSpec(job=(r["job_name"] or ""), cwd=r["cwd"], launch_type="tab",
+                         title=(r["tab_title"] or _name(r)),
+                         claude_args=["--resume", r["session_id"]])
+        try:
+            win = launch(spec, socket)
+            print(f"✓ resumed {_name(r)!r} in window {win}")
+        except LaunchError as e:                     # degrade per session, keep going
+            ok_all = False
+            print(f"✗ {_name(r)!r}: {e}")
+    return 0 if ok_all else 1
+
+
 def cmd_tcomplete(conn, args):
     """Template-name completion feed for `herd spawn -t` (machinery, hidden)."""
     print("\n".join(available_templates()))
@@ -603,13 +665,16 @@ def cmd_tcomplete(conn, args):
 
 
 COMMANDS = {"ls": cmd_ls, "jump": cmd_jump, "spawn": cmd_spawn, "watch": cmd_watch,
+            "restart": cmd_restart,
             "preview": cmd_preview, "complete": cmd_complete, "tcomplete": cmd_tcomplete,
             "rows": cmd_rows, "poke": cmd_poke}
-# `spawn` writes (W1) and `watch` focuses windows — neither is readonly.
-_READONLY = {"ls", "preview", "complete", "tcomplete", "rows", "poke"}
+# `spawn` writes (W1) and `watch` focuses windows — neither is readonly. `restart` is
+# readonly: it only READS the dead rows and launches kitty; the revival write is done
+# by the resumed claude's own SessionStart hook, not by this process.
+_READONLY = {"ls", "preview", "complete", "tcomplete", "rows", "poke", "restart"}
 # The verbs a user types. preview/complete/tcomplete/rows/poke are machinery —
 # callable, but not advertised in help or tab-completion.
-USER_COMMANDS = ("ls", "jump", "spawn", "watch", "doctor")
+USER_COMMANDS = ("ls", "jump", "spawn", "watch", "restart", "doctor")
 
 # doctor opens nothing up front: a missing or corrupt DB is something it REPORTS,
 # and the shared connect below would traceback on exactly the machines it exists
@@ -624,7 +689,7 @@ def cmd_doctor(argv):
 
 # Verbs that take NO arguments at all. spawn parses its own, jump/preview take one
 # operand, watch takes one optional flag — those validate themselves.
-_NO_ARGS = {"ls", "rows", "complete", "tcomplete", "poke"}
+_NO_ARGS = {"ls", "rows", "complete", "tcomplete", "poke", "restart"}
 
 USAGE = """usage: herd <command> [args]
 
@@ -633,6 +698,7 @@ USAGE = """usage: herd <command> [args]
   spawn <job>     launch a named claude session in a kitty tab/pane
   watch           the picker as a permanent dashboard
     --one-shot    exit after one jump (for a kitty overlay panel)
+  restart         revive dead sessions in new kitty tabs (fzf multi-select)
   doctor          diagnose the install
 
   query = herd id, name, job, uuid prefix, or cwd substring"""
